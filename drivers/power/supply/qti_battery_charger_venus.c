@@ -63,6 +63,9 @@
 #define VENUS_BATTERY_MODEL_NAME	"k2_4600mah"
 #define VENUS_BATTERY_DESIGN_UAH	4600000
 #define VENUS_XIAOMI_PPS_POWER_MAX_W	55
+#define XM_CHARGE_UEVENT_COUNT		9
+#define MAX_UEVENT_LENGTH		50
+#define XM_UEVENT_DEBOUNCE_MS		250
 
 #define BATTERY_DIGEST_LEN 32
 #define BATTERY_SS_AUTH_DATA_LEN 4
@@ -424,6 +427,9 @@ struct battery_chg_dev {
 	u32				usb_icl_ua;
 	u32				battery_design_uah;
 	u32				reverse_chg_flag;
+	bool				xm_uevent_valid;
+	char				xm_uevent_cache[XM_CHARGE_UEVENT_COUNT]
+							[MAX_UEVENT_LENGTH + 1];
 	bool				restrict_chg_en;
 	bool				shutdown_delay_en;
 	bool				charger_state_valid;
@@ -1226,15 +1232,18 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 		return;
 	}
 
-	pr_err("notification: %#x\n", notify_msg->notification);
+	pr_debug("notification: %#x\n", notify_msg->notification);
 
 	switch (notify_msg->notification) {
 	case BC_BATTERY_STATUS_GET:
-	case BC_GENERIC_NOTIFY:
 		pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 		if (bcdev->shutdown_volt_mv > 0)
 			schedule_work(&bcdev->battery_check_work);
 		mod_delayed_work(system_wq, &bcdev->xm_prop_change_work, 0);
+		break;
+	case BC_GENERIC_NOTIFY:
+		queue_delayed_work(system_wq, &bcdev->xm_prop_change_work,
+				msecs_to_jiffies(XM_UEVENT_DEBOUNCE_MS));
 		break;
 	case BC_USB_STATUS_GET:
 		pst = &bcdev->psy_list[PSY_TYPE_USB];
@@ -4830,12 +4839,11 @@ static void battery_chg_add_debugfs(struct battery_chg_dev *bcdev)
 static void battery_chg_add_debugfs(struct battery_chg_dev *bcdev) { }
 #endif
 
-#define MAX_UEVENT_LENGTH 50
 static void generate_xm_charge_uvent(struct work_struct *work)
 {
 	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev, xm_prop_change_work.work);
 
-	static char uevent_string[][MAX_UEVENT_LENGTH+1] = {
+	char uevent_string[XM_CHARGE_UEVENT_COUNT][MAX_UEVENT_LENGTH + 1] = {
 		"POWER_SUPPLY_REVERSE_CHG_STATE=\n",	//length=31+1
 		"POWER_SUPPLY_REVERSE_CHG_MODE=\n",	//length=30+1
 		"POWER_SUPPLY_TX_MAC=\n",		//length=20+16
@@ -4846,7 +4854,7 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 		"POWER_SUPPLY_SHUTDOWN_DELAY=\n",//28+8
 		"POWER_SUPPLY_WLS_CAR_ADAPTER=\n",//length=29+1
 	};
-	static char *envp[] = {
+	char *envp[XM_CHARGE_UEVENT_COUNT + 1] = {
 		uevent_string[0],
 		uevent_string[1],
 		uevent_string[2],
@@ -4860,6 +4868,7 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 
 	};
 	char *prop_buf = NULL;
+	bool changed;
 
 	prop_buf = (char *)get_zeroed_page(GFP_KERNEL);
 	if (!prop_buf)
@@ -4896,11 +4905,21 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 
 	/*add our prop end*/
 
-	dev_err(bcdev->dev,"uevent test : %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n",
+	changed = !bcdev->xm_uevent_valid ||
+		memcmp(bcdev->xm_uevent_cache, uevent_string,
+				sizeof(uevent_string));
+	if (!changed)
+		goto out;
+
+	memcpy(bcdev->xm_uevent_cache, uevent_string, sizeof(uevent_string));
+	bcdev->xm_uevent_valid = true;
+
+	dev_dbg(bcdev->dev,"xm charge uevent: %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n",
 			envp[0], envp[1], envp[2], envp[3], envp[4], envp[5], envp[6], envp[7], envp[8]);
 
 	kobject_uevent_env(&bcdev->dev->kobj, KOBJ_CHANGE, envp);
 
+out:
 	free_page((unsigned long)prop_buf);
 	return;
 }
