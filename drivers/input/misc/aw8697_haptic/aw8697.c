@@ -63,6 +63,8 @@
 #define AW8697_GAIN_LEVEL_MAX 0x80
 #define AW8697_COLOROS_FF_GAIN_MIN 0x4736
 #define AW8697_COLOROS_FF_GAIN_MAX 0x7FFF
+#define AW8697_COLOROS_BST_VOL_MIN 0x11
+#define AW8697_COLOROS_BST_VOL_MAX AW8697_MAX_BST_VO
 #define AW8697_OPLUS_GAIN_MAX 2400
 
 #define OSC_CALIBRATION_T_LENGTH 5100000
@@ -1389,6 +1391,23 @@ static unsigned char aw8697_haptic_ff_gain_to_level(u16 gain)
 	return level;
 }
 
+static unsigned char aw8697_haptic_ff_gain_to_bst_vol(u16 gain)
+{
+	u32 bst_vol;
+
+	if (!gain || gain <= AW8697_COLOROS_FF_GAIN_MIN)
+		return AW8697_COLOROS_BST_VOL_MIN;
+	if (gain >= AW8697_COLOROS_FF_GAIN_MAX)
+		return AW8697_COLOROS_BST_VOL_MAX;
+
+	bst_vol = AW8697_COLOROS_BST_VOL_MIN +
+		((u32)(gain - AW8697_COLOROS_FF_GAIN_MIN) *
+		 (AW8697_COLOROS_BST_VOL_MAX - AW8697_COLOROS_BST_VOL_MIN)) /
+		(AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN);
+
+	return bst_vol;
+}
+
 static u16 aw8697_haptic_oplus_gain_to_ff_gain(unsigned int gain)
 {
 	if (!gain)
@@ -1427,10 +1446,15 @@ static int16_t aw8697_haptic_effect_strength(struct aw8697 *aw8697)
 	pr_debug("%s enter\n", __func__);
 	pr_debug("%s: aw8697->play.vmax_mv =0x%x\n", __func__, aw8697->play.vmax_mv);
 	if (aw8697->ff_gain_valid) {
+		unsigned char bst_vol;
+
 		aw8697->level =
 			aw8697_haptic_ff_gain_to_level(aw8697->new_gain);
-		pr_info("%s: ff_gain=0x%x level=0x%x\n", __func__,
-			aw8697->new_gain, aw8697->level);
+		bst_vol = aw8697_haptic_ff_gain_to_bst_vol(aw8697->new_gain);
+		aw8697->vmax = bst_vol;
+		aw8697_haptic_set_bst_vol(aw8697, bst_vol);
+		pr_info("%s: ff_gain=0x%x level=0x%x bst=0x%x\n", __func__,
+			aw8697->new_gain, aw8697->level, bst_vol);
 		return 0;
 	}
 #if 0
@@ -3268,6 +3292,8 @@ static void set_gain(struct work_struct * work)
 	pr_debug("%s enter set_gain queue work\n", __func__);
 
 	aw8697->level = aw8697_haptic_ff_gain_to_level(aw8697->new_gain);
+	aw8697->vmax = aw8697_haptic_ff_gain_to_bst_vol(aw8697->new_gain);
+	aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
 
 	if ((aw8697->activate_mode == AW8697_HAPTIC_ACTIVATE_RAM_LOOP_MODE) &&
 		(aw8697->ram_vbat_comp == AW8697_HAPTIC_RAM_VBAT_COMP_ENABLE) &&
@@ -3944,6 +3970,9 @@ static ssize_t aw8697_led_vmax_store(struct device *dev,
 		aw8697->ff_gain_valid = true;
 		aw8697->level =
 			aw8697_haptic_ff_gain_to_level(aw8697->new_gain);
+		aw8697->vmax =
+			aw8697_haptic_ff_gain_to_bst_vol(aw8697->new_gain);
+		aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
 		aw8697_haptic_set_gain(aw8697, aw8697->level);
 	}
 	mutex_unlock(&aw8697->lock);
