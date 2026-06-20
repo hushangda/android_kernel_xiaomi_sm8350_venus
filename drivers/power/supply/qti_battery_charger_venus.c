@@ -2026,13 +2026,13 @@ static int battery_chg_smooth_capacity(struct battery_chg_dev *bcdev,
 	switch (status) {
 	case POWER_SUPPLY_STATUS_CHARGING:
 		if (raw_soc > ui_soc)
-			ui_soc += VENUS_UI_SOC_STEP;
+			ui_soc = raw_soc;
 		else if (raw_soc < ui_soc)
 			ui_soc -= VENUS_UI_SOC_STEP;
 		break;
 	case POWER_SUPPLY_STATUS_FULL:
 		if (raw_soc > ui_soc)
-			ui_soc += VENUS_UI_SOC_STEP;
+			ui_soc = raw_soc;
 		else if (raw_soc < ui_soc)
 			ui_soc -= VENUS_UI_SOC_STEP;
 		break;
