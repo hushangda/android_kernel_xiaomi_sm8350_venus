@@ -63,6 +63,8 @@
 #define VENUS_BATTERY_MODEL_NAME	"k2_4600mah"
 #define VENUS_BATTERY_DESIGN_UAH	4600000
 #define VENUS_XIAOMI_PPS_POWER_MAX_W	55
+#define VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W	27
+#define VENUS_UI_SOC_STEP		1
 #define XM_CHARGE_UEVENT_COUNT		9
 #define MAX_UEVENT_LENGTH		50
 #define XM_UEVENT_DEBOUNCE_MS		250
@@ -411,6 +413,7 @@ struct battery_chg_dev {
 	struct work_struct		battery_check_work;
 	struct work_struct		charger_status_work;
 	int				fake_soc;
+	int				ui_soc;
 	bool				block_tx;
 	bool				ship_mode_en;
 	bool				debug_battery_detected;
@@ -433,6 +436,7 @@ struct battery_chg_dev {
 	bool				restrict_chg_en;
 	bool				shutdown_delay_en;
 	bool				charger_state_valid;
+	bool				ui_soc_valid;
 	struct delayed_work		xm_prop_change_work;
 	struct delayed_work		charger_debug_info_print_work;
 	/* To track the driver initialization status */
@@ -1622,13 +1626,19 @@ static u32 battery_chg_effective_usb_type(struct battery_chg_dev *bcdev,
 	return reported_type;
 }
 
+static u8 get_quick_charge_type(struct battery_chg_dev *bcdev);
+
 static u32 battery_chg_get_xiaomi_power_max_w(struct battery_chg_dev *bcdev)
 {
 	struct xiaomi_pps_status status;
 
 	battery_chg_get_xiaomi_pps_status(bcdev, &status);
-	if (!battery_chg_has_xiaomi_pps_evidence(&status))
+	if (!battery_chg_has_xiaomi_pps_evidence(&status)) {
+		if (get_quick_charge_type(bcdev) == QUICK_CHARGE_FLASH)
+			return VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W;
+
 		return 0;
+	}
 
 	if (battery_chg_is_xiaomi_high_power_pps(&status))
 		return VENUS_XIAOMI_PPS_POWER_MAX_W;
@@ -1982,6 +1992,73 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	return rc;
 }
 
+static int battery_chg_smooth_capacity(struct battery_chg_dev *bcdev,
+			struct psy_state *pst, int raw_soc)
+{
+	int status = POWER_SUPPLY_STATUS_UNKNOWN;
+	int ui_soc, rc;
+
+	if (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100) {
+		bcdev->ui_soc_valid = false;
+		return bcdev->fake_soc;
+	}
+
+	if (raw_soc < 0)
+		raw_soc = 0;
+	else if (raw_soc > 100)
+		raw_soc = 100;
+
+	if (!bcdev->ui_soc_valid) {
+		bcdev->ui_soc = raw_soc;
+		bcdev->ui_soc_valid = true;
+		return raw_soc;
+	}
+
+	if (bcdev->charger_state_valid) {
+		status = pst->prop[BATT_STATUS];
+	} else {
+		rc = read_property_id(bcdev, pst, BATT_STATUS);
+		if (!rc)
+			status = pst->prop[BATT_STATUS];
+	}
+
+	ui_soc = bcdev->ui_soc;
+	switch (status) {
+	case POWER_SUPPLY_STATUS_CHARGING:
+		if (raw_soc > ui_soc)
+			ui_soc += VENUS_UI_SOC_STEP;
+		else if (raw_soc < ui_soc)
+			ui_soc -= VENUS_UI_SOC_STEP;
+		break;
+	case POWER_SUPPLY_STATUS_FULL:
+		if (raw_soc > ui_soc)
+			ui_soc += VENUS_UI_SOC_STEP;
+		else if (raw_soc < ui_soc)
+			ui_soc -= VENUS_UI_SOC_STEP;
+		break;
+	case POWER_SUPPLY_STATUS_DISCHARGING:
+		if (raw_soc < ui_soc)
+			ui_soc -= VENUS_UI_SOC_STEP;
+		break;
+	default:
+		if (raw_soc > ui_soc + VENUS_UI_SOC_STEP)
+			ui_soc += VENUS_UI_SOC_STEP;
+		else if (raw_soc < ui_soc - VENUS_UI_SOC_STEP)
+			ui_soc -= VENUS_UI_SOC_STEP;
+		else
+			ui_soc = raw_soc;
+		break;
+	}
+
+	if (ui_soc < 0)
+		ui_soc = 0;
+	else if (ui_soc > 100)
+		ui_soc = 100;
+
+	bcdev->ui_soc = ui_soc;
+	return ui_soc;
+}
+
 static int battery_psy_get_prop(struct power_supply *psy,
 		enum power_supply_property prop,
 		union power_supply_propval *pval)
@@ -2025,11 +2102,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 #else
 		pval->intval = DIV_ROUND_CLOSEST(pst->prop[prop_id], 100);
 #endif
-		/*if (IS_ENABLED(CONFIG_QTI_PMIC_GLINK_CLIENT_DEBUG) &&
-		   (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100))
-			pval->intval = bcdev->fake_soc;*/
-		if(bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100)
-			pval->intval = bcdev->fake_soc;
+		pval->intval = battery_chg_smooth_capacity(bcdev,
+				pst, pval->intval);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 #if defined(CONFIG_BQ_FUEL_GAUGE)
