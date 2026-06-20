@@ -61,6 +61,8 @@
 #define AW8697_MAX_BST_VO 0x1f
 #define AW8697_GAIN_LEVEL_MIN 0x1E
 #define AW8697_GAIN_LEVEL_MAX 0x80
+#define AW8697_COLOROS_FF_GAIN_MIN 0x4736
+#define AW8697_COLOROS_FF_GAIN_MAX 0x7FFF
 #define AW8697_OPLUS_GAIN_MAX 2400
 
 #define OSC_CALIBRATION_T_LENGTH 5100000
@@ -1370,11 +1372,21 @@ static int aw8697_haptic_rtp_init(struct aw8697 *aw8697)
 
 static unsigned char aw8697_haptic_ff_gain_to_level(u16 gain)
 {
+	u32 level;
+
 	if (!gain)
 		return 0;
+	if (gain <= AW8697_COLOROS_FF_GAIN_MIN)
+		return AW8697_GAIN_LEVEL_MIN;
+	if (gain >= AW8697_COLOROS_FF_GAIN_MAX)
+		return AW8697_GAIN_LEVEL_MAX;
 
-	return AW8697_GAIN_LEVEL_MIN +
-		(gain * (AW8697_GAIN_LEVEL_MAX - AW8697_GAIN_LEVEL_MIN)) / 0xFFFF;
+	level = AW8697_GAIN_LEVEL_MIN +
+		((u32)(gain - AW8697_COLOROS_FF_GAIN_MIN) *
+		 (AW8697_GAIN_LEVEL_MAX - AW8697_GAIN_LEVEL_MIN)) /
+		(AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN);
+
+	return level;
 }
 
 static u16 aw8697_haptic_oplus_gain_to_ff_gain(unsigned int gain)
