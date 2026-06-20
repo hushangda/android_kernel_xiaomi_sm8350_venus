@@ -2066,6 +2066,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	int prop_id, rc;
+	int prev_ui_soc;
+	bool prev_ui_soc_valid;
 
 	pval->intval = -ENODATA;
 
@@ -2097,6 +2099,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		pval->strval = pst->model;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
+		prev_ui_soc = bcdev->ui_soc;
+		prev_ui_soc_valid = bcdev->ui_soc_valid;
 #if defined(CONFIG_BQ_FUEL_GAUGE)
 		pval->intval = pst->prop[prop_id] / 100;
 #else
@@ -2104,6 +2108,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 #endif
 		pval->intval = battery_chg_smooth_capacity(bcdev,
 				pst, pval->intval);
+		if (prev_ui_soc_valid && pval->intval != prev_ui_soc)
+			power_supply_changed(psy);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 #if defined(CONFIG_BQ_FUEL_GAUGE)
