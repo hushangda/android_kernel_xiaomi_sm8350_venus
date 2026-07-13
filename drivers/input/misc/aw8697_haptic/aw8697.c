@@ -65,6 +65,9 @@
 #define AW8697_COLOROS_FF_GAIN_MAX 0x7FFF
 #define AW8697_COLOROS_BST_VOL_MIN 0x11
 #define AW8697_COLOROS_BST_VOL_MAX AW8697_MAX_BST_VO
+#define AW8697_COLOROS_WEAK_GAIN 0x20
+#define AW8697_COLOROS_STRONG_GAIN AW8697_GAIN_LEVEL_MAX
+#define AW8697_COLOROS_RAM_REPEATS 1
 #define AW8697_OPLUS_GAIN_MAX 2400
 
 #define OSC_CALIBRATION_T_LENGTH 5100000
@@ -1374,25 +1377,28 @@ static int aw8697_haptic_rtp_init(struct aw8697 *aw8697)
 
 static unsigned char aw8697_haptic_ff_gain_to_level(u16 gain)
 {
+	u32 range;
+	u32 offset;
 	u32 level;
 
-	if (!gain)
-		return 0;
-	if (gain <= AW8697_COLOROS_FF_GAIN_MIN)
-		return AW8697_GAIN_LEVEL_MIN;
+	if (!gain || gain <= AW8697_COLOROS_FF_GAIN_MIN)
+		return AW8697_COLOROS_WEAK_GAIN;
 	if (gain >= AW8697_COLOROS_FF_GAIN_MAX)
-		return AW8697_GAIN_LEVEL_MAX;
+		return AW8697_COLOROS_STRONG_GAIN;
 
-	level = AW8697_GAIN_LEVEL_MIN +
-		((u32)(gain - AW8697_COLOROS_FF_GAIN_MIN) *
-		 (AW8697_GAIN_LEVEL_MAX - AW8697_GAIN_LEVEL_MIN)) /
-		(AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN);
+	range = AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN;
+	offset = gain - AW8697_COLOROS_FF_GAIN_MIN;
+	level = AW8697_COLOROS_WEAK_GAIN +
+		(offset * (AW8697_COLOROS_STRONG_GAIN -
+			   AW8697_COLOROS_WEAK_GAIN) + range / 2) / range;
 
 	return level;
 }
 
 static unsigned char aw8697_haptic_ff_gain_to_bst_vol(u16 gain)
 {
+	u32 range;
+	u32 offset;
 	u32 bst_vol;
 
 	if (!gain || gain <= AW8697_COLOROS_FF_GAIN_MIN)
@@ -1400,10 +1406,11 @@ static unsigned char aw8697_haptic_ff_gain_to_bst_vol(u16 gain)
 	if (gain >= AW8697_COLOROS_FF_GAIN_MAX)
 		return AW8697_COLOROS_BST_VOL_MAX;
 
+	range = AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN;
+	offset = gain - AW8697_COLOROS_FF_GAIN_MIN;
 	bst_vol = AW8697_COLOROS_BST_VOL_MIN +
-		((u32)(gain - AW8697_COLOROS_FF_GAIN_MIN) *
-		 (AW8697_COLOROS_BST_VOL_MAX - AW8697_COLOROS_BST_VOL_MIN)) /
-		(AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN);
+		(offset * (AW8697_COLOROS_BST_VOL_MAX -
+			   AW8697_COLOROS_BST_VOL_MIN) + range / 2) / range;
 
 	return bst_vol;
 }
@@ -1490,10 +1497,16 @@ static int aw8697_haptic_play_effect_seq(struct aw8697 *aw8697,
 
 	if (flag) {
 		if (aw8697->activate_mode == AW8697_HAPTIC_ACTIVATE_RAM_MODE) {
-			aw8697_haptic_set_wav_seq(aw8697, 0x00,
-						(char)aw8697->effect_id + 1);
-			aw8697_haptic_set_wav_seq(aw8697, 0x01, 0x00);
-			aw8697_haptic_set_wav_loop(aw8697, 0x00, 0x00);
+			unsigned char i;
+			unsigned char seq = (char)aw8697->effect_id + 1;
+			unsigned char repeats = AW8697_COLOROS_RAM_REPEATS;
+
+			for (i = 0; i < AW8697_SEQUENCER_SIZE; i++) {
+				aw8697_haptic_set_wav_seq(aw8697, i,
+							  i < repeats ? seq : 0);
+				aw8697_haptic_set_wav_loop(aw8697, i, 0);
+			}
+
 			aw8697_haptic_play_mode(aw8697, AW8697_HAPTIC_RAM_MODE);
 			if (aw8697->info.bst_vol_ram <= AW8697_MAX_BST_VO)
 				aw8697_haptic_set_bst_vol(aw8697, aw8697->info.bst_vol_ram);
@@ -1501,6 +1514,9 @@ static int aw8697_haptic_play_effect_seq(struct aw8697 *aw8697,
 				aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
 			aw8697_haptic_effect_strength(aw8697);
 			aw8697_haptic_set_gain(aw8697, aw8697->level);
+			if (aw8697->ff_gain_valid)
+				pr_info("%s: coloros linear level=0x%x bst=0x%x\n",
+					__func__, aw8697->level, aw8697->vmax);
 			aw8697_haptic_start(aw8697);
 		}
 		if (aw8697->activate_mode == AW8697_HAPTIC_ACTIVATE_RAM_LOOP_MODE) {
