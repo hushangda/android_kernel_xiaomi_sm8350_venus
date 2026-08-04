@@ -6311,6 +6311,7 @@ static int fts_set_fod_status(int value)
 
 	if (fts_info->fod_pressed && fts_info->fod_status == value) {
 		logError(1, "%s %s has already set and process:%d\n", tag, __func__, value);
+		pm_relax(fts_info->dev);
 		return res;
 	}
 	fts_info->fod_status = value;
