@@ -7,7 +7,10 @@
 #define __GF_SPI_H
 
 #include <linux/types.h>
+#include <linux/mutex.h>
 #include <linux/notifier.h>
+
+struct regulator;
 /**********************************************************/
 enum FP_MODE {
 	GF_IMAGE_MODE = 0,
@@ -147,6 +150,9 @@ struct gf_dev {
 #endif
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *gf_default_state;
+	struct regulator *vdd;
+	struct mutex power_lock;
+	bool power_enabled;
 };
 
 int gf_parse_dts(struct gf_dev *gf_dev);

@@ -1194,6 +1194,22 @@ int wlan_hdd_ipv4_changed(struct notifier_block *nb,
 }
 
 #ifdef FEATURE_RUNTIME_PM
+/*
+ * A CPU latency request is not, by itself, a reason to keep the WLAN PCIe
+ * function resumed.  It only needs to block WLAN runtime suspend when the
+ * requested latency is tighter than the WLAN resume path.
+ *
+ * In particular, always-on/listen PCM streams can keep a very relaxed CPU
+ * DMA latency request installed for their whole lifetime.  Treating every
+ * non-default request as latency sensitive pins RTPM_ID_QOS_NOTIFY forever
+ * even though those streams tolerate WLAN runtime suspend comfortably.
+ *
+ * Keep a small safety margin above the measured QCA6490 PCIe/CNSS resume
+ * path while preserving the existing behaviour for genuinely low-latency
+ * display, GPU, UFS and audio votes.
+ */
+#define WLAN_HDD_RUNTIME_PM_RESUME_LATENCY_US 20000UL
+
 int wlan_hdd_pm_qos_notify(struct notifier_block *nb, unsigned long curr_val,
 			   void *context)
 {
@@ -1201,6 +1217,7 @@ int wlan_hdd_pm_qos_notify(struct notifier_block *nb, unsigned long curr_val,
 						   pm_qos_notifier);
 	void *hif_ctx;
 	bool is_any_sta_connected = false;
+	bool qos_requires_wlan_active;
 
 	if (hdd_ctx->driver_status != DRIVER_MODULES_ENABLED) {
 		hdd_debug_rl("Driver Module closed; skipping pm qos notify");
@@ -1218,15 +1235,17 @@ int wlan_hdd_pm_qos_notify(struct notifier_block *nb, unsigned long curr_val,
 	hdd_debug("PM QOS update: runtime_pm_prevented %d Current value: %ld, is_any_sta_connected %d",
 		  hdd_ctx->runtime_pm_prevented, curr_val,
 		  is_any_sta_connected);
+	qos_requires_wlan_active =
+		curr_val <= WLAN_HDD_RUNTIME_PM_RESUME_LATENCY_US;
 	qdf_spin_lock_irqsave(&hdd_ctx->pm_qos_lock);
 
 	if (!hdd_ctx->runtime_pm_prevented &&
 	    is_any_sta_connected &&
-	    curr_val != wlan_hdd_get_pm_qos_cpu_latency()) {
+	    qos_requires_wlan_active) {
 		hif_pm_runtime_get_noresume(hif_ctx, RTPM_ID_QOS_NOTIFY);
 		hdd_ctx->runtime_pm_prevented = true;
 	} else if (hdd_ctx->runtime_pm_prevented &&
-		   curr_val == wlan_hdd_get_pm_qos_cpu_latency()) {
+		   !qos_requires_wlan_active) {
 		hif_pm_runtime_put(hif_ctx, RTPM_ID_QOS_NOTIFY);
 		hdd_ctx->runtime_pm_prevented = false;
 	}

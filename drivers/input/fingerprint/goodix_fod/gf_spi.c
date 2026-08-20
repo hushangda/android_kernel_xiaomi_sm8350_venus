@@ -73,54 +73,111 @@
 #define N_SPI_MINORS			32	/* ... up to 256 */
 
 
-#define MI_FP_3V
-static struct regulator *p_3v0_vreg = NULL;
-static int disable_regulator_3V0(struct regulator *vreg);
-static int enable_regulator_3V0(struct device *dev,struct regulator **pp_vreg);
+#define GF_VDD_SUPPLY		"l11c_vdd"
+#define GF_VDD_LOAD_UA		200000
 
-static int disable_regulator_3V0(struct regulator *vreg)
+static int gf_regulator_init(struct gf_dev *gf_dev)
 {
-	devm_regulator_put(vreg);
-	vreg = NULL;
+	struct device *dev = &gf_dev->spi->dev;
+	int rc;
+
+	mutex_init(&gf_dev->power_lock);
+	gf_dev->power_enabled = false;
+
+	gf_dev->vdd = devm_regulator_get(dev, GF_VDD_SUPPLY);
+	if (IS_ERR(gf_dev->vdd)) {
+		rc = PTR_ERR(gf_dev->vdd);
+		gf_dev->vdd = NULL;
+		dev_err(dev, "failed to get %s regulator: %d\n",
+			GF_VDD_SUPPLY, rc);
+		return rc;
+	}
+
 	return 0;
 }
 
-static int enable_regulator_3V0(struct device *dev, struct regulator **pp_vreg)
+static int gf_regulator_enable(struct gf_dev *gf_dev)
 {
-	int rc = 0;
-	struct regulator *vreg;
-	// vreg = devm_regulator_get(dev, "pm8350c_l11");
-	vreg = devm_regulator_get(dev, "l11c_vdd");
-	if (IS_ERR(vreg)) {
-		dev_err(dev, "fp %s: no of vreg found\n", __func__);
-		return PTR_ERR(vreg);
-	} else {
-		dev_err(dev, "fp %s: of vreg successful found\n", __func__);
+	int rc;
+
+	mutex_lock(&gf_dev->power_lock);
+	if (gf_dev->power_enabled) {
+		rc = 0;
+		goto out;
 	}
 
-/*Skip voltage set as it has been set in dts*/
-#if 0
-	rc = regulator_set_voltage(vreg, 3000000, 3000000);
+	if (!gf_dev->vdd) {
+		rc = -ENODEV;
+		goto out;
+	}
 
+	rc = regulator_set_load(gf_dev->vdd, GF_VDD_LOAD_UA);
+	if (rc)
+		goto out;
+
+	rc = regulator_enable(gf_dev->vdd);
 	if (rc) {
-		return rc;
-	}
-#endif
-
-	rc = regulator_set_load(vreg, 200000);
-
-	if (rc) {
-		return rc;
+		regulator_set_load(gf_dev->vdd, 0);
+		goto out;
 	}
 
-	rc = regulator_enable(vreg);
-
-	if (rc) {
-		return rc;
-	}
-
-	*pp_vreg = vreg;
+	gf_dev->power_enabled = true;
+out:
+	mutex_unlock(&gf_dev->power_lock);
 	return rc;
+}
+
+static int gf_regulator_disable(struct gf_dev *gf_dev)
+{
+	int load_rc;
+	int rc = 0;
+
+	mutex_lock(&gf_dev->power_lock);
+	if (!gf_dev->vdd || !gf_dev->power_enabled)
+		goto out;
+
+	rc = regulator_disable(gf_dev->vdd);
+	if (rc)
+		goto out;
+
+	gf_dev->power_enabled = false;
+	load_rc = regulator_set_load(gf_dev->vdd, 0);
+	if (load_rc)
+		dev_warn(&gf_dev->spi->dev,
+			 "failed to clear %s load vote: %d\n",
+			 GF_VDD_SUPPLY, load_rc);
+out:
+	mutex_unlock(&gf_dev->power_lock);
+	return rc;
+}
+
+static int gf_sensor_power_on(struct gf_dev *gf_dev)
+{
+	int rc;
+
+	rc = gf_regulator_enable(gf_dev);
+	if (rc)
+		return rc;
+
+	rc = gf_power_on(gf_dev);
+	if (rc)
+		gf_regulator_disable(gf_dev);
+
+	return rc;
+}
+
+static int gf_sensor_power_off(struct gf_dev *gf_dev)
+{
+	int regulator_rc;
+	int rc;
+
+	if (gf_dev->users && gpio_is_valid(gf_dev->reset_gpio))
+		gpio_set_value(gf_dev->reset_gpio, 0);
+
+	rc = gf_power_off(gf_dev);
+	regulator_rc = gf_regulator_disable(gf_dev);
+
+	return regulator_rc ? regulator_rc : rc;
 }
 
 static int SPIDEV_MAJOR;
@@ -534,25 +591,17 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case GF_IOC_ENABLE_POWER:
 		pr_debug("%s GF_IOC_ENABLE_POWER\n", __func__);
 
-		if (gf_dev->device_available == 1) {
-			pr_debug("Sensor has already powered-on.\n");
-		} else {
-			gf_power_on(gf_dev);
-		}
-
-		gf_dev->device_available = 1;
+		retval = gf_sensor_power_on(gf_dev);
+		if (!retval)
+			gf_dev->device_available = 1;
 		break;
 
 	case GF_IOC_DISABLE_POWER:
 		pr_debug("%s GF_IOC_DISABLE_POWER\n", __func__);
 
-		if (gf_dev->device_available == 0) {
-			pr_debug("Sensor has already powered-off.\n");
-		} else {
-			gf_power_off(gf_dev);
-		}
-
-		gf_dev->device_available = 0;
+		retval = gf_sensor_power_off(gf_dev);
+		if (!retval)
+			gf_dev->device_available = 0;
 		break;
 
 	case GF_IOC_ENTER_SLEEP_MODE:
@@ -766,6 +815,7 @@ static int gf_fasync(int fd, struct file *filp, int mode)
 static int gf_release(struct inode *inode, struct file *filp)
 {
 	struct gf_dev *gf_dev;
+	int power_rc;
 	int status = 0;
 	pr_debug("%s\n", __func__);
 	if (mutex_is_locked(&device_list_lock)) {
@@ -789,21 +839,24 @@ static int gf_release(struct inode *inode, struct file *filp)
 		gf_dev->vreg = NULL;
 	}
 #endif
-	gf_dev->users--;
-
-	if (!gf_dev->users) {
+	if (gf_dev->users == 1) {
 		pr_debug("disble_irq. irq = %d\n", gf_dev->irq);
 		gf_disable_irq(gf_dev);
 		/*power off the sensor */
+		power_rc = gf_sensor_power_off(gf_dev);
+		if (power_rc)
+			dev_err(&gf_dev->spi->dev,
+				"failed to power off sensor on release: %d\n",
+				power_rc);
 		gf_dev->device_available = 0;
 		free_irq(gf_dev->irq, gf_dev);
 		gpio_free(gf_dev->irq_gpio);
 		gpio_free(gf_dev->reset_gpio);
-		gf_power_off(gf_dev);
 #ifdef GF_PW_CTL
 		gpio_free(gf_dev->pwr_gpio);
 #endif
 	}
+	gf_dev->users--;
 
 	mutex_unlock(&device_list_lock);
 	return status;
@@ -928,6 +981,10 @@ static int gf_probe(struct platform_device *pdev)
 		goto error_hw;
 	}
 
+	status = gf_regulator_init(gf_dev);
+	if (status)
+		goto error_hw;
+
 	/* If we can allocate a minor number, hook up this device.
 	 * Reusing minors is fine so long as udev or mdev is working.
 	 */
@@ -980,11 +1037,6 @@ static int gf_probe(struct platform_device *pdev)
 			goto error_input;
 		}
 	}
-	status = enable_regulator_3V0(&gf_dev->spi->dev,&p_3v0_vreg);
-	if(status) {
-		goto error_regulator;
-	}
-
 #ifdef AP_CONTROL_CLK
 	pr_debug("Get the clk resource.\n");
 
@@ -1022,9 +1074,6 @@ gfspi_probe_clk_enable_failed:
 	gfspi_ioctl_clk_uninit(gf_dev);
 gfspi_probe_clk_init_failed:
 #endif
-error_regulator:
-	disable_regulator_3V0(p_3v0_vreg);
-
 	input_unregister_device(gf_dev->input);
 error_input:
 
@@ -1056,8 +1105,12 @@ static int gf_remove(struct platform_device *pdev)
 #endif
 {
 	struct gf_dev *gf_dev = &gf;
+	int power_rc;
 
-	disable_regulator_3V0(p_3v0_vreg);
+	power_rc = gf_sensor_power_off(gf_dev);
+	if (power_rc)
+		dev_err(&gf_dev->spi->dev,
+			"failed to power off sensor on remove: %d\n", power_rc);
 	/*wakeup_source_destroy(fp_wakelock);*/
 	wakeup_source_unregister(fp_wakelock);
 	fp_wakelock = NULL;
