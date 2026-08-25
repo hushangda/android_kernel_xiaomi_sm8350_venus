@@ -210,6 +210,42 @@ static DEFINE_MUTEX(device_list_lock);
 static struct wakeup_source *fp_wakelock = NULL;
 static struct gf_dev gf;
 
+#ifdef CONFIG_PM_SLEEP
+static int gf_pm_suspend(struct device *dev)
+{
+	int rc;
+
+	/*
+	 * ColorOS and the Xiaomi Goodix HAL do not share one screen-state ABI.
+	 * The HAL normally brackets TEE traffic with the SPI-clock ioctls, but a
+	 * missed final transaction must not leave L11C's 200 mA HPM vote active
+	 * for the whole system-suspend interval.  Keep the rail enabled so FOD
+	 * calibration and IRQ wake survive, and only remove its active-load vote.
+	 */
+	rc = gf_sensor_set_idle(&gf);
+	if (rc && rc != -ENODEV)
+		dev_warn(dev, "failed to set fingerprint suspend load: %d\n", rc);
+
+	/* A diagnostic/policy bridge must never turn a recoverable vote failure
+	 * into a system-suspend failure.
+	 */
+	return 0;
+}
+
+static int gf_pm_resume(struct device *dev)
+{
+	/*
+	 * Leave L11C in LPM.  The first real TEE transaction raises the load via
+	 * GF_IOC_ENABLE_SPI_CLK and drops it again at DISABLE_SPI_CLK.
+	 */
+	return 0;
+}
+
+static const struct dev_pm_ops gf_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(gf_pm_suspend, gf_pm_resume)
+};
+#endif
+
 struct gf_key_map maps[] = {
 	{EV_KEY, GF_KEY_INPUT_HOME},
 	{EV_KEY, GF_KEY_INPUT_MENU},
@@ -1247,6 +1283,9 @@ static struct platform_driver gf_driver = {
 		.name = GF_DEV_NAME,
 		.owner = THIS_MODULE,
 		.of_match_table = gx_match_table,
+#ifdef CONFIG_PM_SLEEP
+		.pm = &gf_pm_ops,
+#endif
 	},
 	.probe = gf_probe,
 	.remove = gf_remove,

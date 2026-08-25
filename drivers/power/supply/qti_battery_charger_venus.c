@@ -446,7 +446,6 @@ struct battery_chg_dev {
 	unsigned long			quick_charge_online_jiffies;
 	struct delayed_work		quick_charge_type_work;
 	struct delayed_work		xm_prop_change_work;
-	struct delayed_work		charger_debug_info_print_work;
 	/* To track the driver initialization status */
 	bool				initialized;
 };
@@ -1082,7 +1081,6 @@ static void battery_chg_report_psy_changed(struct battery_chg_dev *bcdev,
 static void battery_chg_queue_charger_refresh(struct battery_chg_dev *bcdev)
 {
 	mod_delayed_work(system_wq, &bcdev->xm_prop_change_work, 0);
-	mod_delayed_work(system_wq, &bcdev->charger_debug_info_print_work, 0);
 }
 
 static void battery_chg_sync_charger_state(struct battery_chg_dev *bcdev)
@@ -5111,53 +5109,6 @@ out:
 	return;
 }
 
-#define CHARGING_PERIOD_S		60
-#define DISCHARGE_PERIOD_S		300
-static void xm_charger_debug_info_print_work(struct work_struct *work)
-{
-	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev, charger_debug_info_print_work.work);
-	struct power_supply *usb_psy = NULL;
-	int rc, usb_present = 0;
-	int vbus_vol_uv, ibus_ua;
-	int interval = DISCHARGE_PERIOD_S;
-	union power_supply_propval val = {0, };
-	//struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
-
-	usb_psy = bcdev->psy_list[PSY_TYPE_USB].psy;
-	if (usb_psy != NULL) {
-		rc = usb_psy_get_prop(usb_psy, POWER_SUPPLY_PROP_ONLINE, &val);
-		if (!rc)
-			usb_present = val.intval;
-		else
-			usb_present = 0;
-		pr_err("usb_present: %d\n", usb_present);
-	} else {
-		return;
-	}
-
-	if (usb_present == 1) {
-		rc = usb_psy_get_prop(usb_psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
-		if (!rc)
-			vbus_vol_uv = val.intval;
-		else
-			vbus_vol_uv = 0;
-
-		rc = usb_psy_get_prop(usb_psy, POWER_SUPPLY_PROP_CURRENT_NOW, &val);
-		if (!rc)
-			ibus_ua = val.intval;
-		else
-			ibus_ua = 0;
-
-		pr_err("vbus_vol_uv: %d, ibus_ua: %d\n", vbus_vol_uv, ibus_ua);
-		interval = CHARGING_PERIOD_S;
-	} else {
-		interval = DISCHARGE_PERIOD_S;
-	}
-
-	schedule_delayed_work(&bcdev->charger_debug_info_print_work, interval * HZ);
-}
-
-
 static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 {
 	struct device_node *node = bcdev->dev->of_node;
@@ -5330,7 +5281,6 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&bcdev->quick_charge_type_work,
 			battery_chg_quick_charge_type_work);
 	INIT_DELAYED_WORK(&bcdev->xm_prop_change_work, generate_xm_charge_uvent);
-	INIT_DELAYED_WORK(&bcdev->charger_debug_info_print_work, xm_charger_debug_info_print_work);
 	atomic_set(&bcdev->state, PMIC_GLINK_STATE_UP);
 	bcdev->dev = dev;
 	client_data.id = MSG_OWNER_BC;
