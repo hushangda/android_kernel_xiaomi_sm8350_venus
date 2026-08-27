@@ -10,6 +10,7 @@
 #include <linux/device.h>
 #include <linux/firmware.h>
 #include <linux/jiffies.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -63,6 +64,9 @@
 #define CHG_EVENT_WAKE_MS		1000
 #define VENUS_BATTERY_MODEL_NAME	"k2_4600mah"
 #define VENUS_BATTERY_DESIGN_UAH	4600000
+#define VENUS_UI_SOC_MIN_STEP_MS		30000
+#define VENUS_UI_SOC_MAX_STEP_MS		1800000
+#define VENUS_UI_SOC_FALLBACK_STEP_MS	300000
 #define VENUS_XIAOMI_PPS_POWER_MAX_W	55
 #define VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W	27
 #define VENUS_QUICK_CHARGE_FILTER_MS	3000
@@ -414,6 +418,7 @@ struct battery_chg_dev {
 	struct work_struct		battery_check_work;
 	struct work_struct		charger_status_work;
 	int				fake_soc;
+	struct mutex			ui_soc_lock;
 	struct mutex			quick_charge_lock;
 	struct mutex			thermal_temp_lock;
 	bool				block_tx;
@@ -438,6 +443,10 @@ struct battery_chg_dev {
 	bool				restrict_chg_en;
 	bool				shutdown_delay_en;
 	bool				charger_state_valid;
+	bool				ui_soc_valid;
+	int				ui_soc;
+	int				ui_soc_status;
+	ktime_t			ui_soc_update_time;
 	bool				thermal_temp_valid;
 	int				thermal_temp;
 	ktime_t			thermal_temp_read_time;
@@ -2157,6 +2166,104 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	return rc;
 }
 
+static u32 battery_chg_effective_full_uah(struct battery_chg_dev *bcdev,
+					  struct psy_state *pst)
+{
+	u32 full_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
+	u32 design_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
+
+	/* Follow the fuel gauge's learned full capacity for replacement packs. */
+	if (full_uah >= 2000000 && full_uah <= 10000000)
+		return full_uah;
+	if (design_uah >= 2000000 && design_uah <= 10000000)
+		return design_uah;
+	if (bcdev->battery_design_uah >= 2000000 &&
+	    bcdev->battery_design_uah <= 10000000)
+		return bcdev->battery_design_uah;
+
+	return VENUS_BATTERY_DESIGN_UAH;
+}
+
+static u32 battery_chg_ui_soc_step_ms(struct battery_chg_dev *bcdev,
+				      struct psy_state *pst)
+{
+	s64 current_ua = (s32)READ_ONCE(pst->prop[BATT_CURR_NOW]);
+	u64 step_ms;
+
+	if (current_ua < 0)
+		current_ua = -current_ua;
+	if (!current_ua)
+		return VENUS_UI_SOC_FALLBACK_STEP_MS;
+
+	/* Time needed to move one percent at the measured battery current. */
+	step_ms = div64_u64((u64)battery_chg_effective_full_uah(bcdev, pst) *
+				36000ULL, current_ua);
+
+	return clamp_val(step_ms, VENUS_UI_SOC_MIN_STEP_MS,
+			 VENUS_UI_SOC_MAX_STEP_MS);
+}
+
+static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
+				       struct psy_state *pst, int raw_soc)
+{
+	ktime_t now = ktime_get_boottime();
+	s64 elapsed_ms;
+	u32 step_ms;
+	int status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
+	int target_soc = raw_soc;
+	int steps, delta;
+
+	/* A raw 100 while the charger still says CHARGING is not a real full. */
+	if (status == POWER_SUPPLY_STATUS_CHARGING && target_soc == 100)
+		target_soc = 99;
+
+	mutex_lock(&bcdev->ui_soc_lock);
+	if (!bcdev->ui_soc_valid) {
+		bcdev->ui_soc = target_soc;
+		bcdev->ui_soc_status = status;
+		bcdev->ui_soc_update_time = now;
+		bcdev->ui_soc_valid = true;
+		goto out;
+	}
+
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99) {
+		bcdev->ui_soc = 100;
+		bcdev->ui_soc_status = status;
+		bcdev->ui_soc_update_time = now;
+		goto out;
+	}
+
+	/* Do not spend elapsed discharge time as an instant gain after plug-in. */
+	if (status != bcdev->ui_soc_status) {
+		bcdev->ui_soc_status = status;
+		bcdev->ui_soc_update_time = now;
+		goto out;
+	}
+
+	if (status == POWER_SUPPLY_STATUS_CHARGING)
+		target_soc = max(target_soc, bcdev->ui_soc);
+	else if (status == POWER_SUPPLY_STATUS_DISCHARGING)
+		target_soc = min(target_soc, bcdev->ui_soc);
+
+	delta = target_soc - bcdev->ui_soc;
+	if (!delta)
+		goto out;
+
+	step_ms = battery_chg_ui_soc_step_ms(bcdev, pst);
+	elapsed_ms = ktime_ms_delta(now, bcdev->ui_soc_update_time);
+	if (elapsed_ms < step_ms)
+		goto out;
+
+	steps = min_t(int, abs(delta), elapsed_ms / step_ms);
+	bcdev->ui_soc += delta > 0 ? steps : -steps;
+	bcdev->ui_soc_update_time = now;
+
+out:
+	raw_soc = bcdev->ui_soc;
+	mutex_unlock(&bcdev->ui_soc_lock);
+	return raw_soc;
+}
+
 static int battery_psy_get_prop(struct power_supply *psy,
 		enum power_supply_property prop,
 		union power_supply_propval *pval)
@@ -2195,10 +2302,17 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		pval->strval = pst->model;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-		pval->intval = clamp_val(
-			DIV_ROUND_CLOSEST(pst->prop[prop_id], 100), 0, 100);
-		if (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100)
+		pval->intval = clamp_val(DIV_ROUND_CLOSEST(
+			pst->prop[prop_id], 100), 0, 100);
+		if (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100) {
+			mutex_lock(&bcdev->ui_soc_lock);
+			bcdev->ui_soc_valid = false;
+			mutex_unlock(&bcdev->ui_soc_lock);
 			pval->intval = bcdev->fake_soc;
+		} else {
+			pval->intval = battery_chg_get_ui_capacity(bcdev, pst,
+							 pval->intval);
+		}
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
@@ -5269,6 +5383,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 		devm_kzalloc(&pdev->dev, MAX_STR_LEN, GFP_KERNEL);
 
 	mutex_init(&bcdev->rw_lock);
+	mutex_init(&bcdev->ui_soc_lock);
 	mutex_init(&bcdev->quick_charge_lock);
 	mutex_init(&bcdev->thermal_temp_lock);
 	init_completion(&bcdev->ack);
