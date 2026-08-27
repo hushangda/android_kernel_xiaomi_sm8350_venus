@@ -11,7 +11,13 @@ else
   echo "ERROR: KPM must be 1 or 0" >&2
   exit 1
 fi
-JOBS="${JOBS:-$(nproc)}"
+# Keep interactive desktop sessions responsive by default.  Dedicated build
+# hosts can still override this explicitly, for example JOBS=16.
+JOBS="${JOBS:-2}"
+if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: JOBS must be a positive integer" >&2
+  exit 1
+fi
 if (( KPM )); then
   DEFAULT_OUT_DIR="$ROOT_DIR/out-venus-5.4.302-kpm"
 else
