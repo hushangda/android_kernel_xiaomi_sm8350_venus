@@ -18,6 +18,8 @@
 #include <linux/bitops.h>
 #include <linux/input/qpnp-power-on.h>
 #include <linux/kobject.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 static const char * const powerup_reasons[PU_REASON_MAX] = {
 	[PU_REASON_EVENT_KPD]		= "keypad",
@@ -57,8 +59,19 @@ static const char * const reset_reasons[RS_REASON_MAX] = {
 static struct kobject *bootinfo_kobj;
 static char powerup_reason[MAX_CMDLINE_PARAM_LEN];
 static char powerdown_reason[MAX_CMDLINE_PARAM_LEN];
+static int escape_mode;
+static struct proc_dir_entry *last_boot_reason_proc;
+static struct proc_dir_entry *escape_mode_proc;
 u32 pu_reason = 0;
 u32 pd_reason = 0;
+
+static int __init escape_mode_setup(char *str)
+{
+	if (str)
+		kstrtoint(str, 0, &escape_mode);
+	return 1;
+}
+__setup("androidboot.escape_mode=", escape_mode_setup);
 
 #define bootinfo_attr(_name) \
 static struct kobj_attribute _name##_attr = {	\
@@ -220,6 +233,47 @@ static struct attribute_group attr_group = {
 	.attrs = g,
 };
 
+static int last_boot_reason_show(struct seq_file *seq, void *unused)
+{
+	char reason[MAX_CMDLINE_PARAM_LEN] = { 0 };
+
+	powerup_reason_show(NULL, NULL, reason);
+	seq_puts(seq, reason);
+	return 0;
+}
+
+static int last_boot_reason_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, last_boot_reason_show, NULL);
+}
+
+static const struct file_operations last_boot_reason_fops = {
+	.owner = THIS_MODULE,
+	.open = last_boot_reason_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int escape_mode_show(struct seq_file *seq, void *unused)
+{
+	seq_printf(seq, "%d\n", READ_ONCE(escape_mode));
+	return 0;
+}
+
+static int escape_mode_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, escape_mode_show, NULL);
+}
+
+static const struct file_operations escape_mode_fops = {
+	.owner = THIS_MODULE,
+	.open = escape_mode_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 static int __init bootinfo_init(void)
 {
 	int ret = -ENOMEM;
@@ -236,7 +290,23 @@ static int __init bootinfo_init(void)
 		goto sys_fail;
 	}
 
+	last_boot_reason_proc = proc_create("last_boot_reason", 0444, NULL,
+					    &last_boot_reason_fops);
+	escape_mode_proc = proc_create("escape_mode", 0444, NULL,
+					&escape_mode_fops);
+	if (!last_boot_reason_proc || !escape_mode_proc) {
+		ret = -ENOMEM;
+		goto proc_fail;
+	}
+
 	return ret;
+
+proc_fail:
+	if (last_boot_reason_proc)
+		proc_remove(last_boot_reason_proc);
+	if (escape_mode_proc)
+		proc_remove(escape_mode_proc);
+	sysfs_remove_group(bootinfo_kobj, &attr_group);
 
 sys_fail:
 	kobject_del(bootinfo_kobj);
@@ -247,6 +317,10 @@ fail:
 
 static void __exit bootinfo_exit(void)
 {
+	if (last_boot_reason_proc)
+		proc_remove(last_boot_reason_proc);
+	if (escape_mode_proc)
+		proc_remove(escape_mode_proc);
 	if (bootinfo_kobj) {
 		sysfs_remove_group(bootinfo_kobj, &attr_group);
 		kobject_del(bootinfo_kobj);

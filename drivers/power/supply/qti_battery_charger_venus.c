@@ -14,8 +14,10 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/proc_fs.h>
 #include <linux/reboot.h>
 #include <linux/rpmsg.h>
+#include <linux/seq_file.h>
 #include <linux/mutex.h>
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
@@ -63,6 +65,7 @@
 #define DEFAULT_RESTRICT_FCC_UA		1000000
 #define CHG_EVENT_WAKE_MS		1000
 #define VENUS_BATTERY_MODEL_NAME	"k2_4600mah"
+/* Used only until the remote fuel gauge returns a valid pack capacity. */
 #define VENUS_BATTERY_DESIGN_UAH	4600000
 #define VENUS_UI_SOC_MIN_STEP_MS		30000
 #define VENUS_UI_SOC_MAX_STEP_MS		1800000
@@ -396,6 +399,19 @@ struct psy_state {
 struct battery_chg_dev {
 	struct device			*dev;
 	struct class			battery_class;
+	struct class			*oplus_chg_class;
+	struct device			*oplus_battery_dev;
+	struct device			*oplus_usb_dev;
+	struct device			*oplus_wls_dev;
+	struct device			*oplus_ac_dev;
+	struct device			*oplus_common_dev;
+	struct proc_dir_entry		*oplus_shell_temp_proc;
+	struct proc_dir_entry		*oplus_wireless_proc_dir;
+	struct proc_dir_entry		*oplus_wired_otg_proc;
+	struct thermal_zone_device	*oplus_shell_tzd;
+	int				oplus_shell_temp_millic[3];
+	unsigned long			oplus_shell_temp_update[3];
+	unsigned long			oplus_shell_temp_valid;
 	struct pmic_glink_client	*client;
 	struct mutex			rw_lock;
 	struct completion		ack;
@@ -2166,6 +2182,36 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	return rc;
 }
 
+static bool battery_chg_capacity_uah_valid(u32 capacity_uah)
+{
+	return capacity_uah >= 2000000 && capacity_uah <= 10000000;
+}
+
+static void battery_chg_record_design_uah(struct battery_chg_dev *bcdev,
+					  u32 capacity_uah)
+{
+	if (battery_chg_capacity_uah_valid(capacity_uah))
+		WRITE_ONCE(bcdev->battery_design_uah,
+			   max(capacity_uah,
+			       READ_ONCE(bcdev->battery_design_uah)));
+}
+
+static void battery_chg_refresh_design_uah(struct battery_chg_dev *bcdev)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	u32 capacity_uah;
+
+	if (!read_property_id(bcdev, pst, BATT_CHG_FULL_DESIGN)) {
+		capacity_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
+		battery_chg_record_design_uah(bcdev, capacity_uah);
+	}
+
+	if (!read_property_id(bcdev, pst, BATT_CHG_FULL)) {
+		capacity_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
+		battery_chg_record_design_uah(bcdev, capacity_uah);
+	}
+}
+
 static u32 battery_chg_effective_full_uah(struct battery_chg_dev *bcdev,
 					  struct psy_state *pst)
 {
@@ -2173,15 +2219,797 @@ static u32 battery_chg_effective_full_uah(struct battery_chg_dev *bcdev,
 	u32 design_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
 
 	/* Follow the fuel gauge's learned full capacity for replacement packs. */
-	if (full_uah >= 2000000 && full_uah <= 10000000)
+	if (battery_chg_capacity_uah_valid(full_uah))
 		return full_uah;
-	if (design_uah >= 2000000 && design_uah <= 10000000)
+	if (battery_chg_capacity_uah_valid(design_uah))
 		return design_uah;
-	if (bcdev->battery_design_uah >= 2000000 &&
-	    bcdev->battery_design_uah <= 10000000)
-		return bcdev->battery_design_uah;
+	design_uah = READ_ONCE(bcdev->battery_design_uah);
+	if (battery_chg_capacity_uah_valid(design_uah))
+		return design_uah;
 
 	return VENUS_BATTERY_DESIGN_UAH;
+}
+
+static int battery_chg_read_full_uah(struct battery_chg_dev *bcdev,
+				     u32 *capacity_uah)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	int rc;
+
+	rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
+	if (rc < 0)
+		return rc;
+
+	*capacity_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
+	battery_chg_record_design_uah(bcdev, *capacity_uah);
+
+	return 0;
+}
+
+enum oplus_chg_compat_format {
+	OPLUS_CHG_FMT_U32,
+	OPLUS_CHG_FMT_S32,
+	OPLUS_CHG_FMT_MAH,
+	OPLUS_CHG_FMT_SOC,
+	OPLUS_CHG_FMT_DECI_C,
+	OPLUS_CHG_FMT_MINUTES_TO_SECONDS,
+	OPLUS_CHG_FMT_STATUS,
+	OPLUS_CHG_FMT_CHARGE_TYPE,
+	OPLUS_CHG_FMT_HEALTH,
+	OPLUS_CHG_FMT_TECHNOLOGY,
+	OPLUS_CHG_FMT_USB_TYPE,
+	OPLUS_CHG_FMT_WLS_TYPE,
+	OPLUS_CHG_FMT_MODEL,
+	OPLUS_CHG_FMT_DEVICE_TYPE,
+	OPLUS_CHG_FMT_DESIGN_UAH,
+	OPLUS_CHG_FMT_DESIGN_MAH,
+	OPLUS_CHG_FMT_FULL_UAH,
+	OPLUS_CHG_FMT_FCC_MAH,
+	OPLUS_CHG_FMT_AC_ONLINE,
+	OPLUS_CHG_FMT_USB_REAL_TYPE,
+	OPLUS_CHG_FMT_WLS_POWER,
+	OPLUS_CHG_FMT_FAST_ACTIVE,
+	OPLUS_CHG_FMT_SKIN_TEMP,
+	OPLUS_CHG_FMT_OTG_ONLINE,
+};
+
+enum oplus_chg_compat_type {
+	OPLUS_CHG_TYPE_COMMON,
+	OPLUS_CHG_TYPE_USB,
+	OPLUS_CHG_TYPE_WIRELESS,
+	OPLUS_CHG_TYPE_BATTERY,
+	OPLUS_CHG_TYPE_MAINS,
+};
+
+struct oplus_chg_compat_attr {
+	struct device_attribute dev_attr;
+	u16 prop_id;
+	u8 psy_type;
+	u8 format;
+};
+
+static const char * const oplus_chg_type_text[] = {
+	"Common", "USB", "Wireless", "Battery", "Mains"
+};
+
+static const char * const oplus_chg_status_text[] = {
+	"Unknown", "Charging", "Discharging", "Not charging", "Full"
+};
+
+static const char * const oplus_chg_charge_type_text[] = {
+	"Unknown", "N/A", "Trickle", "Fast", "Standard", "Adaptive",
+	"Custom"
+};
+
+static const char * const oplus_chg_health_text[] = {
+	"Unknown", "Good", "Overheat", "Dead", "Over voltage",
+	"Unspecified failure", "Cold", "Watchdog timer expire",
+	"Safety timer expire", "Over current", "Warm", "Cool", "Hot"
+};
+
+static const char * const oplus_chg_technology_text[] = {
+	"Unknown", "NiMH", "Li-ion", "Li-poly", "LiFe", "NiCd", "LiMn"
+};
+
+static const char * const oplus_chg_wls_type_text[] = {
+	"Unknown", "BPP", "EPP", "EPP-PLUS", "WARP", "SWARP", "PD-65W",
+	"TRX"
+};
+
+#define OPLUS_SHELL_TEMP_INPUTS		3
+#define OPLUS_SHELL_TEMP_MAX_AGE		(30 * HZ)
+#define VENUS_TYPEC_SINK_MODE		5
+#define VENUS_TYPEC_POWERED_CABLE_ONLY	9
+#define VENUS_TYPEC_AUDIO_ADAPTER	8
+
+static bool battery_chg_shell_input_temp(struct battery_chg_dev *bcdev,
+					 int *temp_millic)
+{
+	unsigned long now = jiffies;
+	bool found = false;
+	int i, temp;
+
+	for (i = 0; i < OPLUS_SHELL_TEMP_INPUTS; i++) {
+		if (!test_bit(i, &bcdev->oplus_shell_temp_valid))
+			continue;
+		if (time_after(now, READ_ONCE(bcdev->oplus_shell_temp_update[i]) +
+					 OPLUS_SHELL_TEMP_MAX_AGE))
+			continue;
+
+		temp = READ_ONCE(bcdev->oplus_shell_temp_millic[i]);
+		if (!found || temp > *temp_millic)
+			*temp_millic = temp;
+		found = true;
+	}
+
+	return found;
+}
+
+static int battery_chg_read_shell_temp(struct battery_chg_dev *bcdev,
+				       int *temp_millic)
+{
+	static const char * const shell_zones[] = {
+		"quiet_therm", "modem-skin-usr", "battery"
+	};
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
+	struct thermal_zone_device *tzd;
+	int rc;
+	u32 i;
+
+	/* Horae provides the fitted shell temperatures through /proc/shell-temp. */
+	if (battery_chg_shell_input_temp(bcdev, temp_millic))
+		return 0;
+
+	if (bcdev->oplus_shell_tzd) {
+		rc = thermal_zone_get_temp(bcdev->oplus_shell_tzd, temp_millic);
+		if (!rc)
+			return 0;
+		bcdev->oplus_shell_tzd = NULL;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(shell_zones); i++) {
+		tzd = thermal_zone_get_zone_by_name(shell_zones[i]);
+		if (IS_ERR(tzd))
+			continue;
+
+		rc = thermal_zone_get_temp(tzd, temp_millic);
+		if (!rc) {
+			bcdev->oplus_shell_tzd = tzd;
+			return 0;
+		}
+	}
+
+	/* The remote thermal property is degrees Celsius, not deci-degrees. */
+	rc = read_property_id(bcdev, pst, XM_PROP_THERMAL_TEMP);
+	if (rc < 0)
+		return rc;
+
+	*temp_millic = (s32)READ_ONCE(pst->prop[XM_PROP_THERMAL_TEMP]) * 1000;
+	return 0;
+}
+
+static int battery_chg_read_wired_otg_online(struct battery_chg_dev *bcdev,
+					     u32 *online)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 mode;
+	int rc;
+
+	rc = read_property_id(bcdev, pst, XM_PROP_TYPEC_MODE);
+	if (rc < 0)
+		return rc;
+
+	mode = READ_ONCE(pst->prop[XM_PROP_TYPEC_MODE]);
+	*online = mode >= VENUS_TYPEC_SINK_MODE &&
+		  mode <= VENUS_TYPEC_POWERED_CABLE_ONLY &&
+		  mode != VENUS_TYPEC_AUDIO_ADAPTER;
+	return 0;
+}
+
+static u32 battery_chg_get_wls_power_max_w(struct battery_chg_dev *bcdev)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_WLS];
+	u32 adapter;
+
+	if (read_property_id(bcdev, pst, WLS_TX_ADAPTER) < 0)
+		return 0;
+
+	adapter = READ_ONCE(pst->prop[WLS_TX_ADAPTER]) & 0xff;
+	switch (adapter) {
+	case ADAPTER_XIAOMI_QC3_20W:
+	case ADAPTER_XIAOMI_PD_20W:
+	case ADAPTER_XIAOMI_CAR_20W:
+		return 20;
+	case ADAPTER_XIAOMI_PD_30W:
+	case ADAPTER_VOICE_BOX_30W:
+		return 30;
+	case ADAPTER_XIAOMI_PD_50W:
+		return 50;
+	case ADAPTER_XIAOMI_PD_60W:
+		return 60;
+	case ADAPTER_XIAOMI_PD_100W:
+		return 100;
+	default:
+		return 0;
+	}
+}
+
+static ssize_t oplus_chg_compat_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct oplus_chg_compat_attr *compat_attr = container_of(attr,
+					struct oplus_chg_compat_attr, dev_attr);
+	struct battery_chg_dev *bcdev = dev_get_drvdata(dev);
+	struct psy_state *pst;
+	u32 value;
+	int temp_millic;
+	int rc;
+
+	switch (compat_attr->format) {
+	case OPLUS_CHG_FMT_DEVICE_TYPE:
+		if (compat_attr->prop_id >= ARRAY_SIZE(oplus_chg_type_text))
+			return -EINVAL;
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				oplus_chg_type_text[compat_attr->prop_id]);
+	case OPLUS_CHG_FMT_DESIGN_UAH:
+	case OPLUS_CHG_FMT_DESIGN_MAH:
+		battery_chg_refresh_design_uah(bcdev);
+		value = READ_ONCE(bcdev->battery_design_uah);
+		if (compat_attr->format == OPLUS_CHG_FMT_DESIGN_MAH)
+			value = DIV_ROUND_CLOSEST(value, 1000);
+		return scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	case OPLUS_CHG_FMT_FULL_UAH:
+	case OPLUS_CHG_FMT_FCC_MAH:
+		rc = battery_chg_read_full_uah(bcdev, &value);
+		if (rc < 0)
+			return rc;
+		if (compat_attr->format == OPLUS_CHG_FMT_FCC_MAH)
+			value = DIV_ROUND_CLOSEST(value, 1000);
+		return scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	case OPLUS_CHG_FMT_AC_ONLINE:
+		pst = &bcdev->psy_list[PSY_TYPE_USB];
+		rc = read_property_id(bcdev, pst, USB_ONLINE);
+		if (rc < 0)
+			return rc;
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				!!READ_ONCE(pst->prop[USB_ONLINE]));
+	case OPLUS_CHG_FMT_WLS_POWER:
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				battery_chg_get_wls_power_max_w(bcdev));
+	case OPLUS_CHG_FMT_FAST_ACTIVE:
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				get_quick_charge_type(bcdev) != QUICK_CHARGE_NORMAL);
+	case OPLUS_CHG_FMT_SKIN_TEMP:
+		rc = battery_chg_read_shell_temp(bcdev, &temp_millic);
+		if (rc < 0)
+			return rc;
+		return scnprintf(buf, PAGE_SIZE, "%d\n",
+				DIV_ROUND_CLOSEST(temp_millic, 100));
+	case OPLUS_CHG_FMT_OTG_ONLINE:
+		rc = battery_chg_read_wired_otg_online(bcdev, &value);
+		if (rc < 0)
+			return rc;
+		return scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	default:
+		break;
+	}
+
+	if (compat_attr->psy_type >= PSY_TYPE_MAX)
+		return -EINVAL;
+
+	pst = &bcdev->psy_list[compat_attr->psy_type];
+	rc = read_property_id(bcdev, pst, compat_attr->prop_id);
+	if (rc < 0)
+		return rc;
+	value = READ_ONCE(pst->prop[compat_attr->prop_id]);
+
+	switch (compat_attr->format) {
+	case OPLUS_CHG_FMT_U32:
+		return scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	case OPLUS_CHG_FMT_S32:
+		return scnprintf(buf, PAGE_SIZE, "%d\n", (s32)value);
+	case OPLUS_CHG_FMT_MAH:
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				DIV_ROUND_CLOSEST(value, 1000));
+	case OPLUS_CHG_FMT_SOC:
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				clamp_val(DIV_ROUND_CLOSEST(value, 100), 0, 100));
+	case OPLUS_CHG_FMT_DECI_C:
+		return scnprintf(buf, PAGE_SIZE, "%d\n",
+				DIV_ROUND_CLOSEST((s32)value, 10));
+	case OPLUS_CHG_FMT_MINUTES_TO_SECONDS:
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				value > 65535 / 60 ? 65535 : value * 60);
+	case OPLUS_CHG_FMT_STATUS:
+		if (value >= ARRAY_SIZE(oplus_chg_status_text))
+			value = 0;
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				oplus_chg_status_text[value]);
+	case OPLUS_CHG_FMT_CHARGE_TYPE:
+		if (value >= ARRAY_SIZE(oplus_chg_charge_type_text))
+			value = 0;
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				oplus_chg_charge_type_text[value]);
+	case OPLUS_CHG_FMT_HEALTH:
+		if (value >= ARRAY_SIZE(oplus_chg_health_text))
+			value = 0;
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				oplus_chg_health_text[value]);
+	case OPLUS_CHG_FMT_TECHNOLOGY:
+		if (value >= ARRAY_SIZE(oplus_chg_technology_text))
+			value = 0;
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				oplus_chg_technology_text[value]);
+	case OPLUS_CHG_FMT_USB_TYPE:
+		value = battery_chg_effective_usb_type(bcdev, value);
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				get_usb_type_name(value));
+	case OPLUS_CHG_FMT_WLS_TYPE:
+		if (value >= ARRAY_SIZE(oplus_chg_wls_type_text))
+			value = 0;
+		return scnprintf(buf, PAGE_SIZE, "%s\n",
+				oplus_chg_wls_type_text[value]);
+	case OPLUS_CHG_FMT_MODEL:
+		return scnprintf(buf, PAGE_SIZE, "%s\n", pst->model);
+	case OPLUS_CHG_FMT_USB_REAL_TYPE:
+		value = battery_chg_effective_usb_type(bcdev, value);
+		return scnprintf(buf, PAGE_SIZE, "%u\n", value);
+	default:
+		return -EINVAL;
+	}
+}
+
+#define OPLUS_CHG_COMPAT_ATTR(_group, _name, _psy, _prop, _format) \
+static struct oplus_chg_compat_attr oplus_##_group##_##_name = { \
+	.dev_attr = __ATTR(_name, 0444, oplus_chg_compat_show, NULL), \
+	.psy_type = _psy, \
+	.prop_id = _prop, \
+	.format = _format, \
+}
+
+/*
+ * ColorOS consumes these files under /sys/class/oplus_chg.  They are
+ * read-only compatibility views of real QTI charger and fuel-gauge data;
+ * unsupported control and feature-detection files are deliberately absent.
+ * Oplus battery_fcc, battery_rm and design_capacity use mAh, while the
+ * power_supply charge_full files use uAh.
+ */
+OPLUS_CHG_COMPAT_ATTR(battery, type, PSY_TYPE_MAX,
+		       OPLUS_CHG_TYPE_BATTERY, OPLUS_CHG_FMT_DEVICE_TYPE);
+OPLUS_CHG_COMPAT_ATTR(battery, status, PSY_TYPE_BATTERY,
+		       BATT_STATUS, OPLUS_CHG_FMT_STATUS);
+OPLUS_CHG_COMPAT_ATTR(battery, present, PSY_TYPE_BATTERY,
+		       BATT_PRESENT, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, voltage_now, PSY_TYPE_BATTERY,
+		       BATT_VOLT_NOW, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, voltage_max, PSY_TYPE_BATTERY,
+		       BATT_VOLT_MAX, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, current_now, PSY_TYPE_BATTERY,
+		       BATT_CURR_NOW, OPLUS_CHG_FMT_S32);
+OPLUS_CHG_COMPAT_ATTR(battery, capacity, PSY_TYPE_BATTERY,
+		       BATT_CAPACITY, OPLUS_CHG_FMT_SOC);
+OPLUS_CHG_COMPAT_ATTR(battery, real_capacity, PSY_TYPE_BATTERY,
+		       BATT_CAPACITY, OPLUS_CHG_FMT_SOC);
+OPLUS_CHG_COMPAT_ATTR(battery, charge_type, PSY_TYPE_BATTERY,
+		       BATT_CHG_TYPE, OPLUS_CHG_FMT_CHARGE_TYPE);
+OPLUS_CHG_COMPAT_ATTR(battery, model_name, PSY_TYPE_BATTERY,
+		       BATT_MODEL_NAME, OPLUS_CHG_FMT_MODEL);
+OPLUS_CHG_COMPAT_ATTR(battery, temp, PSY_TYPE_BATTERY,
+		       BATT_TEMP, OPLUS_CHG_FMT_DECI_C);
+OPLUS_CHG_COMPAT_ATTR(battery, health, PSY_TYPE_BATTERY,
+		       BATT_HEALTH, OPLUS_CHG_FMT_HEALTH);
+OPLUS_CHG_COMPAT_ATTR(battery, technology, PSY_TYPE_BATTERY,
+		       BATT_TECHNOLOGY, OPLUS_CHG_FMT_TECHNOLOGY);
+OPLUS_CHG_COMPAT_ATTR(battery, cycle_count, PSY_TYPE_BATTERY,
+		       BATT_CYCLE_COUNT, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, voltage_ocv, PSY_TYPE_BATTERY,
+		       BATT_VOLT_OCV, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, charge_counter, PSY_TYPE_BATTERY,
+		       BATT_CHG_COUNTER, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, charge_full_design, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_DESIGN_UAH);
+OPLUS_CHG_COMPAT_ATTR(battery, charge_full, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_FULL_UAH);
+OPLUS_CHG_COMPAT_ATTR(battery, time_to_full_avg, PSY_TYPE_BATTERY,
+		       BATT_TTF_AVG, OPLUS_CHG_FMT_MINUTES_TO_SECONDS);
+OPLUS_CHG_COMPAT_ATTR(battery, time_to_full_now, PSY_TYPE_BATTERY,
+		       BATT_TTF_AVG, OPLUS_CHG_FMT_MINUTES_TO_SECONDS);
+OPLUS_CHG_COMPAT_ATTR(battery, time_to_empty_avg, PSY_TYPE_BATTERY,
+		       BATT_TTE_AVG, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, power_now, PSY_TYPE_BATTERY,
+		       BATT_POWER_NOW, OPLUS_CHG_FMT_S32);
+OPLUS_CHG_COMPAT_ATTR(battery, power_avg, PSY_TYPE_BATTERY,
+		       BATT_POWER_AVG, OPLUS_CHG_FMT_S32);
+OPLUS_CHG_COMPAT_ATTR(battery, authenticate, PSY_TYPE_XM,
+		       XM_PROP_AUTHENTIC, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, battery_cc, PSY_TYPE_BATTERY,
+		       BATT_CYCLE_COUNT, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, battery_fcc, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_FCC_MAH);
+OPLUS_CHG_COMPAT_ATTR(battery, battery_rm, PSY_TYPE_XM,
+		       XM_PROP_FG_RM, OPLUS_CHG_FMT_MAH);
+OPLUS_CHG_COMPAT_ATTR(battery, battery_soh, PSY_TYPE_BATTERY,
+		       BATT_SOH, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, chip_soc, PSY_TYPE_BATTERY,
+		       BATT_CAPACITY, OPLUS_CHG_FMT_SOC);
+OPLUS_CHG_COMPAT_ATTR(battery, design_capacity, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_DESIGN_MAH);
+OPLUS_CHG_COMPAT_ATTR(battery, battery_type, PSY_TYPE_BATTERY,
+		       BATT_MODEL_NAME, OPLUS_CHG_FMT_MODEL);
+OPLUS_CHG_COMPAT_ATTR(battery, gauge_vbat, PSY_TYPE_XM,
+		       XM_PROP_QBG_VBAT, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(battery, fast_charge, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_FAST_ACTIVE);
+
+OPLUS_CHG_COMPAT_ATTR(usb, type, PSY_TYPE_MAX,
+		       OPLUS_CHG_TYPE_USB, OPLUS_CHG_FMT_DEVICE_TYPE);
+OPLUS_CHG_COMPAT_ATTR(usb, online, PSY_TYPE_USB,
+		       USB_ONLINE, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, present, PSY_TYPE_USB,
+		       USB_ONLINE, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, voltage_now, PSY_TYPE_USB,
+		       USB_VOLT_NOW, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, voltage_max, PSY_TYPE_USB,
+		       USB_VOLT_MAX, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, current_now, PSY_TYPE_USB,
+		       USB_CURR_NOW, OPLUS_CHG_FMT_S32);
+OPLUS_CHG_COMPAT_ATTR(usb, current_max, PSY_TYPE_USB,
+		       USB_CURR_MAX, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, input_current_now, PSY_TYPE_USB,
+		       USB_CURR_NOW, OPLUS_CHG_FMT_S32);
+OPLUS_CHG_COMPAT_ATTR(usb, usb_type, PSY_TYPE_USB,
+		       USB_ADAP_TYPE, OPLUS_CHG_FMT_USB_TYPE);
+OPLUS_CHG_COMPAT_ATTR(usb, typec_cc_orientation, PSY_TYPE_XM,
+		       XM_PROP_CC_ORIENTATION, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, real_type, PSY_TYPE_USB,
+		       USB_REAL_TYPE, OPLUS_CHG_FMT_USB_REAL_TYPE);
+OPLUS_CHG_COMPAT_ATTR(usb, primal_type, PSY_TYPE_USB,
+		       USB_REAL_TYPE, OPLUS_CHG_FMT_USB_REAL_TYPE);
+OPLUS_CHG_COMPAT_ATTR(usb, usb_status, PSY_TYPE_USB,
+		       USB_MOISTURE_DET_STS, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(usb, otg_online, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_OTG_ONLINE);
+
+OPLUS_CHG_COMPAT_ATTR(wireless, type, PSY_TYPE_MAX,
+		       OPLUS_CHG_TYPE_WIRELESS, OPLUS_CHG_FMT_DEVICE_TYPE);
+OPLUS_CHG_COMPAT_ATTR(wireless, online, PSY_TYPE_WLS,
+		       WLS_ONLINE, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(wireless, present, PSY_TYPE_WLS,
+		       WLS_ONLINE, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(wireless, voltage_now, PSY_TYPE_WLS,
+		       WLS_VOLT_NOW, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(wireless, voltage_max, PSY_TYPE_WLS,
+		       WLS_VOLT_MAX, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(wireless, current_now, PSY_TYPE_WLS,
+		       WLS_CURR_NOW, OPLUS_CHG_FMT_S32);
+OPLUS_CHG_COMPAT_ATTR(wireless, current_max, PSY_TYPE_WLS,
+		       WLS_CURR_MAX, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(wireless, capacity, PSY_TYPE_BATTERY,
+		       BATT_CAPACITY, OPLUS_CHG_FMT_SOC);
+OPLUS_CHG_COMPAT_ATTR(wireless, wireless_type, PSY_TYPE_WLS,
+		       WLS_TYPE, OPLUS_CHG_FMT_WLS_TYPE);
+OPLUS_CHG_COMPAT_ATTR(wireless, real_type, PSY_TYPE_WLS,
+		       WLS_TYPE, OPLUS_CHG_FMT_U32);
+OPLUS_CHG_COMPAT_ATTR(wireless, max_w_power, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_WLS_POWER);
+
+OPLUS_CHG_COMPAT_ATTR(ac, type, PSY_TYPE_MAX,
+		       OPLUS_CHG_TYPE_MAINS, OPLUS_CHG_FMT_DEVICE_TYPE);
+OPLUS_CHG_COMPAT_ATTR(ac, online, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_AC_ONLINE);
+
+OPLUS_CHG_COMPAT_ATTR(common, type, PSY_TYPE_MAX,
+		       OPLUS_CHG_TYPE_COMMON, OPLUS_CHG_FMT_DEVICE_TYPE);
+OPLUS_CHG_COMPAT_ATTR(common, skin_temp, PSY_TYPE_MAX,
+		       0, OPLUS_CHG_FMT_SKIN_TEMP);
+
+#define OPLUS_CHG_ATTR_PTR(_group, _name) \
+	(&oplus_##_group##_##_name.dev_attr.attr)
+
+static struct attribute *oplus_battery_attrs[] = {
+	OPLUS_CHG_ATTR_PTR(battery, type),
+	OPLUS_CHG_ATTR_PTR(battery, status),
+	OPLUS_CHG_ATTR_PTR(battery, present),
+	OPLUS_CHG_ATTR_PTR(battery, voltage_now),
+	OPLUS_CHG_ATTR_PTR(battery, voltage_max),
+	OPLUS_CHG_ATTR_PTR(battery, current_now),
+	OPLUS_CHG_ATTR_PTR(battery, capacity),
+	OPLUS_CHG_ATTR_PTR(battery, real_capacity),
+	OPLUS_CHG_ATTR_PTR(battery, charge_type),
+	OPLUS_CHG_ATTR_PTR(battery, model_name),
+	OPLUS_CHG_ATTR_PTR(battery, temp),
+	OPLUS_CHG_ATTR_PTR(battery, health),
+	OPLUS_CHG_ATTR_PTR(battery, technology),
+	OPLUS_CHG_ATTR_PTR(battery, cycle_count),
+	OPLUS_CHG_ATTR_PTR(battery, voltage_ocv),
+	OPLUS_CHG_ATTR_PTR(battery, charge_counter),
+	OPLUS_CHG_ATTR_PTR(battery, charge_full_design),
+	OPLUS_CHG_ATTR_PTR(battery, charge_full),
+	OPLUS_CHG_ATTR_PTR(battery, time_to_full_avg),
+	OPLUS_CHG_ATTR_PTR(battery, time_to_full_now),
+	OPLUS_CHG_ATTR_PTR(battery, time_to_empty_avg),
+	OPLUS_CHG_ATTR_PTR(battery, power_now),
+	OPLUS_CHG_ATTR_PTR(battery, power_avg),
+	OPLUS_CHG_ATTR_PTR(battery, authenticate),
+	OPLUS_CHG_ATTR_PTR(battery, battery_cc),
+	OPLUS_CHG_ATTR_PTR(battery, battery_fcc),
+	OPLUS_CHG_ATTR_PTR(battery, battery_rm),
+	OPLUS_CHG_ATTR_PTR(battery, battery_soh),
+	OPLUS_CHG_ATTR_PTR(battery, chip_soc),
+	OPLUS_CHG_ATTR_PTR(battery, design_capacity),
+	OPLUS_CHG_ATTR_PTR(battery, battery_type),
+	OPLUS_CHG_ATTR_PTR(battery, gauge_vbat),
+	OPLUS_CHG_ATTR_PTR(battery, fast_charge),
+	NULL,
+};
+ATTRIBUTE_GROUPS(oplus_battery);
+
+static struct attribute *oplus_usb_attrs[] = {
+	OPLUS_CHG_ATTR_PTR(usb, type),
+	OPLUS_CHG_ATTR_PTR(usb, online),
+	OPLUS_CHG_ATTR_PTR(usb, present),
+	OPLUS_CHG_ATTR_PTR(usb, voltage_now),
+	OPLUS_CHG_ATTR_PTR(usb, voltage_max),
+	OPLUS_CHG_ATTR_PTR(usb, current_now),
+	OPLUS_CHG_ATTR_PTR(usb, current_max),
+	OPLUS_CHG_ATTR_PTR(usb, input_current_now),
+	OPLUS_CHG_ATTR_PTR(usb, usb_type),
+	OPLUS_CHG_ATTR_PTR(usb, typec_cc_orientation),
+	OPLUS_CHG_ATTR_PTR(usb, real_type),
+	OPLUS_CHG_ATTR_PTR(usb, primal_type),
+	OPLUS_CHG_ATTR_PTR(usb, usb_status),
+	OPLUS_CHG_ATTR_PTR(usb, otg_online),
+	NULL,
+};
+ATTRIBUTE_GROUPS(oplus_usb);
+
+static struct attribute *oplus_wireless_attrs[] = {
+	OPLUS_CHG_ATTR_PTR(wireless, type),
+	OPLUS_CHG_ATTR_PTR(wireless, online),
+	OPLUS_CHG_ATTR_PTR(wireless, present),
+	OPLUS_CHG_ATTR_PTR(wireless, voltage_now),
+	OPLUS_CHG_ATTR_PTR(wireless, voltage_max),
+	OPLUS_CHG_ATTR_PTR(wireless, current_now),
+	OPLUS_CHG_ATTR_PTR(wireless, current_max),
+	OPLUS_CHG_ATTR_PTR(wireless, capacity),
+	OPLUS_CHG_ATTR_PTR(wireless, wireless_type),
+	OPLUS_CHG_ATTR_PTR(wireless, real_type),
+	OPLUS_CHG_ATTR_PTR(wireless, max_w_power),
+	NULL,
+};
+ATTRIBUTE_GROUPS(oplus_wireless);
+
+static struct attribute *oplus_ac_attrs[] = {
+	OPLUS_CHG_ATTR_PTR(ac, type),
+	OPLUS_CHG_ATTR_PTR(ac, online),
+	NULL,
+};
+ATTRIBUTE_GROUPS(oplus_ac);
+
+static struct attribute *oplus_common_attrs[] = {
+	OPLUS_CHG_ATTR_PTR(common, type),
+	OPLUS_CHG_ATTR_PTR(common, skin_temp),
+	NULL,
+};
+ATTRIBUTE_GROUPS(oplus_common);
+
+static int oplus_shell_temp_proc_show(struct seq_file *seq, void *unused)
+{
+	struct battery_chg_dev *bcdev = seq->private;
+	int temp_millic;
+	bool found = false;
+	int i;
+	int rc;
+
+	for (i = 0; i < OPLUS_SHELL_TEMP_INPUTS; i++) {
+		if (!test_bit(i, &bcdev->oplus_shell_temp_valid))
+			continue;
+		seq_printf(seq, "%d %d\n", i,
+			   READ_ONCE(bcdev->oplus_shell_temp_millic[i]));
+		found = true;
+	}
+	if (found)
+		return 0;
+
+	rc = battery_chg_read_shell_temp(bcdev, &temp_millic);
+	if (rc < 0)
+		return rc;
+
+	seq_printf(seq, "0 %d\n", temp_millic);
+	return 0;
+}
+
+static ssize_t oplus_shell_temp_proc_write(struct file *file,
+					   const char __user *buf,
+					   size_t count, loff_t *ppos)
+{
+	struct battery_chg_dev *bcdev = PDE_DATA(file_inode(file));
+	char input[48];
+	int sensor, temp_millic;
+
+	if (!count || count >= sizeof(input))
+		return -EINVAL;
+	if (copy_from_user(input, buf, count))
+		return -EFAULT;
+	input[count] = '\0';
+
+	if (sscanf(input, "%d %d", &sensor, &temp_millic) != 2)
+		return -EINVAL;
+	if (sensor < 0 || sensor >= OPLUS_SHELL_TEMP_INPUTS ||
+	    temp_millic < -40000 || temp_millic > 150000)
+		return -ERANGE;
+
+	WRITE_ONCE(bcdev->oplus_shell_temp_millic[sensor], temp_millic);
+	WRITE_ONCE(bcdev->oplus_shell_temp_update[sensor], jiffies);
+	set_bit(sensor, &bcdev->oplus_shell_temp_valid);
+
+	return count;
+}
+
+static int oplus_shell_temp_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, oplus_shell_temp_proc_show, PDE_DATA(inode));
+}
+
+static const struct file_operations oplus_shell_temp_proc_ops = {
+	.owner = THIS_MODULE,
+	.open = oplus_shell_temp_proc_open,
+	.read = seq_read,
+	.write = oplus_shell_temp_proc_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int oplus_wired_otg_proc_show(struct seq_file *seq, void *unused)
+{
+	struct battery_chg_dev *bcdev = seq->private;
+	u32 online;
+	int rc;
+
+	rc = battery_chg_read_wired_otg_online(bcdev, &online);
+	if (rc < 0)
+		return rc;
+	seq_printf(seq, "%u\n", online);
+	return 0;
+}
+
+static int oplus_wired_otg_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, oplus_wired_otg_proc_show, PDE_DATA(inode));
+}
+
+static const struct file_operations oplus_wired_otg_proc_ops = {
+	.owner = THIS_MODULE,
+	.open = oplus_wired_otg_proc_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static int battery_chg_create_oplus_device(struct battery_chg_dev *bcdev,
+					   struct device **compat_dev,
+					   const struct attribute_group **groups,
+					   const char *name)
+{
+	*compat_dev = device_create_with_groups(bcdev->oplus_chg_class,
+						bcdev->dev, MKDEV(0, 0), bcdev,
+						groups, "%s", name);
+	if (IS_ERR(*compat_dev)) {
+		int rc = PTR_ERR(*compat_dev);
+
+		*compat_dev = NULL;
+		return rc;
+	}
+
+	return 0;
+}
+
+static void battery_chg_remove_oplus_sysfs(struct battery_chg_dev *bcdev)
+{
+	if (bcdev->oplus_common_dev) {
+		device_unregister(bcdev->oplus_common_dev);
+		bcdev->oplus_common_dev = NULL;
+	}
+	if (bcdev->oplus_ac_dev) {
+		device_unregister(bcdev->oplus_ac_dev);
+		bcdev->oplus_ac_dev = NULL;
+	}
+	if (bcdev->oplus_wls_dev) {
+		device_unregister(bcdev->oplus_wls_dev);
+		bcdev->oplus_wls_dev = NULL;
+	}
+	if (bcdev->oplus_usb_dev) {
+		device_unregister(bcdev->oplus_usb_dev);
+		bcdev->oplus_usb_dev = NULL;
+	}
+	if (bcdev->oplus_battery_dev) {
+		device_unregister(bcdev->oplus_battery_dev);
+		bcdev->oplus_battery_dev = NULL;
+	}
+	if (bcdev->oplus_chg_class) {
+		class_destroy(bcdev->oplus_chg_class);
+		bcdev->oplus_chg_class = NULL;
+	}
+}
+
+static int battery_chg_init_oplus_sysfs(struct battery_chg_dev *bcdev)
+{
+	int rc;
+
+	bcdev->oplus_chg_class = class_create(THIS_MODULE, "oplus_chg");
+	if (IS_ERR(bcdev->oplus_chg_class)) {
+		rc = PTR_ERR(bcdev->oplus_chg_class);
+		bcdev->oplus_chg_class = NULL;
+		return rc;
+	}
+
+	rc = battery_chg_create_oplus_device(bcdev, &bcdev->oplus_battery_dev,
+					oplus_battery_groups, "battery");
+	if (rc < 0)
+		goto error;
+	rc = battery_chg_create_oplus_device(bcdev, &bcdev->oplus_usb_dev,
+					oplus_usb_groups, "usb");
+	if (rc < 0)
+		goto error;
+	rc = battery_chg_create_oplus_device(bcdev, &bcdev->oplus_wls_dev,
+					oplus_wireless_groups, "wireless");
+	if (rc < 0)
+		goto error;
+	rc = battery_chg_create_oplus_device(bcdev, &bcdev->oplus_ac_dev,
+					oplus_ac_groups, "ac");
+	if (rc < 0)
+		goto error;
+	rc = battery_chg_create_oplus_device(bcdev, &bcdev->oplus_common_dev,
+					oplus_common_groups, "common");
+	if (rc < 0)
+		goto error;
+
+	return 0;
+
+error:
+	battery_chg_remove_oplus_sysfs(bcdev);
+	return rc;
+}
+
+static int battery_chg_init_oplus_shell_temp(struct battery_chg_dev *bcdev)
+{
+	bcdev->oplus_shell_temp_proc = proc_create_data("shell-temp", 0664, NULL,
+							&oplus_shell_temp_proc_ops,
+							bcdev);
+	if (!bcdev->oplus_shell_temp_proc)
+		return -ENOMEM;
+
+	bcdev->oplus_wireless_proc_dir = proc_mkdir("wireless", NULL);
+	if (!bcdev->oplus_wireless_proc_dir)
+		return -ENOMEM;
+
+	bcdev->oplus_wired_otg_proc = proc_create_data("wired_otg_online", 0444,
+						bcdev->oplus_wireless_proc_dir,
+						&oplus_wired_otg_proc_ops, bcdev);
+	if (!bcdev->oplus_wired_otg_proc) {
+		proc_remove(bcdev->oplus_wireless_proc_dir);
+		bcdev->oplus_wireless_proc_dir = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void battery_chg_remove_oplus_shell_temp(struct battery_chg_dev *bcdev)
+{
+	if (bcdev->oplus_wired_otg_proc) {
+		proc_remove(bcdev->oplus_wired_otg_proc);
+		bcdev->oplus_wired_otg_proc = NULL;
+	}
+	if (bcdev->oplus_wireless_proc_dir) {
+		proc_remove(bcdev->oplus_wireless_proc_dir);
+		bcdev->oplus_wireless_proc_dir = NULL;
+	}
+	if (bcdev->oplus_shell_temp_proc) {
+		proc_remove(bcdev->oplus_shell_temp_proc);
+		bcdev->oplus_shell_temp_proc = NULL;
+	}
+	bcdev->oplus_shell_tzd = NULL;
 }
 
 static u32 battery_chg_ui_soc_step_ms(struct battery_chg_dev *bcdev,
@@ -2211,7 +3039,7 @@ static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
 	u32 step_ms;
 	int status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
 	int target_soc = raw_soc;
-	int steps, delta;
+	int delta;
 
 	/* A raw 100 while the charger still says CHARGING is not a real full. */
 	if (status == POWER_SUPPLY_STATUS_CHARGING && target_soc == 100)
@@ -2254,8 +3082,15 @@ static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
 	if (elapsed_ms < step_ms)
 		goto out;
 
-	steps = min_t(int, abs(delta), elapsed_ms / step_ms);
-	bcdev->ui_soc += delta > 0 ? steps : -steps;
+	/*
+	 * Never spend a long quiet interval all at once when the remote gauge
+	 * catches up by several percentage points.  A previous implementation
+	 * converted the complete elapsed interval into multiple steps, which
+	 * made Android visibly jump (for example 99 -> 97 in one notification).
+	 * Keep the gauge value as the target, but expose at most one percent per
+	 * rate-limited update and start timing the next step from here.
+	 */
+	bcdev->ui_soc += delta > 0 ? 1 : -1;
 	bcdev->ui_soc_update_time = now;
 
 out:
@@ -2317,14 +3152,26 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TEMP:
 		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
 		break;
+	case POWER_SUPPLY_PROP_CHARGE_FULL:
+		raw_value = pst->prop[prop_id];
+		battery_chg_record_design_uah(bcdev, raw_value);
+		pval->intval = raw_value;
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		raw_value = pst->prop[prop_id];
-		if (raw_value) {
-			bcdev->battery_design_uah = raw_value;
-			pval->intval = raw_value;
-		} else {
-			pval->intval = bcdev->battery_design_uah;
-		}
+		battery_chg_record_design_uah(bcdev, raw_value);
+
+		/*
+		 * Replacement packs can advertise their larger installed capacity
+		 * through learned charge_full while the remote firmware retains the
+		 * stock design value. Preserve the largest valid value as design
+		 * capacity; normal cell ageing must not shrink a design rating. Read
+		 * it explicitly so the result does not depend on property query order.
+		 */
+		read_property_id(bcdev, pst, BATT_CHG_FULL);
+		raw_value = READ_ONCE(pst->prop[BATT_CHG_FULL]);
+		battery_chg_record_design_uah(bcdev, raw_value);
+		pval->intval = READ_ONCE(bcdev->battery_design_uah);
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
 		raw_value = pst->prop[prop_id];
@@ -5449,6 +6296,16 @@ static int battery_chg_probe(struct platform_device *pdev)
 		dev_err(dev, "Failed to create battery_class rc=%d\n", rc);
 		goto error;
 	}
+	rc = battery_chg_init_oplus_sysfs(bcdev);
+	if (rc < 0)
+		dev_warn(dev,
+			 "Failed to create Oplus charger compatibility nodes rc=%d\n",
+			 rc);
+	rc = battery_chg_init_oplus_shell_temp(bcdev);
+	if (rc < 0)
+		dev_warn(dev,
+			 "Failed to create Oplus shell temperature node rc=%d\n",
+			 rc);
 
 	battery_chg_add_debugfs(bcdev);
 	battery_chg_notify_enable(bcdev);
@@ -5478,6 +6335,8 @@ static int battery_chg_remove(struct platform_device *pdev)
 	device_init_wakeup(bcdev->dev, false);
 	cancel_delayed_work_sync(&bcdev->quick_charge_type_work);
 	debugfs_remove_recursive(bcdev->debugfs_dir);
+	battery_chg_remove_oplus_shell_temp(bcdev);
+	battery_chg_remove_oplus_sysfs(bcdev);
 	class_unregister(&bcdev->battery_class);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);

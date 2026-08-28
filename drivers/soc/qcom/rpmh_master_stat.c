@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/mm.h>
 #include <linux/of.h>
@@ -83,13 +84,30 @@ struct msm_rpmh_profile_unit {
 
 struct rpmh_master_stats_prv_data {
 	struct kobj_attribute ka;
+	struct kobj_attribute oplus_ka;
 	struct kobject *kobj;
+	struct kobject *oplus_module_kobj[2];
+	bool oplus_module_link[2];
 };
 
 static struct msm_rpmh_master_stats apss_master_stats;
 static void __iomem *rpmh_unit_base;
 
 static DEFINE_MUTEX(rpmh_stats_mutex);
+
+static const char * const oplus_stats_module_names[] = {
+	"qcom_stats",
+	"soc_sleep_stats",
+};
+
+#define MSM_ARCH_TIMER_FREQ 19200000
+
+static inline u64 get_time_in_msec(u64 counter)
+{
+	do_div(counter, MSM_ARCH_TIMER_FREQ / MSEC_PER_SEC);
+
+	return counter;
+}
 
 static ssize_t msm_rpmh_master_stats_print_data(char *prvbuf, ssize_t length,
 				struct msm_rpmh_master_stats *record,
@@ -154,6 +172,133 @@ static ssize_t msm_rpmh_master_stats_show(struct kobject *kobj,
 	mutex_unlock(&rpmh_stats_mutex);
 
 	return length;
+}
+
+static ssize_t
+oplus_print_master_stats(char *buf, ssize_t length,
+			 struct msm_rpmh_master_stats *record, const char *name)
+{
+	u64 accumulated_duration = record->accumulated_duration;
+
+	if (record->last_entered > record->last_exited)
+		accumulated_duration += __arch_counter_get_cntvct() -
+					record->last_entered;
+
+	return scnprintf(buf, length, "%s:%x:%llx\n", name, record->counts,
+			 get_time_in_msec(accumulated_duration));
+}
+
+/* Format consumed by ColorOS PowerStats SubSystemDataReader. */
+static ssize_t oplus_msm_rpmh_master_stats_show(struct kobject *kobj,
+						struct kobj_attribute *attr,
+						char *buf)
+{
+	ssize_t length = 0;
+	struct msm_rpmh_master_stats *record;
+	bool skip_apss = false;
+	int i;
+
+	mutex_lock(&rpmh_stats_mutex);
+
+	if (rpmh_unit_base) {
+		length = oplus_print_master_stats(buf, PAGE_SIZE,
+						  &apss_master_stats, "APSS");
+		skip_apss = true;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(rpmh_masters); i++) {
+		if (skip_apss && i == 0)
+			continue;
+
+		record = qcom_smem_get(rpmh_masters[i].pid,
+				       rpmh_masters[i].smem_id, NULL);
+		if (!IS_ERR_OR_NULL(record) && PAGE_SIZE - length > 0)
+			length += oplus_print_master_stats(buf + length,
+							  PAGE_SIZE - length,
+							  record,
+							  rpmh_masters[i].master_name);
+	}
+
+	mutex_unlock(&rpmh_stats_mutex);
+
+	return length;
+}
+
+/*
+ * ColorOS releases use both qcom_stats and soc_sleep_stats as the module
+ * directory name.  Keep one real data file and expose both legacy paths as
+ * sysfs links instead of duplicating the statistics implementation.
+ */
+static struct kobject *oplus_stats_module_kobject(const char *name)
+{
+	struct module_kobject *mk;
+	struct kobject *kobj;
+	int ret;
+
+	kobj = kset_find_obj(module_kset, name);
+	if (kobj)
+		return kobj;
+
+	mk = kzalloc(sizeof(*mk), GFP_KERNEL);
+	if (!mk)
+		return ERR_PTR(-ENOMEM);
+
+	mk->mod = THIS_MODULE;
+	mk->kobj.kset = module_kset;
+	ret = kobject_init_and_add(&mk->kobj, &module_ktype, NULL, "%s", name);
+	if (ret) {
+		kobject_put(&mk->kobj);
+		kfree(mk);
+
+		/* Another built-in driver may have created the shared root. */
+		if (ret == -EEXIST) {
+			kobj = kset_find_obj(module_kset, name);
+			if (kobj)
+				return kobj;
+		}
+		return ERR_PTR(ret);
+	}
+
+	return &mk->kobj;
+}
+
+static void oplus_remove_rpmh_master_links(struct rpmh_master_stats_prv_data *prvdata)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(prvdata->oplus_module_kobj); i++) {
+		if (!prvdata->oplus_module_kobj[i])
+			continue;
+		if (prvdata->oplus_module_link[i])
+			sysfs_remove_link(prvdata->oplus_module_kobj[i],
+					  "rpmh_stats");
+		kobject_put(prvdata->oplus_module_kobj[i]);
+		prvdata->oplus_module_kobj[i] = NULL;
+	}
+}
+
+static void oplus_create_rpmh_master_links(struct rpmh_master_stats_prv_data *prvdata)
+{
+	struct kobject *module_kobj;
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(oplus_stats_module_names); i++) {
+		module_kobj = oplus_stats_module_kobject(oplus_stats_module_names[i]);
+		if (IS_ERR(module_kobj)) {
+			pr_warn("failed to create /sys/module/%s: %ld\n",
+				oplus_stats_module_names[i], PTR_ERR(module_kobj));
+			continue;
+		}
+
+		prvdata->oplus_module_kobj[i] = module_kobj;
+		ret = sysfs_create_link(module_kobj, prvdata->kobj,
+					"rpmh_stats");
+		if (!ret)
+			prvdata->oplus_module_link[i] = true;
+		else if (ret != -EEXIST)
+			pr_warn("failed to create /sys/module/%s/rpmh_stats: %d\n",
+				oplus_stats_module_names[i], ret);
+	}
 }
 
 static inline void msm_rpmh_apss_master_stats_update(
@@ -234,6 +379,18 @@ static int msm_rpmh_master_stats_probe(struct platform_device *pdev)
 		goto fail_sysfs;
 	}
 
+	sysfs_attr_init(&prvdata->oplus_ka.attr);
+	prvdata->oplus_ka.attr.mode = 0444;
+	prvdata->oplus_ka.attr.name = "oplus_rpmh_master_stats";
+	prvdata->oplus_ka.show = oplus_msm_rpmh_master_stats_show;
+	prvdata->oplus_ka.store = NULL;
+
+	ret = sysfs_create_file(prvdata->kobj, &prvdata->oplus_ka.attr);
+	if (ret) {
+		pr_err("failed to create Oplus RPMh master stats node\n");
+		goto fail_oplus_sysfs;
+	}
+
 	rpmh_unit_base = of_iomap(pdev->dev.of_node, 0);
 	if (!rpmh_unit_base) {
 		pr_err("Failed to get rpmh_unit_base or rpm based target\n");
@@ -242,9 +399,13 @@ static int msm_rpmh_master_stats_probe(struct platform_device *pdev)
 		apss_master_stats.version_id = 0x1;
 	}
 
+	oplus_create_rpmh_master_links(prvdata);
+
 	platform_set_drvdata(pdev, prvdata);
 	return ret;
 
+fail_oplus_sysfs:
+	sysfs_remove_file(prvdata->kobj, &prvdata->ka.attr);
 fail_sysfs:
 	kobject_put(prvdata->kobj);
 	return ret;
@@ -257,7 +418,9 @@ static int msm_rpmh_master_stats_remove(struct platform_device *pdev)
 	prvdata = (struct rpmh_master_stats_prv_data *)
 				platform_get_drvdata(pdev);
 
+	oplus_remove_rpmh_master_links(prvdata);
 	sysfs_remove_file(prvdata->kobj, &prvdata->ka.attr);
+	sysfs_remove_file(prvdata->kobj, &prvdata->oplus_ka.attr);
 	kobject_put(prvdata->kobj);
 	platform_set_drvdata(pdev, NULL);
 	if (rpmh_unit_base)

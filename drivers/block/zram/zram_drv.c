@@ -36,6 +36,33 @@
 
 #include "zram_drv.h"
 
+#ifdef CONFIG_OPLUS_COLOROS_COMPAT
+/* ColorOS controls reclaim writeback through this per-zram ABI. */
+static atomic_t hybridswap_swapd_paused = ATOMIC_INIT(0);
+
+static ssize_t hybridswap_swapd_pause_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	return sysfs_emit(buf, "%d\n", atomic_read(&hybridswap_swapd_paused));
+}
+
+static ssize_t hybridswap_swapd_pause_store(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf, size_t len)
+{
+	bool paused;
+	int ret;
+
+	ret = kstrtobool(buf, &paused);
+	if (ret)
+		return ret;
+
+	atomic_set(&hybridswap_swapd_paused, paused);
+	return len;
+}
+#endif
+
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
 static DEFINE_MUTEX(zram_index_mutex);
@@ -635,6 +662,11 @@ static ssize_t writeback_store(struct device *dev,
 	ssize_t ret = len;
 	int mode, err;
 	unsigned long blk_idx = 0;
+
+#ifdef CONFIG_OPLUS_COLOROS_COMPAT
+	if (atomic_read(&hybridswap_swapd_paused))
+		return -EBUSY;
+#endif
 
 	if (sysfs_streq(buf, "idle"))
 		mode = IDLE_WRITEBACK;
@@ -1841,6 +1873,9 @@ static DEVICE_ATTR_WO(mem_used_max);
 static DEVICE_ATTR_WO(idle);
 static DEVICE_ATTR_RW(max_comp_streams);
 static DEVICE_ATTR_RW(comp_algorithm);
+#ifdef CONFIG_OPLUS_COLOROS_COMPAT
+static DEVICE_ATTR_RW(hybridswap_swapd_pause);
+#endif
 #ifdef CONFIG_ZRAM_WRITEBACK
 static DEVICE_ATTR_RW(backing_dev);
 static DEVICE_ATTR_WO(writeback);
@@ -1858,6 +1893,9 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_idle.attr,
 	&dev_attr_max_comp_streams.attr,
 	&dev_attr_comp_algorithm.attr,
+#ifdef CONFIG_OPLUS_COLOROS_COMPAT
+	&dev_attr_hybridswap_swapd_pause.attr,
+#endif
 #ifdef CONFIG_ZRAM_WRITEBACK
 	&dev_attr_backing_dev.attr,
 	&dev_attr_writeback.attr,

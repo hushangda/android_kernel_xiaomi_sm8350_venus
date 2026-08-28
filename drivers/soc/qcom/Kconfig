@@ -1357,6 +1357,15 @@ config SDX_EXT_IPC
 
       If unsure, say N.
 
+config OPLUS_COLOROS_COMPAT
+	bool "OPlus ColorOS userspace kernel ABI compatibility"
+	depends on SCHED_WALT && PROC_FS && SYSCTL
+	default n
+	help
+	  Provide the scheduling, frame-boost, stability and monitoring ABIs used
+	  by OPlus ColorOS userspace. Requests are translated to Qualcomm WALT
+	  per-task boost state and native kernel backends rather than placeholders.
+
 source "drivers/soc/qcom/icnss2/Kconfig"
 
 source "drivers/soc/qcom/gnsssirf/Kconfig"

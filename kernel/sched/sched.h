@@ -2209,6 +2209,7 @@ unsigned long arch_scale_max_freq_capacity(struct sched_domain *sd, int cpu)
 unsigned long capacity_curr_of(int cpu);
 
 #ifdef CONFIG_SCHED_WALT
+#include <linux/oplus_coloros_compat.h>
 static inline int per_task_boost(struct task_struct *p)
 {
 	if (p->wts.boost_period) {
@@ -2218,7 +2219,7 @@ static inline int per_task_boost(struct task_struct *p)
 			p->wts.boost = 0;
 		}
 	}
-	return p->wts.boost;
+	return oplus_coloros_task_boost(p, p->wts.boost);
 }
 #else
 static inline int per_task_boost(struct task_struct *p)

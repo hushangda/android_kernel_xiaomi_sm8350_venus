@@ -3008,6 +3008,13 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->wts.boost_period		= 0;
 	p->wts.low_latency		= 0;
 	p->wts.iowaited			= false;
+#ifdef CONFIG_OPLUS_COLOROS_COMPAT
+	p->wts.oplus_ux_state		= 0;
+	p->wts.oplus_im_flag		= 0;
+	p->wts.oplus_binder_ux		= 0;
+	p->wts.oplus_frame_boost_level	= 0;
+	p->wts.oplus_frame_boost_expires = 0;
+#endif
 #endif
 	INIT_LIST_HEAD(&p->se.group_node);
 
