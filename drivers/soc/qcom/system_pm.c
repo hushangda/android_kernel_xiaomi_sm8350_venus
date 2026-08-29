@@ -37,7 +37,7 @@ static int system_sleep_update_wakeup(bool from_idle)
 	/*
 	 * The architectural broadcast timer also carries non-wakeup hrtimers.
 	 * It is a valid wake source while entering an idle state, but must not
-	 * be forwarded to the PDC during system suspend.  Wakeup alarms are
+	 * be forwarded to the PDC during system suspend. Wakeup alarms are
 	 * programmed independently by alarmtimer/RTC.
 	 */
 #ifdef CONFIG_SUSPEND

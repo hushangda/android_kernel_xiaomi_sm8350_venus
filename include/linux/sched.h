@@ -618,13 +618,6 @@ struct walt_task_struct {
 	u8				low_latency;
 	u64				boost_period;
 	u64				boost_expires;
-#ifdef CONFIG_OPLUS_COLOROS_COMPAT
-	u32				oplus_ux_state;
-	u64				oplus_im_flag;
-	u8				oplus_binder_ux;
-	u8				oplus_frame_boost_level;
-	u64				oplus_frame_boost_expires;
-#endif
 	u64				last_sleep_ts;
 	u32				init_load_pct;
 	u32				unfilter;
