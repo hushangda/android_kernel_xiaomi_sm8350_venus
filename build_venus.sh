@@ -57,6 +57,12 @@ MAKE_ARGS=(
   READELF="$READELF"
 )
 
+# Keep host-tool compilation independent from the target compiler sysroot.
+# Passing these on make's command line is required because the kernel
+# Makefile assigns HOSTCC/HOSTCXX itself and therefore overrides environment
+# variables.
+[[ -n "${HOSTCC:-}" ]] && MAKE_ARGS+=(HOSTCC="$HOSTCC")
+[[ -n "${HOSTCXX:-}" ]] && MAKE_ARGS+=(HOSTCXX="$HOSTCXX")
 cd "$ROOT_DIR"
 mkdir -p "$OUT_DIR"
 
