@@ -63,8 +63,12 @@
 #define DEFAULT_RESTRICT_FCC_UA		1000000
 #define CHG_EVENT_WAKE_MS		1000
 #define VENUS_BATTERY_MODEL_NAME	"k2_4600mah"
+#define VENUS_BATTERY_MODEL_FMT		"k2_%umah"
 /* Used only until the remote fuel gauge returns a valid pack capacity. */
 #define VENUS_BATTERY_DESIGN_UAH	4600000
+#define VENUS_BATTERY_MIN_UAH		2000000
+#define VENUS_BATTERY_MAX_UAH		10000000
+#define VENUS_BATTERY_MAX_RM_UAH	11000000
 #define VENUS_XIAOMI_PPS_POWER_MAX_W	55
 #define VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W	27
 #define VENUS_QUICK_CHARGE_FILTER_MS	3000
@@ -2161,16 +2165,87 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 
 static bool battery_chg_capacity_uah_valid(u32 capacity_uah)
 {
-	return capacity_uah >= 2000000 && capacity_uah <= 10000000;
+	return capacity_uah >= VENUS_BATTERY_MIN_UAH &&
+		capacity_uah <= VENUS_BATTERY_MAX_UAH;
 }
 
-static void battery_chg_record_design_uah(struct battery_chg_dev *bcdev,
-					  u32 capacity_uah)
+static u32 battery_chg_refresh_pack_capacity_uah(
+					struct battery_chg_dev *bcdev,
+					struct psy_state *pst)
 {
-	if (battery_chg_capacity_uah_valid(capacity_uah))
-		WRITE_ONCE(bcdev->battery_design_uah,
-			   max(capacity_uah,
-			       READ_ONCE(bcdev->battery_design_uah)));
+	u32 full_design_uah, full_uah, pack_uah = 0;
+
+	/*
+	 * Replacement batteries report their capacity through either FULL or
+	 * FULL_DESIGN, depending on the remote fuel-gauge firmware.  Read both
+	 * and retain the larger valid value so a stock profile cannot cap an
+	 * expanded pack at 4600 mAh.
+	 */
+	read_property_id(bcdev, pst, BATT_CHG_FULL_DESIGN);
+	full_design_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
+
+	read_property_id(bcdev, pst, BATT_CHG_FULL);
+	full_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
+
+	if (battery_chg_capacity_uah_valid(full_design_uah))
+		pack_uah = full_design_uah;
+	if (battery_chg_capacity_uah_valid(full_uah))
+		pack_uah = max(pack_uah, full_uah);
+
+	if (!battery_chg_capacity_uah_valid(pack_uah))
+		pack_uah = READ_ONCE(bcdev->battery_design_uah);
+	if (!battery_chg_capacity_uah_valid(pack_uah))
+		pack_uah = VENUS_BATTERY_DESIGN_UAH;
+
+	WRITE_ONCE(bcdev->battery_design_uah, pack_uah);
+	if (pst->model)
+		scnprintf(pst->model, MAX_STR_LEN, VENUS_BATTERY_MODEL_FMT,
+			  DIV_ROUND_CLOSEST(pack_uah, 1000));
+
+	return pack_uah;
+}
+
+static int battery_chg_read_fg_remaining_uah(struct battery_chg_dev *bcdev,
+					      u32 *remaining_uah)
+{
+	struct psy_state *xm_pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 value;
+	int rc;
+
+	rc = read_property_id(bcdev, xm_pst, XM_PROP_FG_RM);
+	if (rc < 0)
+		return rc;
+
+	value = READ_ONCE(xm_pst->prop[XM_PROP_FG_RM]);
+	if (value > VENUS_BATTERY_MAX_RM_UAH)
+		return -ERANGE;
+
+	*remaining_uah = value;
+	return 0;
+}
+
+static int battery_chg_get_scaled_soc_x100(struct battery_chg_dev *bcdev,
+					    struct psy_state *pst,
+					    u32 *soc_x100)
+{
+	u32 pack_uah, remaining_uah;
+	u64 scaled;
+	int rc;
+
+	pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst);
+
+	rc = battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+	if (rc < 0)
+		return rc;
+
+	/* Do not turn a not-yet-initialized zero RM into a false empty SOC. */
+	if (!remaining_uah && READ_ONCE(pst->prop[BATT_CAPACITY]) > 100)
+		return -EAGAIN;
+
+	scaled = div64_u64((u64)remaining_uah * 10000, pack_uah);
+	*soc_x100 = min_t(u64, scaled, 10000);
+
+	return 0;
 }
 
 static int battery_chg_get_realtime_capacity(struct battery_chg_dev *bcdev,
@@ -2203,12 +2278,13 @@ static int battery_psy_get_prop(struct power_supply *psy,
 {
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
-	u32 raw_value;
+	u32 pack_uah, raw_value, remaining_uah, soc_x100;
 	int prop_id, rc;
 
 	pval->intval = -ENODATA;
 
 	if (prop == POWER_SUPPLY_PROP_MODEL_NAME) {
+		battery_chg_refresh_pack_capacity_uah(bcdev, pst);
 		pval->strval = pst->model ? pst->model : VENUS_BATTERY_MODEL_NAME;
 		return 0;
 	}
@@ -2217,18 +2293,26 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	if (prop == POWER_SUPPLY_PROP_TIME_TO_FULL_NOW)
 		prop = POWER_SUPPLY_PROP_TIME_TO_FULL_AVG;
 
+	if (prop == POWER_SUPPLY_PROP_CHARGE_COUNTER &&
+	    !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah)) {
+		pval->intval = remaining_uah;
+		return 0;
+	}
+
+	if (prop == POWER_SUPPLY_PROP_CHARGE_FULL ||
+	    prop == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN) {
+		pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst);
+		pval->intval = pack_uah;
+		return 0;
+	}
+
 	prop_id = get_property_id(pst, prop);
 	if (prop_id < 0)
 		return prop_id;
 
 	rc = read_property_id(bcdev, pst, prop_id);
-	if (rc < 0) {
-		if (prop == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN) {
-			pval->intval = bcdev->battery_design_uah;
-			return 0;
-		}
+	if (rc < 0)
 		return rc;
-	}
 
 	switch (prop) {
 	case POWER_SUPPLY_PROP_MODEL_NAME:
@@ -2240,27 +2324,20 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		if (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100) {
 			pval->intval = bcdev->fake_soc;
 		} else {
+			/*
+			 * The remote integer SOC remains calibrated for the stock
+			 * cell on Venus.  RM and FULL, however, carry the real uAh
+			 * values for replacement packs, so use their ratio.
+			 */
+			if (!battery_chg_get_scaled_soc_x100(bcdev, pst,
+							 &soc_x100))
+				pval->intval = soc_x100 / 100;
 			pval->intval = battery_chg_get_realtime_capacity(bcdev,
 							      pst, pval->intval);
 		}
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
-		break;
-	case POWER_SUPPLY_PROP_CHARGE_FULL:
-		raw_value = pst->prop[prop_id];
-		battery_chg_record_design_uah(bcdev, raw_value);
-		pval->intval = raw_value;
-		break;
-	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-		raw_value = pst->prop[prop_id];
-		battery_chg_record_design_uah(bcdev, raw_value);
-
-		/* Preserve a valid larger replacement-pack capacity. */
-		read_property_id(bcdev, pst, BATT_CHG_FULL);
-		raw_value = READ_ONCE(pst->prop[BATT_CHG_FULL]);
-		battery_chg_record_design_uah(bcdev, raw_value);
-		pval->intval = READ_ONCE(bcdev->battery_design_uah);
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
 		raw_value = pst->prop[prop_id];
@@ -3909,8 +3986,14 @@ static ssize_t soc_decimal_show(struct class *c,
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
+	struct psy_state *batt_pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 soc_x100;
 	int rc;
+
+	rc = battery_chg_get_scaled_soc_x100(bcdev, batt_pst, &soc_x100);
+	if (!rc)
+		return scnprintf(buf, PAGE_SIZE, "%u", soc_x100 % 100);
 
 	rc = read_property_id(bcdev, pst, XM_PROP_SOC_DECIMAL);
 	if (rc < 0)
@@ -4802,14 +4885,14 @@ static ssize_t fg_rm_show(struct class *c,
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
-	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 remaining_uah;
 	int rc;
 
-	rc = read_property_id(bcdev, pst, XM_PROP_FG_RM);
+	rc = battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
 	if (rc < 0)
 		return rc;
 
-	return scnprintf(buf, PAGE_SIZE, "%u\n", pst->prop[XM_PROP_FG_RM]);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", remaining_uah);
 }
 static CLASS_ATTR_RO(fg_rm);
 
