@@ -437,6 +437,7 @@ struct battery_chg_dev {
 	u32				last_fcc_ua;
 	u32				usb_icl_ua;
 	u32				battery_design_uah;
+	u32				battery_full_uah;
 	u32				reverse_chg_flag;
 	bool				xm_uevent_valid;
 	char				xm_uevent_cache[XM_CHARGE_UEVENT_COUNT]
@@ -2171,15 +2172,19 @@ static bool battery_chg_capacity_uah_valid(u32 capacity_uah)
 
 static u32 battery_chg_refresh_pack_capacity_uah(
 					struct battery_chg_dev *bcdev,
-					struct psy_state *pst)
+					struct psy_state *pst,
+					u32 *learned_full_uah)
 {
-	u32 full_design_uah, full_uah, pack_uah = 0;
+	u32 full_design_uah, full_uah;
+	u32 pack_uah = READ_ONCE(bcdev->battery_design_uah);
 
 	/*
 	 * Replacement batteries report their capacity through either FULL or
-	 * FULL_DESIGN, depending on the remote fuel-gauge firmware.  Read both
-	 * and retain the larger valid value so a stock profile cannot cap an
-	 * expanded pack at 4600 mAh.
+	 * FULL_DESIGN, depending on the remote fuel-gauge firmware.  Preserve the
+	 * largest valid nominal capacity seen so a stock profile cannot cap an
+	 * expanded pack at 4600 mAh.  FULL itself remains the learned FCC and is
+	 * cached separately: an aged stock battery can legitimately have FULL
+	 * below FULL_DESIGN.
 	 */
 	read_property_id(bcdev, pst, BATT_CHG_FULL_DESIGN);
 	full_design_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
@@ -2188,16 +2193,20 @@ static u32 battery_chg_refresh_pack_capacity_uah(
 	full_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
 
 	if (battery_chg_capacity_uah_valid(full_design_uah))
-		pack_uah = full_design_uah;
-	if (battery_chg_capacity_uah_valid(full_uah))
+		pack_uah = max(pack_uah, full_design_uah);
+	if (battery_chg_capacity_uah_valid(full_uah)) {
 		pack_uah = max(pack_uah, full_uah);
+		WRITE_ONCE(bcdev->battery_full_uah, full_uah);
+	}
 
-	if (!battery_chg_capacity_uah_valid(pack_uah))
-		pack_uah = READ_ONCE(bcdev->battery_design_uah);
 	if (!battery_chg_capacity_uah_valid(pack_uah))
 		pack_uah = VENUS_BATTERY_DESIGN_UAH;
+	if (!battery_chg_capacity_uah_valid(full_uah))
+		full_uah = READ_ONCE(bcdev->battery_full_uah);
 
 	WRITE_ONCE(bcdev->battery_design_uah, pack_uah);
+	if (learned_full_uah)
+		*learned_full_uah = full_uah;
 	if (pst->model)
 		scnprintf(pst->model, MAX_STR_LEN, VENUS_BATTERY_MODEL_FMT,
 			  DIV_ROUND_CLOSEST(pack_uah, 1000));
@@ -2228,11 +2237,23 @@ static int battery_chg_get_scaled_soc_x100(struct battery_chg_dev *bcdev,
 					    struct psy_state *pst,
 					    u32 *soc_x100)
 {
-	u32 pack_uah, remaining_uah;
+	u32 learned_full_uah, pack_uah, remaining_uah;
 	u64 scaled;
 	int rc;
 
-	pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst);
+	pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst,
+							 &learned_full_uah);
+
+	/*
+	 * The remote SOC is already calibrated for the stock 4600 mAh battery
+	 * and accounts for its learned FCC, reserve and gauge smoothing.  Only
+	 * replacement packs need RM/FCC scaling because their remote SOC can
+	 * remain tied to the stock profile.
+	 */
+	if (pack_uah <= VENUS_BATTERY_DESIGN_UAH)
+		return -EOPNOTSUPP;
+	if (!battery_chg_capacity_uah_valid(learned_full_uah))
+		return -ENODATA;
 
 	rc = battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
 	if (rc < 0)
@@ -2242,7 +2263,7 @@ static int battery_chg_get_scaled_soc_x100(struct battery_chg_dev *bcdev,
 	if (!remaining_uah && READ_ONCE(pst->prop[BATT_CAPACITY]) > 100)
 		return -EAGAIN;
 
-	scaled = div64_u64((u64)remaining_uah * 10000, pack_uah);
+	scaled = div64_u64((u64)remaining_uah * 10000, learned_full_uah);
 	*soc_x100 = min_t(u64, scaled, 10000);
 
 	return 0;
@@ -2278,13 +2299,13 @@ static int battery_psy_get_prop(struct power_supply *psy,
 {
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
-	u32 pack_uah, raw_value, remaining_uah, soc_x100;
+	u32 learned_full_uah, pack_uah, raw_value, remaining_uah, soc_x100;
 	int prop_id, rc;
 
 	pval->intval = -ENODATA;
 
 	if (prop == POWER_SUPPLY_PROP_MODEL_NAME) {
-		battery_chg_refresh_pack_capacity_uah(bcdev, pst);
+		battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
 		pval->strval = pst->model ? pst->model : VENUS_BATTERY_MODEL_NAME;
 		return 0;
 	}
@@ -2299,9 +2320,17 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		return 0;
 	}
 
-	if (prop == POWER_SUPPLY_PROP_CHARGE_FULL ||
-	    prop == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN) {
-		pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst);
+	if (prop == POWER_SUPPLY_PROP_CHARGE_FULL) {
+		battery_chg_refresh_pack_capacity_uah(bcdev, pst,
+						       &learned_full_uah);
+		if (!battery_chg_capacity_uah_valid(learned_full_uah))
+			return -ENODATA;
+		pval->intval = learned_full_uah;
+		return 0;
+	}
+
+	if (prop == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN) {
+		pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
 		pval->intval = pack_uah;
 		return 0;
 	}
@@ -2325,9 +2354,9 @@ static int battery_psy_get_prop(struct power_supply *psy,
 			pval->intval = bcdev->fake_soc;
 		} else {
 			/*
-			 * The remote integer SOC remains calibrated for the stock
-			 * cell on Venus.  RM and FULL, however, carry the real uAh
-			 * values for replacement packs, so use their ratio.
+			 * Expanded packs use RM / learned FULL.  Stock packs retain
+			 * the remote SOC so normal FCC aging cannot cap them below
+			 * 100 percent.
 			 */
 			if (!battery_chg_get_scaled_soc_x100(bcdev, pst,
 							 &soc_x100))

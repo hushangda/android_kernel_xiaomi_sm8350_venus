@@ -63,6 +63,38 @@ config ANDROID_VENDOR_HOOKS
 	  Allow vendor modules to attach to tracepoint "hooks" defined via
 	  DECLARE_HOOK or DECLARE_RESTRICTED_HOOK.
 
+config OPLUS_FEATURE_HANS
+	bool "OPlus HANS freezer compatibility"
+	depends on ANDROID_BINDER_IPC
+	depends on ANDROID_VENDOR_HOOKS
+	depends on NETFILTER && INET
+	default n
+	help
+	  Provide the raw-netlink, Binder, signal and network callbacks
+	  expected by the OPlus HANS userspace freezer service.
+
+config OPLUS_FEATURE_LINKPOWER
+	bool "OPlus LinkPower network compatibility"
+	depends on INET
+	depends on NETFILTER
+	default n
+	help
+	  Provide the linkpower generic-netlink ABI and socket accounting used by
+	  the OPlus network-power framework. This includes per-process socket
+	  ownership, connection statistics, socket teardown and the socket mark
+	  consumed by OPlus netd's netdisable BPF programs.
+
+config OPLUS_FEATURE_STABILITY_HELPER
+	bool "OPlus framework stability compatibility"
+	depends on ANDROID_BINDER_IPC
+	depends on TRACEPOINTS
+	depends on DMA_SHARED_BUFFER
+	default n
+	help
+	  Provide the oplus_frk_nl generic-netlink ABI expected by the OPlus
+	  system server and report excessive thread creation, low-memory causes
+	  and long-pending asynchronous Binder transactions.
+
 endif # if ANDROID
 
 endmenu

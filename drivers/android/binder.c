@@ -51,6 +51,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nsproxy.h>
+#include <linux/oplus_stability.h>
 #include <linux/poll.h>
 #include <linux/debugfs.h>
 #include <linux/rbtree.h>
@@ -2912,6 +2913,8 @@ static int binder_proc_transaction(struct binder_transaction *t,
 	} else {
 		binder_enqueue_work_ilocked(&t->work, &node->async_todo);
 	}
+	oplus_stability_binder_transaction_queued_locked(proc, t,
+						  pending_async);
 
 	if (!pending_async)
 		binder_wakeup_thread_ilocked(proc, thread, !oneway /* sync */);
@@ -3066,6 +3069,7 @@ static void binder_transaction(struct binder_proc *proc,
 		target_proc = target_thread->proc;
 		target_proc->tmp_ref++;
 		binder_inner_proc_unlock(target_thread->proc);
+		trace_android_vh_binder_reply(target_proc, proc, thread, tr);
 #ifdef CONFIG_OEM_KERNEL
 		if (oem_binder_hook_set.oem_reply_hook && target_proc->tsk)
 			oem_binder_hook_set.oem_reply_hook(target_proc->tsk, proc->tsk,
@@ -3124,6 +3128,7 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_dead_binder;
 		}
 		e->to_node = target_node->debug_id;
+		trace_android_vh_binder_trans(target_proc, proc, thread, tr);
 #ifdef CONFIG_OEM_KERNEL
 		if (oem_binder_hook_set.oem_trans_hook && target_proc && target_proc->tsk)
 			oem_binder_hook_set.oem_trans_hook(target_proc->tsk, proc->tsk,
@@ -3254,6 +3259,7 @@ static void binder_transaction(struct binder_proc *proc,
 	t->code = tr->code;
 	t->flags = tr->flags;
 	t->is_nested = is_nested;
+	oplus_stability_binder_transaction_init(t);
 	if (!(t->flags & TF_ONE_WAY) &&
 	    binder_supported_policy(current->policy)) {
 		/* Inherit supported policies for synchronous transactions */
@@ -5723,6 +5729,7 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	}
 	hlist_add_head(&proc->proc_node, &binder_procs);
 	mutex_unlock(&binder_procs_lock);
+	trace_android_vh_binder_preset(&binder_procs, &binder_procs_lock);
 
 	if (binder_debugfs_dir_entry_proc && !existing_pid) {
 		char strbuf[11];

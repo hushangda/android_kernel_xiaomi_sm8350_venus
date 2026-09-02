@@ -605,6 +605,9 @@ struct binder_transaction {
 	kuid_t	sender_euid;
 	struct list_head fd_fixups;
 	binder_uintptr_t security_ctx;
+#ifdef CONFIG_OPLUS_FEATURE_STABILITY_HELPER
+	u64 oplus_stability_start_ns;
+#endif
 	/**
 	 * @lock:  protects @from, @to_proc, and @to_thread
 	 *
