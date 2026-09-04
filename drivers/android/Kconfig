@@ -63,11 +63,20 @@ config ANDROID_VENDOR_HOOKS
 	  Allow vendor modules to attach to tracepoint "hooks" defined via
 	  DECLARE_HOOK or DECLARE_RESTRICTED_HOOK.
 
+config ANDROID_VENDOR_FREEZER_COMPAT
+	bool
+	depends on NET && SYSFS
+	default n
+	help
+	  Own raw-netlink protocol 29 and route the first valid userspace
+	  handshake to either the OPlus HANS or Xiaomi MILLET backend.
+
 config OPLUS_FEATURE_HANS
 	bool "OPlus HANS freezer compatibility"
 	depends on ANDROID_BINDER_IPC
 	depends on ANDROID_VENDOR_HOOKS
 	depends on NETFILTER && INET
+	select ANDROID_VENDOR_FREEZER_COMPAT
 	default n
 	help
 	  Provide the raw-netlink, Binder, signal and network callbacks

@@ -29,6 +29,7 @@
 #include <linux/tcp.h>
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
+#include <linux/vendor_freezer_compat.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
 #include <net/net_namespace.h>
@@ -113,7 +114,8 @@ static DEFINE_SPINLOCK(hans_uid_lock);
 
 static bool hans_daemon_ready(void)
 {
-	return atomic_read(&hans_daemon_port) > 0;
+	return vendor_freezer_backend_active(VENDOR_FREEZER_HANS) &&
+	       atomic_read(&hans_daemon_port) > 0;
 }
 
 static int hans_report(enum hans_message_type type, int caller_pid,
@@ -760,6 +762,36 @@ static void hans_netlink_handler(struct sk_buff *skb)
 				    message.type, ret);
 }
 
+static bool hans_match_handshake(struct sk_buff *skb)
+{
+	struct hans_message *message;
+	struct nlmsghdr *nlh;
+	kuid_t sender;
+	uid_t sender_uid;
+
+	if (!skb || skb->len < NLMSG_SPACE(0))
+		return false;
+	nlh = nlmsg_hdr(skb);
+	if (!nlmsg_ok(nlh, skb->len) ||
+	    nlmsg_len(nlh) < sizeof(*message) - sizeof(message->persistent))
+		return false;
+
+	sender = NETLINK_CREDS(skb)->uid;
+	sender_uid = from_kuid_munged(&init_user_ns, sender);
+	if (sender_uid != 0 && sender_uid != HANS_SYSTEM_UID)
+		return false;
+
+	message = nlmsg_data(nlh);
+	return message->type == HANS_LOOP_BACK && message->port > 0;
+}
+
+static const struct vendor_freezer_backend_ops hans_backend_ops = {
+	.backend = VENDOR_FREEZER_HANS,
+	.name = "hans",
+	.match_handshake = hans_match_handshake,
+	.receive = hans_netlink_handler,
+};
+
 static int hans_register_trace_hooks(void)
 {
 	int ret;
@@ -807,35 +839,31 @@ static void hans_unregister_trace_hooks(void)
 
 static int __init oplus_hans_init(void)
 {
-	struct netlink_kernel_cfg cfg = {
-		.input = hans_netlink_handler,
-	};
 	int ret;
 
 	hash_init(hans_uid_map);
 	hash_init(hans_persistent_uid_map);
 	atomic_set(&hans_daemon_port, -1);
 
-	hans_netlink_sock = netlink_kernel_create(&init_net,
-						 NETLINK_OPLUS_HANS, &cfg);
-	if (!hans_netlink_sock)
-		return -ENOMEM;
+	ret = vendor_freezer_register_backend(&hans_backend_ops,
+					      &hans_netlink_sock);
+	if (ret)
+		return ret;
 	ret = hans_register_trace_hooks();
 	if (ret)
-		goto release_netlink;
+		goto unregister_backend;
 	ret = nf_register_net_hooks(&init_net, hans_nf_ops,
 				    ARRAY_SIZE(hans_nf_ops));
 	if (ret)
 		goto unregister_hooks;
 
-	pr_info("raw-netlink protocol %d registered\n", NETLINK_OPLUS_HANS);
+	pr_info("protocol %d backend registered\n", NETLINK_OPLUS_HANS);
 	return 0;
 
 unregister_hooks:
 	hans_unregister_trace_hooks();
-release_netlink:
-	netlink_kernel_release(hans_netlink_sock);
-	hans_netlink_sock = NULL;
+unregister_backend:
+	vendor_freezer_unregister_backend(VENDOR_FREEZER_HANS);
 	return ret;
 }
 
@@ -844,10 +872,7 @@ static void __exit oplus_hans_exit(void)
 	atomic_set(&hans_daemon_port, -1);
 	nf_unregister_net_hooks(&init_net, hans_nf_ops, ARRAY_SIZE(hans_nf_ops));
 	hans_unregister_trace_hooks();
-	if (hans_netlink_sock) {
-		netlink_kernel_release(hans_netlink_sock);
-		hans_netlink_sock = NULL;
-	}
+	vendor_freezer_unregister_backend(VENDOR_FREEZER_HANS);
 	hans_clear_uids();
 }
 

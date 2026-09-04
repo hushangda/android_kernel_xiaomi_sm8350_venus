@@ -20,6 +20,7 @@
 #include <linux/ktime.h>
 #include <linux/hrtimer.h>
 #include <linux/proc_fs.h>
+#include <linux/user_namespace.h>
 #include "millet.h"
 
 int frozen_uid_min = 10000;
@@ -74,6 +75,9 @@ int millet_can_attach(struct cgroup_taskset *tset)
 	struct task_struct *task;
 	struct cgroup_subsys_state *css;
 
+	if (!millet_is_active())
+		return 0;
+
 	cgroup_taskset_for_each(task, css, tset)
 	{
 		tcred = __task_cred(task);
@@ -98,6 +102,9 @@ int millet_sendto_user(struct task_struct *tsk,
 	struct nlmsghdr *nlh = NULL;
 	struct millet_data *payload = NULL;
 	struct timespec64 ts;
+
+	if (!millet_is_active())
+		return RET_OK;
 
 	if (!atomic_read(&sk->has_init))
 		return RET_ERR;
@@ -158,6 +165,9 @@ int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *tsk,
 	u64 walltime, timecost;
 	unsigned long flags;
 	int ret = RET_OK;
+
+	if (!millet_is_active())
+		return RET_OK;
 
 	if (!TYPE_VALID(type)) {
 		pr_err("wrong type valid %d\n", type);
@@ -271,6 +281,38 @@ static void recv_handler(struct sk_buff *skb)
 		break;
 	}
 }
+
+static bool millet_match_handshake(struct sk_buff *skb)
+{
+	struct millet_userconf *payload;
+	struct nlmsghdr *nlh;
+	uid_t uid;
+
+	if (!skb || skb->len < NLMSG_SPACE(0))
+		return false;
+
+	uid = from_kuid_munged(&init_user_ns, NETLINK_CREDS(skb)->uid);
+	if (uid > 1000)
+		return false;
+
+	nlh = nlmsg_hdr(skb);
+	if (!nlmsg_ok(nlh, skb->len) ||
+	    nlmsg_len(nlh) < sizeof(*payload))
+		return false;
+
+	payload = nlmsg_data(nlh);
+	return TYPE_VALID(payload->owner) &&
+	       payload->msg_type == LOOPBACK_MSG &&
+	       payload->src_port == MILLET_USER_ID &&
+	       payload->dst_port == MILLET_KERNEL_ID;
+}
+
+static const struct vendor_freezer_backend_ops millet_backend_ops = {
+	.backend = VENDOR_FREEZER_MILLET,
+	.name = "millet",
+	.match_handshake = millet_match_handshake,
+	.receive = recv_handler,
+};
 
 static int millet_sock_show(struct seq_file *m, void *v)
 {
@@ -435,19 +477,16 @@ int unregister_millet_hook(int type)
 
 static int __init millet_init(void)
 {
-	int ret = RET_ERR;
+	int ret;
 	struct proc_dir_entry *millet_stat_entry = NULL;
 	struct proc_dir_entry *millet_version_entry = NULL;
 	int i;
 
-	struct netlink_kernel_cfg cfg = {
-		.input = recv_handler,
-	};
-
-	millet_sk.sock =
-		netlink_kernel_create(&init_net, NETLINK_MILLET, &cfg);
-	if (!millet_sk.sock) {
-		pr_err("%s: create socket error!\n", __func__);
+	ret = vendor_freezer_register_backend(&millet_backend_ops,
+					      &millet_sk.sock);
+	if (ret) {
+		pr_err("%s: register protocol 29 backend failed: %d\n",
+		       __func__, ret);
 		return ret;
 	}
 

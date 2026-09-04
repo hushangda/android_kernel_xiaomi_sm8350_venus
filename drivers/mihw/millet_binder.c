@@ -32,6 +32,9 @@ mi_binder_reply_hook(struct task_struct *dst, struct task_struct *src,
 {
 	struct millet_data data;
 
+	if (!millet_is_active())
+		return;
+
 	if (unlikely(!dst))
 		return;
 
@@ -55,6 +58,9 @@ mi_binder_trans_hook(struct task_struct *dst, struct task_struct *src,
 		int caller_tid, bool oneway, int code)
 {
 	struct millet_data data;
+
+	if (!millet_is_active())
+		return;
 
 	if (unlikely(!dst))
 		return;
@@ -81,6 +87,9 @@ mi_binder_wait4_hook(struct task_struct *dst, struct task_struct *src,
 {
 	struct millet_data data;
 
+	if (!millet_is_active())
+		return;
+
 	if (unlikely(!dst))
 		return;
 
@@ -105,6 +114,9 @@ mi_binder_overflow_hook(struct task_struct *dst, struct task_struct *src,
 		int caller_tid, bool oneway, int code)
 {
 	struct millet_data data;
+
+	if (!millet_is_active())
+		return;
 
 	if (unlikely(!dst))
 		return;
@@ -136,6 +148,10 @@ mi_query_binder_st_hook(int uid, struct task_struct *tsk, int tid, int pid,
 		enum BINDER_STAT reason)
 {
 	struct millet_data data;
+
+	if (!millet_is_active())
+		return;
+
 	memset(&data, 0, sizeof(struct millet_data));
 
 	data.uid = uid;
@@ -242,4 +258,3 @@ static int __init init_millet_binder_drv(void)
 module_init(init_millet_binder_drv);
 
 MODULE_LICENSE("GPL");
-

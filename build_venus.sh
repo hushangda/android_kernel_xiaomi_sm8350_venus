@@ -58,17 +58,20 @@ MAKE_ARGS=(
 )
 
 # Keep host-tool compilation independent from the target compiler sysroot.
-# Passing these on make's command line is required because the kernel
-# Makefile assigns HOSTCC/HOSTCXX itself and therefore overrides environment
-# variables.
+# Pass host compiler settings on make's command line because the kernel
+# Makefile otherwise overrides environment values.
 [[ -n "${HOSTCC:-}" ]] && MAKE_ARGS+=(HOSTCC="$HOSTCC")
 [[ -n "${HOSTCXX:-}" ]] && MAKE_ARGS+=(HOSTCXX="$HOSTCXX")
+[[ -n "${HOSTCFLAGS:-}" ]] && MAKE_ARGS+=(HOSTCFLAGS="$HOSTCFLAGS")
+[[ -n "${HOSTCXXFLAGS:-}" ]] && MAKE_ARGS+=(HOSTCXXFLAGS="$HOSTCXXFLAGS")
+[[ -n "${HOSTLDFLAGS:-}" ]] && MAKE_ARGS+=(HOSTLDFLAGS="$HOSTLDFLAGS")
 cd "$ROOT_DIR"
 mkdir -p "$OUT_DIR"
 
 make "${MAKE_ARGS[@]}" venus_defconfig
 CONFIG_ARGS=(
   --enable ZRAM \
+  --enable ZRAM_MULTI_COMP \
   --enable CRYPTO_LZ4 \
   --enable ZRAM_DEF_COMP_LZ4 \
   --disable ZRAM_DEF_COMP_LZORLE \
@@ -102,7 +105,9 @@ CONFIG_ARGS=(
   --enable KSU_SUSFS_SUS_MAP \
   --enable KALLSYMS \
   --enable KALLSYMS_ALL \
-  --enable BPF_STREAM_PARSER
+  --enable BPF_STREAM_PARSER \
+  --enable OPLUS_FEATURE_HANS \
+  --enable MILLET
 )
 
 if (( KPM )); then
@@ -126,6 +131,16 @@ for required_config in \
   'CONFIG_F2FS_FS_ZSTD=y' \
   'CONFIG_F2FS_UNFAIR_RWSEM=y' \
   'CONFIG_F2FS_CP_OPT=y'; do
+  grep -q "^$required_config$" "$OUT_DIR/.config" || {
+    echo "ERROR: missing $required_config" >&2
+    exit 1
+  }
+done
+for required_config in \
+  'CONFIG_ZRAM_MULTI_COMP=y' \
+  'CONFIG_ANDROID_VENDOR_FREEZER_COMPAT=y' \
+  'CONFIG_OPLUS_FEATURE_HANS=y' \
+  'CONFIG_MILLET=y'; do
   grep -q "^$required_config$" "$OUT_DIR/.config" || {
     echo "ERROR: missing $required_config" >&2
     exit 1
@@ -225,6 +240,8 @@ echo "ReSukiSU + SuSFS: enabled"
 echo "KPM: $([[ "$KPM" == 1 ]] && echo enabled || echo disabled)"
 echo "F2FS compression: enabled"
 echo "F2FS performance options: unfair rwsem + checkpoint fsync optimization enabled"
+echo "Vendor freezer protocol 29: HANS/MILLET auto multiplex enabled"
+echo "ZRAM multi-compressor recompression: enabled"
 echo "Recovery/TWRP KSU userspace hook guard: enabled"
 echo "Image (for TWRP prebuilt/venus/kernel): $KERNEL_IMAGE"
 echo "Image.gz: $KERNEL_IMAGE_GZ"
