@@ -69,6 +69,10 @@
 #define VENUS_BATTERY_MIN_UAH		2000000
 #define VENUS_BATTERY_MAX_UAH		10000000
 #define VENUS_BATTERY_MAX_RM_UAH	11000000
+#define VENUS_EXPANDED_MARGIN_UAH	100000
+#define VENUS_UI_SOC_MIN_STEP_MS		5000
+#define VENUS_UI_SOC_MAX_STEP_MS		120000
+#define VENUS_UI_SOC_FALLBACK_STEP_MS	120000
 #define VENUS_XIAOMI_PPS_POWER_MAX_W	55
 #define VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W	27
 #define VENUS_QUICK_CHARGE_FILTER_MS	3000
@@ -438,6 +442,17 @@ struct battery_chg_dev {
 	u32				usb_icl_ua;
 	u32				battery_design_uah;
 	u32				battery_full_uah;
+	bool				battery_profile_valid;
+	bool				battery_expanded;
+	struct mutex			ui_soc_lock;
+	bool				ui_soc_valid;
+	int				ui_soc;
+	int				ui_soc_target;
+	int				ui_soc_direction;
+	int				ui_soc_anchor_x100;
+	u32				ui_soc_anchor_rm_uah;
+	bool				ui_soc_rm_valid;
+	ktime_t			ui_soc_update_time;
 	u32				reverse_chg_flag;
 	bool				xm_uevent_valid;
 	char				xm_uevent_cache[XM_CHARGE_UEVENT_COUNT]
@@ -451,6 +466,7 @@ struct battery_chg_dev {
 	bool				quick_charge_online;
 	u8				quick_charge_type;
 	unsigned long			quick_charge_online_jiffies;
+	struct delayed_work		ui_soc_work;
 	struct delayed_work		quick_charge_type_work;
 	struct delayed_work		xm_prop_change_work;
 	/* To track the driver initialization status */
@@ -2177,25 +2193,44 @@ static u32 battery_chg_refresh_pack_capacity_uah(
 {
 	u32 full_design_uah, full_uah;
 	u32 pack_uah = READ_ONCE(bcdev->battery_design_uah);
+	bool profile_valid = READ_ONCE(bcdev->battery_profile_valid);
+	bool expanded = READ_ONCE(bcdev->battery_expanded);
+	int design_rc, full_rc;
 
 	/*
-	 * Replacement batteries report their capacity through either FULL or
-	 * FULL_DESIGN, depending on the remote fuel-gauge firmware.  Preserve the
-	 * largest valid nominal capacity seen so a stock profile cannot cap an
-	 * expanded pack at 4600 mAh.  FULL itself remains the learned FCC and is
-	 * cached separately: an aged stock battery can legitimately have FULL
-	 * below FULL_DESIGN.
+	 * Newer QTI/Xiaomi targets can use FULL_DESIGN as the pack identity, but
+	 * Venus replacement packs have been observed to keep FULL_DESIGN fixed at
+	 * the stock 4600 mAh while reporting their real size through FULL.  Accept
+	 * either field as expanded-pack evidence and preserve the reported value,
+	 * rather than matching one replacement-pack size.  The 100 mAh margin
+	 * keeps small stock-pack reporting variation on the remote-SOC path.  Once
+	 * expanded evidence is seen, keep that identity for the rest of this boot
+	 * so a later learned-FCC reduction cannot demote the pack to stock.
 	 */
-	read_property_id(bcdev, pst, BATT_CHG_FULL_DESIGN);
+	design_rc = read_property_id(bcdev, pst, BATT_CHG_FULL_DESIGN);
 	full_design_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
 
-	read_property_id(bcdev, pst, BATT_CHG_FULL);
+	full_rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
 	full_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
 
-	if (battery_chg_capacity_uah_valid(full_design_uah))
-		pack_uah = max(pack_uah, full_design_uah);
-	if (battery_chg_capacity_uah_valid(full_uah)) {
-		pack_uah = max(pack_uah, full_uah);
+	if (!design_rc && battery_chg_capacity_uah_valid(full_design_uah)) {
+		if (full_design_uah >= VENUS_BATTERY_DESIGN_UAH +
+		    VENUS_EXPANDED_MARGIN_UAH) {
+			profile_valid = true;
+			expanded = true;
+			pack_uah = max(pack_uah, full_design_uah);
+		} else if (!expanded) {
+			pack_uah = VENUS_BATTERY_DESIGN_UAH;
+		}
+	}
+
+	if (!full_rc && battery_chg_capacity_uah_valid(full_uah)) {
+		profile_valid = true;
+		if (full_uah >= VENUS_BATTERY_DESIGN_UAH +
+		    VENUS_EXPANDED_MARGIN_UAH) {
+			expanded = true;
+			pack_uah = max(pack_uah, full_uah);
+		}
 		WRITE_ONCE(bcdev->battery_full_uah, full_uah);
 	}
 
@@ -2205,6 +2240,8 @@ static u32 battery_chg_refresh_pack_capacity_uah(
 		full_uah = READ_ONCE(bcdev->battery_full_uah);
 
 	WRITE_ONCE(bcdev->battery_design_uah, pack_uah);
+	WRITE_ONCE(bcdev->battery_profile_valid, profile_valid);
+	WRITE_ONCE(bcdev->battery_expanded, expanded);
 	if (learned_full_uah)
 		*learned_full_uah = full_uah;
 	if (pst->model)
@@ -2233,64 +2270,249 @@ static int battery_chg_read_fg_remaining_uah(struct battery_chg_dev *bcdev,
 	return 0;
 }
 
-static int battery_chg_get_scaled_soc_x100(struct battery_chg_dev *bcdev,
-					    struct psy_state *pst,
-					    u32 *soc_x100)
+static u32 battery_chg_effective_full_uah(struct battery_chg_dev *bcdev)
 {
-	u32 learned_full_uah, pack_uah, remaining_uah;
-	u64 scaled;
-	int rc;
+	u32 full_uah = READ_ONCE(bcdev->battery_full_uah);
+	u32 design_uah = READ_ONCE(bcdev->battery_design_uah);
 
-	pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst,
-							 &learned_full_uah);
+	/* FULL may follow an aged pack; fall back to the detected nominal size. */
+	if (battery_chg_capacity_uah_valid(full_uah))
+		return full_uah;
+	if (battery_chg_capacity_uah_valid(design_uah))
+		return design_uah;
 
-	/*
-	 * The remote SOC is already calibrated for the stock 4600 mAh battery
-	 * and accounts for its learned FCC, reserve and gauge smoothing.  Only
-	 * replacement packs need RM/FCC scaling because their remote SOC can
-	 * remain tied to the stock profile.
-	 */
-	if (pack_uah <= VENUS_BATTERY_DESIGN_UAH)
-		return -EOPNOTSUPP;
-	if (!battery_chg_capacity_uah_valid(learned_full_uah))
-		return -ENODATA;
-
-	rc = battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
-	if (rc < 0)
-		return rc;
-
-	/* Do not turn a not-yet-initialized zero RM into a false empty SOC. */
-	if (!remaining_uah && READ_ONCE(pst->prop[BATT_CAPACITY]) > 100)
-		return -EAGAIN;
-
-	scaled = div64_u64((u64)remaining_uah * 10000, learned_full_uah);
-	*soc_x100 = min_t(u64, scaled, 10000);
-
-	return 0;
+	return VENUS_BATTERY_DESIGN_UAH;
 }
 
-static int battery_chg_get_realtime_capacity(struct battery_chg_dev *bcdev,
-					     struct psy_state *pst, int raw_soc)
+static u32 battery_chg_ui_soc_step_ms(struct battery_chg_dev *bcdev,
+				      struct psy_state *pst)
 {
-	int status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
-	bool status_fresh = false;
+	s64 current_ua = (s32)READ_ONCE(pst->prop[BATT_CURR_NOW]);
+	u64 step_ms;
 
-	/* Refresh status only near full to keep the 100% gate authoritative. */
-	if (raw_soc >= 99 &&
-	    !read_property_id(bcdev, pst, BATT_STATUS)) {
-		status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
-		status_fresh = true;
+	if (current_ua < 0)
+		current_ua = -current_ua;
+	if (!current_ua)
+		return VENUS_UI_SOC_FALLBACK_STEP_MS;
+
+	/*
+	 * Time physically needed to move one percent at the latest battery
+	 * current. There is deliberately no fixed 30 second floor: high-current
+	 * charging or discharge is allowed to update faster when justified.
+	 */
+	step_ms = div64_u64((u64)battery_chg_effective_full_uah(bcdev) *
+				36000ULL, current_ua);
+
+	return clamp_val(step_ms, VENUS_UI_SOC_MIN_STEP_MS,
+			 VENUS_UI_SOC_MAX_STEP_MS);
+}
+
+static int battery_chg_soc_direction(int status)
+{
+	switch (status) {
+	case POWER_SUPPLY_STATUS_CHARGING:
+	case POWER_SUPPLY_STATUS_FULL:
+		return 1;
+	case POWER_SUPPLY_STATUS_DISCHARGING:
+	case POWER_SUPPLY_STATUS_NOT_CHARGING:
+		return -1;
+	default:
+		return 0;
+	}
+}
+
+static void battery_chg_reset_ui_soc(struct battery_chg_dev *bcdev)
+{
+	cancel_delayed_work(&bcdev->ui_soc_work);
+	mutex_lock(&bcdev->ui_soc_lock);
+	bcdev->ui_soc_valid = false;
+	mutex_unlock(&bcdev->ui_soc_lock);
+}
+
+static void battery_chg_reanchor_ui_soc(struct battery_chg_dev *bcdev)
+{
+	cancel_delayed_work(&bcdev->ui_soc_work);
+	mutex_lock(&bcdev->ui_soc_lock);
+	if (bcdev->ui_soc_valid) {
+		/*
+		 * A remote subsystem restart must not expose its first recalculated
+		 * SOC directly to userspace.  Preserve the last displayed value and
+		 * make the next valid remaining-charge sample a fresh anchor.
+		 */
+		bcdev->ui_soc_target = bcdev->ui_soc;
+		bcdev->ui_soc_rm_valid = false;
+		bcdev->ui_soc_update_time = ktime_get_boottime();
+	}
+	mutex_unlock(&bcdev->ui_soc_lock);
+}
+
+static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
+				       struct psy_state *pst, int raw_soc,
+				       u32 remaining_uah, bool rm_valid,
+				       bool expanded, bool *changed)
+{
+	ktime_t now = ktime_get_boottime();
+	u32 full_uah, next_ms = 0, step_ms;
+	s64 candidate_x100, delta_rm, elapsed_ms;
+	int direction, status, target_soc;
+
+	status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
+	direction = battery_chg_soc_direction(status);
+	full_uah = battery_chg_effective_full_uah(bcdev);
+	step_ms = battery_chg_ui_soc_step_ms(bcdev, pst);
+	*changed = false;
+	/* A charger-confirmed FULL state must not leave userspace at 99%. */
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
+		raw_soc = 100;
+
+	mutex_lock(&bcdev->ui_soc_lock);
+	if (!bcdev->ui_soc_valid) {
+		bcdev->ui_soc = raw_soc;
+		bcdev->ui_soc_target = raw_soc;
+		bcdev->ui_soc_direction = direction;
+		bcdev->ui_soc_anchor_x100 = raw_soc * 100;
+		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+		bcdev->ui_soc_rm_valid = rm_valid;
+		bcdev->ui_soc_update_time = now;
+		bcdev->ui_soc_valid = true;
+		goto out;
+	}
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99) {
+		/* Re-anchor every completed charge so learned aging is retained. */
+		if (rm_valid) {
+			bcdev->ui_soc_anchor_x100 = 10000;
+			bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+			bcdev->ui_soc_rm_valid = true;
+		}
+		if (bcdev->ui_soc == 99) {
+			bcdev->ui_soc = 100;
+			bcdev->ui_soc_target = 100;
+			bcdev->ui_soc_update_time = now;
+			*changed = true;
+			goto out;
+		}
 	}
 
-	/* A raw 100 while the charger still says CHARGING is not a real full. */
-	if (status == POWER_SUPPLY_STATUS_CHARGING && raw_soc == 100)
-		return 99;
+	/* Do not spend elapsed discharge time immediately after a plug change. */
+	if (direction && direction != bcdev->ui_soc_direction) {
+		bcdev->ui_soc_direction = direction;
+		bcdev->ui_soc_update_time = now;
+	}
 
-	/* Promote 99 to 100 only from a fresh charger-confirmed FULL state. */
-	if (status_fresh && status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
-		return 100;
+	/*
+	 * Expanded packs can retain the stock remote SOC profile. Anchor once to
+	 * the remote percentage, then follow the change in the gauge remaining
+	 * charge instead of treating later remote SOC recalculations as truth.
+	 * The rate limiter below also contains discontinuities in FG_RM itself.
+	 */
+	if (expanded && rm_valid && !bcdev->ui_soc_rm_valid) {
+		bcdev->ui_soc_anchor_x100 = bcdev->ui_soc * 100;
+		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+		bcdev->ui_soc_rm_valid = true;
+	}
+	if (expanded && !rm_valid)
+		bcdev->ui_soc_rm_valid = false;
+
+	if (expanded && rm_valid && bcdev->ui_soc_rm_valid &&
+	    battery_chg_capacity_uah_valid(full_uah) &&
+	    remaining_uah <= VENUS_BATTERY_MAX_RM_UAH) {
+		delta_rm = (s64)remaining_uah -
+			   (s64)bcdev->ui_soc_anchor_rm_uah;
+		candidate_x100 = (s64)bcdev->ui_soc_anchor_x100 +
+			div_s64(delta_rm * 10000LL, full_uah);
+		candidate_x100 = clamp_val(candidate_x100, 0, 10000);
+		target_soc = div_s64(candidate_x100 + 50, 100);
+	} else {
+		/* A failed RM read falls back to the remote SOC, still rate limited. */
+		target_soc = raw_soc;
+	}
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
+		target_soc = 100;
+
+	/*
+	 * RM recalculation must not reverse the displayed direction or grant
+	 * charge credit that makes the next real percent appear late.  Drop the
+	 * opposite-direction delta and continue from the current displayed SOC.
+	 */
+	if (expanded && rm_valid &&
+	    ((direction > 0 && target_soc < bcdev->ui_soc) ||
+	     (direction < 0 && target_soc > bcdev->ui_soc))) {
+		bcdev->ui_soc_anchor_x100 = bcdev->ui_soc * 100;
+		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+		target_soc = bcdev->ui_soc;
+	} else if (expanded && direction > 0) {
+		target_soc = max(target_soc, bcdev->ui_soc);
+	} else if (expanded && direction < 0) {
+		target_soc = min(target_soc, bcdev->ui_soc);
+	}
+
+	target_soc = clamp_val(target_soc, 0, 100);
+	bcdev->ui_soc_target = target_soc;
+	if (target_soc == bcdev->ui_soc)
+		goto out;
+
+	/* Keep the stock path unchanged for normal one-percent updates. */
+	if (!expanded && abs(target_soc - bcdev->ui_soc) == 1) {
+		bcdev->ui_soc = target_soc;
+		bcdev->ui_soc_update_time = now;
+		*changed = true;
+		goto out;
+	}
+
+	elapsed_ms = ktime_ms_delta(now, bcdev->ui_soc_update_time);
+	if (elapsed_ms < 0)
+		elapsed_ms = 0;
+	if (elapsed_ms >= step_ms) {
+		bcdev->ui_soc += target_soc > bcdev->ui_soc ? 1 : -1;
+		bcdev->ui_soc_update_time = now;
+		*changed = true;
+		if (bcdev->ui_soc != target_soc)
+			next_ms = step_ms;
+	} else {
+		next_ms = step_ms - elapsed_ms;
+	}
+
+out:
+	raw_soc = bcdev->ui_soc;
+	mutex_unlock(&bcdev->ui_soc_lock);
+
+	if (next_ms)
+		mod_delayed_work(system_wq, &bcdev->ui_soc_work,
+				 msecs_to_jiffies(next_ms));
+	else
+		cancel_delayed_work(&bcdev->ui_soc_work);
 
 	return raw_soc;
+}
+
+static void battery_chg_ui_soc_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(to_delayed_work(work),
+						struct battery_chg_dev,
+						ui_soc_work);
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	u32 remaining_uah = 0;
+	bool changed, rm_valid;
+	int raw_soc, rc;
+
+	if (!READ_ONCE(bcdev->initialized) || !pst->psy)
+		return;
+
+	rc = read_property_id(bcdev, pst, BATT_CAPACITY);
+	if (rc < 0)
+		return;
+	raw_soc = clamp_val(DIV_ROUND_CLOSEST(
+		READ_ONCE(pst->prop[BATT_CAPACITY]), 100), 0, 100);
+
+	read_property_id(bcdev, pst, BATT_STATUS);
+	read_property_id(bcdev, pst, BATT_CURR_NOW);
+	rm_valid = READ_ONCE(bcdev->battery_expanded) &&
+		!battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+	battery_chg_get_ui_capacity(bcdev, pst, raw_soc, remaining_uah,
+				    rm_valid,
+				    READ_ONCE(bcdev->battery_expanded), &changed);
+	if (changed)
+		power_supply_changed(pst->psy);
 }
 
 static int battery_psy_get_prop(struct power_supply *psy,
@@ -2299,7 +2521,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 {
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
-	u32 learned_full_uah, pack_uah, raw_value, remaining_uah, soc_x100;
+	u32 learned_full_uah, pack_uah, raw_value, remaining_uah = 0;
+	bool changed, expanded, rm_valid;
 	int prop_id, rc;
 
 	pval->intval = -ENODATA;
@@ -2315,6 +2538,7 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		prop = POWER_SUPPLY_PROP_TIME_TO_FULL_AVG;
 
 	if (prop == POWER_SUPPLY_PROP_CHARGE_COUNTER &&
+	    READ_ONCE(bcdev->battery_expanded) &&
 	    !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah)) {
 		pval->intval = remaining_uah;
 		return 0;
@@ -2351,19 +2575,21 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		pval->intval = clamp_val(DIV_ROUND_CLOSEST(
 			pst->prop[prop_id], 100), 0, 100);
 		if (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100) {
+			battery_chg_reset_ui_soc(bcdev);
 			pval->intval = bcdev->fake_soc;
-		} else {
-			/*
-			 * Expanded packs use RM / learned FULL.  Stock packs retain
-			 * the remote SOC so normal FCC aging cannot cap them below
-			 * 100 percent.
-			 */
-			if (!battery_chg_get_scaled_soc_x100(bcdev, pst,
-							 &soc_x100))
-				pval->intval = soc_x100 / 100;
-			pval->intval = battery_chg_get_realtime_capacity(bcdev,
-							      pst, pval->intval);
+			break;
 		}
+
+		if (!READ_ONCE(bcdev->battery_profile_valid))
+			battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
+		expanded = READ_ONCE(bcdev->battery_expanded);
+		read_property_id(bcdev, pst, BATT_STATUS);
+		read_property_id(bcdev, pst, BATT_CURR_NOW);
+		rm_valid = expanded &&
+			!battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+		pval->intval = battery_chg_get_ui_capacity(bcdev, pst,
+				pval->intval, remaining_uah, rm_valid,
+				expanded, &changed);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
@@ -2597,7 +2823,8 @@ static void battery_chg_subsys_up_work(struct work_struct *work)
 				bcdev->usb_icl_ua, rc);
 	}
 
-	/* Refresh userspace after remote properties become available again. */
+	/* Refresh the data after SSR without dropping the displayed SOC state. */
+	battery_chg_reanchor_ui_soc(bcdev);
 	battery_chg_report_psy_changed(bcdev, PSY_TYPE_BATTERY);
 	battery_chg_report_psy_changed(bcdev, PSY_TYPE_USB);
 	battery_chg_report_psy_changed(bcdev, PSY_TYPE_WLS);
@@ -4015,14 +4242,8 @@ static ssize_t soc_decimal_show(struct class *c,
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
-	struct psy_state *batt_pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
-	u32 soc_x100;
 	int rc;
-
-	rc = battery_chg_get_scaled_soc_x100(bcdev, batt_pst, &soc_x100);
-	if (!rc)
-		return scnprintf(buf, PAGE_SIZE, "%u", soc_x100 % 100);
 
 	rc = read_property_id(bcdev, pst, XM_PROP_SOC_DECIMAL);
 	if (rc < 0)
@@ -5431,6 +5652,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 		devm_kzalloc(&pdev->dev, MAX_STR_LEN, GFP_KERNEL);
 
 	mutex_init(&bcdev->rw_lock);
+	mutex_init(&bcdev->ui_soc_lock);
 	mutex_init(&bcdev->quick_charge_lock);
 	mutex_init(&bcdev->thermal_temp_lock);
 	init_completion(&bcdev->ack);
@@ -5440,6 +5662,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_WORK(&bcdev->usb_type_work, battery_chg_update_usb_type_work);
 	INIT_WORK(&bcdev->battery_check_work, battery_chg_check_status_work);
 	INIT_WORK(&bcdev->charger_status_work, battery_chg_charger_status_work);
+	INIT_DELAYED_WORK(&bcdev->ui_soc_work, battery_chg_ui_soc_work);
 	INIT_DELAYED_WORK(&bcdev->quick_charge_type_work,
 			battery_chg_quick_charge_type_work);
 	INIT_DELAYED_WORK(&bcdev->xm_prop_change_work, generate_xm_charge_uvent);
@@ -5510,6 +5733,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 error:
 	bcdev->initialized = false;
 	complete(&bcdev->ack);
+	cancel_delayed_work_sync(&bcdev->ui_soc_work);
 	cancel_delayed_work_sync(&bcdev->quick_charge_type_work);
 	pmic_glink_unregister_client(bcdev->client);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
@@ -5523,6 +5747,7 @@ static int battery_chg_remove(struct platform_device *pdev)
 	int rc;
 
 	device_init_wakeup(bcdev->dev, false);
+	cancel_delayed_work_sync(&bcdev->ui_soc_work);
 	cancel_delayed_work_sync(&bcdev->quick_charge_type_work);
 	debugfs_remove_recursive(bcdev->debugfs_dir);
 	class_unregister(&bcdev->battery_class);
