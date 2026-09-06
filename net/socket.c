@@ -86,6 +86,7 @@
 #include <linux/xattr.h>
 #include <linux/nospec.h>
 #include <linux/indirect_call_wrapper.h>
+#include <linux/oplus_linkpower.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -405,6 +406,7 @@ struct file *sock_alloc_file(struct socket *sock, int flags, const char *dname)
 
 	sock->file = file;
 	file->private_data = sock;
+	oplus_linkpower_socket_created(sock->sk);
 	stream_open(SOCK_INODE(sock), file);
 	return file;
 }

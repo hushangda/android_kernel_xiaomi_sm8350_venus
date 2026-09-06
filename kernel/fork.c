@@ -35,6 +35,7 @@
 #include <linux/sem.h>
 #include <linux/file.h>
 #include <linux/fdtable.h>
+#include <linux/oplus_stability.h>
 #include <linux/iocontext.h>
 #include <linux/key.h>
 #include <linux/binfmts.h>
@@ -1623,6 +1624,7 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 	sig->oom_score_adj_min = current->signal->oom_score_adj_min;
 
 	mutex_init(&sig->cred_guard_mutex);
+	mutex_init(&sig->exec_update_mutex);
 
 	return 0;
 }
@@ -2354,6 +2356,7 @@ static __latent_entropy struct task_struct *copy_process(
 	spin_unlock(&current->sighand->siglock);
 	syscall_tracepoint_update(p);
 	write_unlock_irq(&tasklist_lock);
+	oplus_stability_thread_created(p, nr_threads);
 
 	if (pidfile)
 		fd_install(pidfd, pidfile);

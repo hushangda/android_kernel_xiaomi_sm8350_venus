@@ -204,6 +204,8 @@ writeback_limit_enable  RW	show and set writeback_limit feature
 max_comp_streams  	RW	the number of possible concurrent compress
 				operations
 comp_algorithm    	RW	show and change the compression algorithm
+recomp_algorithm  	RW	show and set secondary compression algorithms
+recompress        	WO	trigger recompression with a secondary algorithm
 compact           	WO	trigger memory compaction
 debug_stat        	RO	this file is used for zram debugging purposes
 backing_dev	  	RW	set up backend storage for zram to write out
@@ -305,6 +307,29 @@ a single line of text and contains the following stats separated by whitespace:
 
 Optional Feature
 ================
+
+recompression
+-------------
+
+With ``CONFIG_ZRAM_MULTI_COMP``, zram supports one primary and up to three
+secondary compression algorithms. Configure secondary algorithms before
+setting ``disksize``; lower priority numbers are tried first::
+
+	# Use zstd as the first recompression algorithm
+	echo "algo=zstd priority=1" > /sys/block/zram0/recomp_algorithm
+
+After the device is initialized, recompression can target all eligible
+objects, idle objects, huge objects, or objects above a size threshold::
+
+	echo "threshold=3000" > /sys/block/zram0/recompress
+	echo "type=idle threshold=2000" > /sys/block/zram0/recompress
+	echo "type=huge algo=zstd" > /sys/block/zram0/recompress
+
+Mark pages idle first with ``echo all > /sys/block/zram0/idle``. Selecting
+idle pages by age additionally requires ``CONFIG_ZRAM_TRACK_ENTRY_ACTIME``;
+for example, ``echo 600 > idle`` marks pages untouched for 600 seconds.
+Recompression only replaces an object when it moves to a smaller zsmalloc
+size class, so an unsuccessful pass cannot increase its memory footprint.
 
 writeback
 ---------

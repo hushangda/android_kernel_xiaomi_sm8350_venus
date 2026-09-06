@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KPM="${KPM:-1}"
+KPM="${KPM:-0}"
 if [[ "$KPM" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
   KPM=1
 elif [[ "$KPM" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
@@ -11,7 +11,24 @@ else
   echo "ERROR: KPM must be 1 or 0" >&2
   exit 1
 fi
-JOBS="${JOBS:-$(nproc)}"
+# Keep MGLRU compiled but disabled by default pending vendor reclaim fixes.
+# MGLRU=1 remains an explicit opt-in for future compatibility testing.
+MGLRU="${MGLRU:-0}"
+if [[ "$MGLRU" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
+  MGLRU=1
+elif [[ "$MGLRU" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
+  MGLRU=0
+else
+  echo "ERROR: MGLRU must be 1 or 0" >&2
+  exit 1
+fi
+# Keep interactive desktop sessions responsive by default.  Dedicated build
+# hosts can still override this explicitly, for example JOBS=16.
+JOBS="${JOBS:-2}"
+if [[ ! "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: JOBS must be a positive integer" >&2
+  exit 1
+fi
 if (( KPM )); then
   DEFAULT_OUT_DIR="$ROOT_DIR/out-venus-5.4.302-kpm"
 else
@@ -51,12 +68,21 @@ MAKE_ARGS=(
   READELF="$READELF"
 )
 
+# Keep host-tool compilation independent from the target compiler sysroot.
+# Pass host compiler settings on make's command line because the kernel
+# Makefile otherwise overrides environment values.
+[[ -n "${HOSTCC:-}" ]] && MAKE_ARGS+=(HOSTCC="$HOSTCC")
+[[ -n "${HOSTCXX:-}" ]] && MAKE_ARGS+=(HOSTCXX="$HOSTCXX")
+[[ -n "${HOSTCFLAGS:-}" ]] && MAKE_ARGS+=(HOSTCFLAGS="$HOSTCFLAGS")
+[[ -n "${HOSTCXXFLAGS:-}" ]] && MAKE_ARGS+=(HOSTCXXFLAGS="$HOSTCXXFLAGS")
+[[ -n "${HOSTLDFLAGS:-}" ]] && MAKE_ARGS+=(HOSTLDFLAGS="$HOSTLDFLAGS")
 cd "$ROOT_DIR"
 mkdir -p "$OUT_DIR"
 
 make "${MAKE_ARGS[@]}" venus_defconfig
 CONFIG_ARGS=(
   --enable ZRAM \
+  --enable ZRAM_MULTI_COMP \
   --enable CRYPTO_LZ4 \
   --enable ZRAM_DEF_COMP_LZ4 \
   --disable ZRAM_DEF_COMP_LZORLE \
@@ -90,8 +116,18 @@ CONFIG_ARGS=(
   --enable KSU_SUSFS_SUS_MAP \
   --enable KALLSYMS \
   --enable KALLSYMS_ALL \
-  --enable BPF_STREAM_PARSER
+  --enable BPF_STREAM_PARSER \
+  --enable LRU_GEN \
+  --disable LRU_GEN_STATS \
+  --enable OPLUS_FEATURE_HANS \
+  --enable MILLET
 )
+
+if (( MGLRU )); then
+  CONFIG_ARGS+=(--enable LRU_GEN_ENABLED)
+else
+  CONFIG_ARGS+=(--disable LRU_GEN_ENABLED)
+fi
 
 if (( KPM )); then
   CONFIG_ARGS+=(--enable KPM)
@@ -119,6 +155,32 @@ for required_config in \
     exit 1
   }
 done
+for required_config in \
+  'CONFIG_ZRAM_MULTI_COMP=y' \
+  'CONFIG_LRU_GEN=y' \
+  'CONFIG_ANDROID_VENDOR_FREEZER_COMPAT=y' \
+  'CONFIG_OPLUS_FEATURE_HANS=y' \
+  'CONFIG_MILLET=y'; do
+  grep -q "^$required_config$" "$OUT_DIR/.config" || {
+    echo "ERROR: missing $required_config" >&2
+    exit 1
+  }
+done
+if (( MGLRU )); then
+  grep -q '^CONFIG_LRU_GEN_ENABLED=y$' "$OUT_DIR/.config" || {
+    echo "ERROR: CONFIG_LRU_GEN_ENABLED must be enabled for MGLRU=1" >&2
+    exit 1
+  }
+else
+  grep -q '^# CONFIG_LRU_GEN_ENABLED is not set$' "$OUT_DIR/.config" || {
+    echo "ERROR: CONFIG_LRU_GEN_ENABLED must be disabled for MGLRU=0" >&2
+    exit 1
+  }
+fi
+grep -q '^# CONFIG_LRU_GEN_STATS is not set$' "$OUT_DIR/.config" || {
+  echo "ERROR: CONFIG_LRU_GEN_STATS must stay disabled for production builds" >&2
+  exit 1
+}
 for required_config in \
   'CONFIG_KSU=y' \
   'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' \
@@ -211,8 +273,11 @@ echo "KSU manager package restriction: disabled"
 echo "ReSukiSU multi-manager support: enabled"
 echo "ReSukiSU + SuSFS: enabled"
 echo "KPM: $([[ "$KPM" == 1 ]] && echo enabled || echo disabled)"
+echo "Multi-Gen LRU: compiled, default $([[ "$MGLRU" == 1 ]] && echo enabled || echo disabled) (MGLRU=$MGLRU)"
 echo "F2FS compression: enabled"
 echo "F2FS performance options: unfair rwsem + checkpoint fsync optimization enabled"
+echo "Vendor freezer protocol 29: HANS/MILLET auto multiplex enabled"
+echo "ZRAM multi-compressor recompression: enabled"
 echo "Recovery/TWRP KSU userspace hook guard: enabled"
 echo "Image (for TWRP prebuilt/venus/kernel): $KERNEL_IMAGE"
 echo "Image.gz: $KERNEL_IMAGE_GZ"

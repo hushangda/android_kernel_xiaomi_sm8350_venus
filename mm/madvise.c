@@ -31,6 +31,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/sched/mm.h>
 #include <linux/uio.h>
+#include <linux/init.h>
 
 #include <asm/tlb.h>
 
@@ -56,6 +57,8 @@ static int madvise_need_mmap_write(int behavior)
 	case MADV_COLD:
 	case MADV_PAGEOUT:
 	case MADV_FREE:
+	case MADV_POPULATE_READ:
+	case MADV_POPULATE_WRITE:
 		return 0;
 	default:
 		/* be safe, default to 1. list exceptions explicitly */
@@ -858,6 +861,49 @@ static long madvise_dontneed_free(struct vm_area_struct *vma,
 		return -EINVAL;
 }
 
+static long madvise_populate(struct vm_area_struct *vma,
+			     struct vm_area_struct **prev,
+			     unsigned long start, unsigned long end,
+			     int behavior)
+{
+	const bool write = behavior == MADV_POPULATE_WRITE;
+	struct mm_struct *mm = vma->vm_mm;
+	int locked = 1;
+	long pages;
+
+	*prev = vma;
+
+	while (start < end) {
+		pages = faultin_page_range(mm, start, end, write, &locked);
+		if (!locked) {
+			mmap_read_lock(mm);
+			locked = 1;
+			*prev = NULL;
+		}
+		if (pages < 0) {
+			switch (pages) {
+			case -ERESTARTSYS:
+			case -EINTR:
+				return -EINTR;
+			case -EINVAL:
+				return -EINVAL;
+			case -EHWPOISON:
+				return -EHWPOISON;
+			case -EFAULT:
+				return -EFAULT;
+			default:
+				pr_warn_once("%s: unhandled return value: %ld\n",
+					     __func__, pages);
+				fallthrough;
+			case -ENOMEM:
+				return -ENOMEM;
+			}
+		}
+		start += pages * PAGE_SIZE;
+	}
+	return 0;
+}
+
 /*
  * Application wants to free up the pages and associated backing store.
  * This is effectively punching a hole into the middle of a file.
@@ -993,6 +1039,9 @@ madvise_vma(struct task_struct *task, struct vm_area_struct *vma,
 	case MADV_FREE:
 	case MADV_DONTNEED:
 		return madvise_dontneed_free(vma, prev, start, end, behavior);
+	case MADV_POPULATE_READ:
+	case MADV_POPULATE_WRITE:
+		return madvise_populate(vma, prev, start, end, behavior);
 	default:
 		return madvise_behavior(vma, prev, start, end, behavior);
 	}
@@ -1013,6 +1062,8 @@ madvise_behavior_valid(int behavior)
 	case MADV_FREE:
 	case MADV_COLD:
 	case MADV_PAGEOUT:
+	case MADV_POPULATE_READ:
+	case MADV_POPULATE_WRITE:
 #ifdef CONFIG_KSM
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
@@ -1042,6 +1093,7 @@ process_madvise_behavior_valid(int behavior)
 	switch (behavior) {
 	case MADV_COLD:
 	case MADV_PAGEOUT:
+	case MADV_WILLNEED:
 #ifdef CONFIG_KSM
 	case MADV_MERGEABLE:
 	case MADV_UNMERGEABLE:
@@ -1104,6 +1156,10 @@ process_madvise_behavior_valid(int behavior)
  *		easily if memory pressure hanppens.
  *  MADV_PAGEOUT - the application is not expected to use this memory soon,
  *		page out the pages in this range immediately.
+ *  MADV_POPULATE_READ - populate (prefault) page tables readable by
+ *		triggering read faults if required.
+ *  MADV_POPULATE_WRITE - populate (prefault) page tables writable by
+ *		triggering write faults if required.
  *
  * return values:
  *  zero    - success
@@ -1258,9 +1314,27 @@ static int do_process_madvise(struct task_struct *target_task,
 	return ret;
 }
 
-SYSCALL_DEFINE6(process_madvise, int, which, pid_t, upid,
-		const struct iovec __user *, vec, unsigned long, vlen,
-		int, behavior, unsigned long, flags)
+/*
+ * Unlike newer kernels, import_iovec() in this tree does not select the
+ * compat layout. Both process_madvise ABIs share the native syscall entry,
+ * so explicitly convert compat_iovec before walking the target mappings.
+ */
+static ssize_t process_madvise_import_iovec(const struct iovec __user *vec,
+		unsigned int vlen, unsigned int fast_segs,
+		struct iovec **iov, struct iov_iter *iter)
+{
+#ifdef CONFIG_COMPAT
+	if (in_compat_syscall())
+		return compat_import_iovec(READ,
+				(const struct compat_iovec __user *)vec,
+				vlen, fast_segs, iov, iter);
+#endif
+	return import_iovec(READ, vec, vlen, fast_segs, iov, iter);
+}
+
+static long process_madvise_legacy(int which, pid_t upid,
+		const struct iovec __user *vec, unsigned long vlen,
+		int behavior, unsigned long flags)
 {
 	ssize_t ret;
 	struct pid *pid;
@@ -1311,7 +1385,8 @@ SYSCALL_DEFINE6(process_madvise, int, which, pid_t, upid,
 		goto release_task;
 	}
 
-	ret = import_iovec(READ, vec, vlen, ARRAY_SIZE(iovstack), &iov, &iter);
+	ret = process_madvise_import_iovec(vec, vlen, ARRAY_SIZE(iovstack),
+					   &iov, &iter);
 	if (ret >= 0) {
 		size_t total_len = iov_iter_count(&iter);
 
@@ -1326,4 +1401,109 @@ release_task:
 put_pid:
 	put_pid(pid);
 	return ret;
+}
+
+static long process_madvise_upstream(int pidfd,
+		const struct iovec __user *vec, size_t vlen,
+		int behavior, unsigned int flags)
+{
+	ssize_t ret;
+	struct pid *pid;
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct iovec iovstack[UIO_FASTIOV];
+	struct iovec *iov = iovstack;
+	struct iov_iter iter;
+
+	if (flags != 0)
+		return -EINVAL;
+
+	ret = process_madvise_import_iovec(vec, vlen, ARRAY_SIZE(iovstack),
+					   &iov, &iter);
+	if (ret < 0)
+		return ret;
+
+	pid = pidfd_get_pid(pidfd);
+	if (IS_ERR(pid)) {
+		ret = PTR_ERR(pid);
+		goto free_iov;
+	}
+
+	task = get_pid_task(pid, PIDTYPE_PID);
+	if (!task) {
+		ret = -ESRCH;
+		goto put_pid;
+	}
+
+	if (!process_madvise_behavior_valid(behavior)) {
+		ret = -EINVAL;
+		goto release_task;
+	}
+
+	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+	if (IS_ERR_OR_NULL(mm)) {
+		ret = IS_ERR(mm) ? PTR_ERR(mm) : -ESRCH;
+		goto release_task;
+	}
+
+	if (!capable(CAP_SYS_NICE)) {
+		ret = -EPERM;
+		goto release_mm;
+	}
+
+	{
+		size_t total_len = iov_iter_count(&iter);
+
+		ret = do_process_madvise(task, mm, &iter, behavior);
+		if (ret >= 0)
+			ret = total_len - iov_iter_count(&iter);
+	}
+
+release_mm:
+	mmput(mm);
+release_task:
+	put_task_struct(task);
+put_pid:
+	put_pid(pid);
+free_iov:
+	kfree(iov);
+	return ret;
+}
+
+/*
+ * This tree previously exposed a non-upstream six-argument process_madvise()
+ * at syscall 436.  Android userspace expects close_range() at 436 and the
+ * pidfd-based five-argument process_madvise() at 440.  Keep the old calling
+ * convention available at 440 only as an explicit boot-time compatibility
+ * option for vendor userspace that still needs it.
+ */
+static bool process_madvise_legacy_abi;
+
+static int __init process_madvise_abi_setup(char *str)
+{
+	if (!strcmp(str, "legacy"))
+		process_madvise_legacy_abi = true;
+	else if (!strcmp(str, "upstream"))
+		process_madvise_legacy_abi = false;
+	else
+		return 0;
+
+	pr_info("process_madvise: using %s syscall ABI\n",
+		process_madvise_legacy_abi ? "legacy" : "upstream");
+	return 1;
+}
+__setup("process_madvise_abi=", process_madvise_abi_setup);
+
+SYSCALL_DEFINE6(process_madvise, unsigned long, arg0, unsigned long, arg1,
+		unsigned long, arg2, unsigned long, arg3,
+		unsigned long, arg4, unsigned long, arg5)
+{
+	if (unlikely(process_madvise_legacy_abi))
+		return process_madvise_legacy((int)arg0, (pid_t)arg1,
+				(const struct iovec __user *)arg2, arg3,
+				(int)arg4, arg5);
+
+	return process_madvise_upstream((int)arg0,
+			(const struct iovec __user *)arg1, (size_t)arg2,
+			(int)arg3, (unsigned int)arg4);
 }

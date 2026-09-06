@@ -158,7 +158,16 @@ ssize_t nfc_i2c_dev_read(struct file *filp, char __user *buf,
 						       !i2c_dev->irq_enabled);
 
 				if (ret) {
-					pr_err("error wakeup of read wq\n");
+					/*
+					 * The freezer interrupts this blocking read as part
+					 * of every system suspend.  That is an expected
+					 * -ERESTARTSYS path, not an NFC failure.  Logging it
+					 * at error level on every suspend attempt needlessly
+					 * floods the kernel log during screen-off entry.
+					 */
+					if (ret != -ERESTARTSYS)
+						pr_err("error wakeup of read wq: %d\n",
+						       ret);
 					goto err;
 				}
 			}

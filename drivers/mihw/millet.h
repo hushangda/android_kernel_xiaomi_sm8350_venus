@@ -5,6 +5,7 @@
 #include <net/sock.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
+#include <linux/vendor_freezer_compat.h>
 #include "uapi/millet.h"
 
 #define RET_OK 0
@@ -40,6 +41,11 @@ struct millet_sock {
 		void *priv;
 	} mod[MILLET_TYPES_NUM];
 };
+
+static inline bool millet_is_active(void)
+{
+	return vendor_freezer_backend_active(VENDOR_FREEZER_MILLET);
+}
 
 #ifdef CONFIG_MILLET
 int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *t,

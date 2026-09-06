@@ -68,12 +68,31 @@ config ZRAM_WRITEBACK
 
 	 See Documentation/admin-guide/blockdev/zram.rst for more information.
 
+config ZRAM_TRACK_ENTRY_ACTIME
+	bool "Track access time of zram entries"
+	depends on ZRAM
+	help
+	  Track the access time of every stored page. This permits selecting
+	  pages older than a requested age for idle-page recompression or
+	  writeback, at the cost of one ktime_t per zram table entry.
+	  Leave this disabled when age-based selection is not needed, especially
+	  on low-memory devices where the per-entry metadata cost matters.
+
 config ZRAM_MEMORY_TRACKING
 	bool "Track zRam block status"
 	depends on ZRAM && DEBUG_FS
+	select ZRAM_TRACK_ENTRY_ACTIME
 	help
 	  With this feature, admin can track the state of allocated blocks
 	  of zRAM. Admin could see the information via
 	  /sys/kernel/debug/zram/zramX/block_state.
 
 	  See Documentation/admin-guide/blockdev/zram.rst for more information.
+
+config ZRAM_MULTI_COMP
+	bool "Enable multiple compression streams"
+	depends on ZRAM
+	help
+	  Enable secondary compression streams so selected zram pages can be
+	  recompressed with a slower but more effective algorithm. Idle-page
+	  selection by age additionally requires ZRAM_TRACK_ENTRY_ACTIME.

@@ -9,6 +9,8 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/firmware.h>
+#include <linux/jiffies.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -61,8 +63,22 @@
 #define DEFAULT_RESTRICT_FCC_UA		1000000
 #define CHG_EVENT_WAKE_MS		1000
 #define VENUS_BATTERY_MODEL_NAME	"k2_4600mah"
+#define VENUS_BATTERY_MODEL_FMT		"k2_%umah"
+/* Used only until the remote fuel gauge returns a valid pack capacity. */
 #define VENUS_BATTERY_DESIGN_UAH	4600000
+#define VENUS_BATTERY_MIN_UAH		2000000
+#define VENUS_BATTERY_MAX_UAH		10000000
+#define VENUS_BATTERY_MAX_RM_UAH	11000000
+#define VENUS_EXPANDED_MARGIN_UAH	100000
+#define VENUS_UI_SOC_MIN_STEP_MS		5000
+#define VENUS_UI_SOC_MAX_STEP_MS		120000
+#define VENUS_UI_SOC_FALLBACK_STEP_MS	120000
 #define VENUS_XIAOMI_PPS_POWER_MAX_W	55
+#define VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W	27
+#define VENUS_QUICK_CHARGE_FILTER_MS	3000
+#define XM_CHARGE_UEVENT_COUNT		9
+#define MAX_UEVENT_LENGTH		50
+#define XM_UEVENT_DEBOUNCE_MS		250
 
 #define BATTERY_DIGEST_LEN 32
 #define BATTERY_SS_AUTH_DATA_LEN 4
@@ -408,6 +424,8 @@ struct battery_chg_dev {
 	struct work_struct		battery_check_work;
 	struct work_struct		charger_status_work;
 	int				fake_soc;
+	struct mutex			quick_charge_lock;
+	struct mutex			thermal_temp_lock;
 	bool				block_tx;
 	bool				ship_mode_en;
 	bool				debug_battery_detected;
@@ -423,12 +441,34 @@ struct battery_chg_dev {
 	u32				last_fcc_ua;
 	u32				usb_icl_ua;
 	u32				battery_design_uah;
+	u32				battery_full_uah;
+	bool				battery_profile_valid;
+	bool				battery_expanded;
+	struct mutex			ui_soc_lock;
+	bool				ui_soc_valid;
+	int				ui_soc;
+	int				ui_soc_target;
+	int				ui_soc_direction;
+	int				ui_soc_anchor_x100;
+	u32				ui_soc_anchor_rm_uah;
+	bool				ui_soc_rm_valid;
+	ktime_t			ui_soc_update_time;
 	u32				reverse_chg_flag;
+	bool				xm_uevent_valid;
+	char				xm_uevent_cache[XM_CHARGE_UEVENT_COUNT]
+							[MAX_UEVENT_LENGTH + 1];
 	bool				restrict_chg_en;
 	bool				shutdown_delay_en;
 	bool				charger_state_valid;
+	bool				thermal_temp_valid;
+	int				thermal_temp;
+	ktime_t			thermal_temp_read_time;
+	bool				quick_charge_online;
+	u8				quick_charge_type;
+	unsigned long			quick_charge_online_jiffies;
+	struct delayed_work		ui_soc_work;
+	struct delayed_work		quick_charge_type_work;
 	struct delayed_work		xm_prop_change_work;
-	struct delayed_work		charger_debug_info_print_work;
 	/* To track the driver initialization status */
 	bool				initialized;
 };
@@ -1048,7 +1088,11 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 
 static bool is_usb_pd_type(u32 usb_type);
 static u32 battery_chg_effective_usb_type(struct battery_chg_dev *bcdev,
-			u32 reported_type);
+				u32 reported_type);
+static void battery_chg_mark_quick_charge_online(
+				struct battery_chg_dev *bcdev);
+static void battery_chg_reset_quick_charge_filter(
+				struct battery_chg_dev *bcdev);
 
 static void battery_chg_report_psy_changed(struct battery_chg_dev *bcdev,
 					   enum psy_type type)
@@ -1060,7 +1104,6 @@ static void battery_chg_report_psy_changed(struct battery_chg_dev *bcdev,
 static void battery_chg_queue_charger_refresh(struct battery_chg_dev *bcdev)
 {
 	mod_delayed_work(system_wq, &bcdev->xm_prop_change_work, 0);
-	mod_delayed_work(system_wq, &bcdev->charger_debug_info_print_work, 0);
 }
 
 static void battery_chg_sync_charger_state(struct battery_chg_dev *bcdev)
@@ -1080,6 +1123,11 @@ static void battery_chg_sync_charger_state(struct battery_chg_dev *bcdev)
 		pr_debug("Failed to read WLS_ONLINE rc=%d\n", rc);
 
 	online = usb_pst->prop[USB_ONLINE] || wls_pst->prop[WLS_ONLINE];
+	if (usb_pst->prop[USB_ONLINE])
+		battery_chg_mark_quick_charge_online(bcdev);
+	else
+		battery_chg_reset_quick_charge_filter(bcdev);
+
 	if (online) {
 		if (batt_pst->prop[BATT_STATUS] != POWER_SUPPLY_STATUS_FULL)
 			batt_pst->prop[BATT_STATUS] = POWER_SUPPLY_STATUS_CHARGING;
@@ -1226,15 +1274,21 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 		return;
 	}
 
-	pr_err("notification: %#x\n", notify_msg->notification);
+	pr_debug("notification: %#x\n", notify_msg->notification);
 
 	switch (notify_msg->notification) {
 	case BC_BATTERY_STATUS_GET:
-	case BC_GENERIC_NOTIFY:
 		pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 		if (bcdev->shutdown_volt_mv > 0)
 			schedule_work(&bcdev->battery_check_work);
 		mod_delayed_work(system_wq, &bcdev->xm_prop_change_work, 0);
+		break;
+	case BC_GENERIC_NOTIFY:
+		pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+		if (bcdev->shutdown_volt_mv > 0)
+			schedule_work(&bcdev->battery_check_work);
+		queue_delayed_work(system_wq, &bcdev->xm_prop_change_work,
+				msecs_to_jiffies(XM_UEVENT_DEBOUNCE_MS));
 		break;
 	case BC_USB_STATUS_GET:
 		pst = &bcdev->psy_list[PSY_TYPE_USB];
@@ -1613,13 +1667,20 @@ static u32 battery_chg_effective_usb_type(struct battery_chg_dev *bcdev,
 	return reported_type;
 }
 
+static u8 get_quick_charge_type_raw(struct battery_chg_dev *bcdev);
+static u8 get_quick_charge_type(struct battery_chg_dev *bcdev);
+
 static u32 battery_chg_get_xiaomi_power_max_w(struct battery_chg_dev *bcdev)
 {
 	struct xiaomi_pps_status status;
 
 	battery_chg_get_xiaomi_pps_status(bcdev, &status);
-	if (!battery_chg_has_xiaomi_pps_evidence(&status))
+	if (!battery_chg_has_xiaomi_pps_evidence(&status)) {
+		if (get_quick_charge_type_raw(bcdev) == QUICK_CHARGE_FLASH)
+			return VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W;
+
 		return 0;
+	}
 
 	if (battery_chg_is_xiaomi_high_power_pps(&status))
 		return VENUS_XIAOMI_PPS_POWER_MAX_W;
@@ -1697,7 +1758,153 @@ struct quick_charge adapter_cap[11] = {
 	{ POWER_SUPPLY_USB_REAL_TYPE_HVDCP3P5,  QUICK_CHARGE_FLASH },
 	{0, 0},
 };
+
+static void battery_chg_mark_quick_charge_online(struct battery_chg_dev *bcdev)
+{
+	bool schedule_work = false;
+
+	mutex_lock(&bcdev->quick_charge_lock);
+	if (!bcdev->quick_charge_online) {
+		bcdev->quick_charge_online = true;
+		bcdev->quick_charge_type = QUICK_CHARGE_NORMAL;
+		bcdev->quick_charge_online_jiffies = jiffies;
+		schedule_work = true;
+	}
+	mutex_unlock(&bcdev->quick_charge_lock);
+
+	if (schedule_work)
+		mod_delayed_work(system_wq, &bcdev->quick_charge_type_work,
+			msecs_to_jiffies(VENUS_QUICK_CHARGE_FILTER_MS));
+}
+
+static void battery_chg_reset_quick_charge_filter(struct battery_chg_dev *bcdev)
+{
+	mutex_lock(&bcdev->quick_charge_lock);
+	bcdev->quick_charge_type = QUICK_CHARGE_NORMAL;
+	bcdev->quick_charge_online = false;
+	bcdev->quick_charge_online_jiffies = 0;
+	mutex_unlock(&bcdev->quick_charge_lock);
+
+	cancel_delayed_work(&bcdev->quick_charge_type_work);
+}
+
+static bool battery_chg_usb_online(struct battery_chg_dev *bcdev)
+{
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_USB];
+	int rc;
+
+	rc = read_property_id(bcdev, pst, USB_ONLINE);
+	if (!rc)
+		return !!pst->prop[USB_ONLINE];
+
+	if (bcdev->charger_state_valid)
+		return !!pst->prop[USB_ONLINE];
+
+	return false;
+}
+
+static u8 battery_chg_filter_quick_charge_type(struct battery_chg_dev *bcdev,
+					       u8 raw_type, bool *changed)
+{
+	unsigned long now = jiffies;
+	unsigned long deadline;
+	unsigned long delay = 0;
+	bool schedule_work = false;
+	bool cancel_work = false;
+	u8 filtered_type;
+
+	if (changed)
+		*changed = false;
+
+	if (raw_type >= QUICK_CHARGE_MAX)
+		raw_type = QUICK_CHARGE_NORMAL;
+
+	mutex_lock(&bcdev->quick_charge_lock);
+	if (!bcdev->quick_charge_online) {
+		bcdev->quick_charge_online = true;
+		bcdev->quick_charge_online_jiffies = now;
+	}
+
+	deadline = bcdev->quick_charge_online_jiffies +
+			msecs_to_jiffies(VENUS_QUICK_CHARGE_FILTER_MS);
+
+	if (raw_type == QUICK_CHARGE_SUPER) {
+		if (bcdev->quick_charge_type != raw_type && changed)
+			*changed = true;
+		bcdev->quick_charge_type = raw_type;
+		filtered_type = bcdev->quick_charge_type;
+		cancel_work = true;
+		goto out;
+	}
+
+	if (raw_type == QUICK_CHARGE_NORMAL &&
+	    bcdev->quick_charge_type == QUICK_CHARGE_NORMAL &&
+	    !time_after_eq(now, deadline)) {
+		filtered_type = bcdev->quick_charge_type;
+		delay = deadline - now;
+		schedule_work = true;
+		goto out;
+	}
+
+	if (time_after_eq(now, deadline)) {
+		if (bcdev->quick_charge_type != raw_type && changed)
+			*changed = true;
+		bcdev->quick_charge_type = raw_type;
+		filtered_type = bcdev->quick_charge_type;
+		cancel_work = true;
+		goto out;
+	}
+
+	filtered_type = bcdev->quick_charge_type;
+	delay = deadline - now;
+	schedule_work = true;
+
+out:
+	mutex_unlock(&bcdev->quick_charge_lock);
+
+	if (cancel_work)
+		cancel_delayed_work(&bcdev->quick_charge_type_work);
+	else if (schedule_work)
+		mod_delayed_work(system_wq, &bcdev->quick_charge_type_work, delay);
+
+	return filtered_type;
+}
+
+static u8 get_quick_charge_type_filtered(struct battery_chg_dev *bcdev,
+					 bool *changed)
+{
+	u8 raw_type;
+
+	if (!battery_chg_usb_online(bcdev)) {
+		battery_chg_reset_quick_charge_filter(bcdev);
+		if (changed)
+			*changed = false;
+		return QUICK_CHARGE_NORMAL;
+	}
+
+	raw_type = get_quick_charge_type_raw(bcdev);
+
+	return battery_chg_filter_quick_charge_type(bcdev, raw_type, changed);
+}
+
 static u8 get_quick_charge_type(struct battery_chg_dev *bcdev)
+{
+	return get_quick_charge_type_filtered(bcdev, NULL);
+}
+
+static void battery_chg_quick_charge_type_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(to_delayed_work(work),
+					struct battery_chg_dev,
+					quick_charge_type_work);
+	bool changed = false;
+
+	get_quick_charge_type_filtered(bcdev, &changed);
+	if (changed)
+		battery_chg_report_psy_changed(bcdev, PSY_TYPE_USB);
+}
+
+static u8 get_quick_charge_type_raw(struct battery_chg_dev *bcdev)
 {
 	int i = 0;
 	int rc;
@@ -1973,34 +2180,388 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	return rc;
 }
 
+static bool battery_chg_capacity_uah_valid(u32 capacity_uah)
+{
+	return capacity_uah >= VENUS_BATTERY_MIN_UAH &&
+		capacity_uah <= VENUS_BATTERY_MAX_UAH;
+}
+
+static u32 battery_chg_refresh_pack_capacity_uah(
+					struct battery_chg_dev *bcdev,
+					struct psy_state *pst,
+					u32 *learned_full_uah)
+{
+	u32 full_design_uah, full_uah;
+	u32 pack_uah = READ_ONCE(bcdev->battery_design_uah);
+	bool profile_valid = READ_ONCE(bcdev->battery_profile_valid);
+	bool expanded = READ_ONCE(bcdev->battery_expanded);
+	int design_rc, full_rc;
+
+	/*
+	 * Newer QTI/Xiaomi targets can use FULL_DESIGN as the pack identity, but
+	 * Venus replacement packs have been observed to keep FULL_DESIGN fixed at
+	 * the stock 4600 mAh while reporting their real size through FULL.  Accept
+	 * either field as expanded-pack evidence and preserve the reported value,
+	 * rather than matching one replacement-pack size.  The 100 mAh margin
+	 * keeps small stock-pack reporting variation on the remote-SOC path.  Once
+	 * expanded evidence is seen, keep that identity for the rest of this boot
+	 * so a later learned-FCC reduction cannot demote the pack to stock.
+	 */
+	design_rc = read_property_id(bcdev, pst, BATT_CHG_FULL_DESIGN);
+	full_design_uah = READ_ONCE(pst->prop[BATT_CHG_FULL_DESIGN]);
+
+	full_rc = read_property_id(bcdev, pst, BATT_CHG_FULL);
+	full_uah = READ_ONCE(pst->prop[BATT_CHG_FULL]);
+
+	if (!design_rc && battery_chg_capacity_uah_valid(full_design_uah)) {
+		if (full_design_uah >= VENUS_BATTERY_DESIGN_UAH +
+		    VENUS_EXPANDED_MARGIN_UAH) {
+			profile_valid = true;
+			expanded = true;
+			pack_uah = max(pack_uah, full_design_uah);
+		} else if (!expanded) {
+			pack_uah = VENUS_BATTERY_DESIGN_UAH;
+		}
+	}
+
+	if (!full_rc && battery_chg_capacity_uah_valid(full_uah)) {
+		profile_valid = true;
+		if (full_uah >= VENUS_BATTERY_DESIGN_UAH +
+		    VENUS_EXPANDED_MARGIN_UAH) {
+			expanded = true;
+			pack_uah = max(pack_uah, full_uah);
+		}
+		WRITE_ONCE(bcdev->battery_full_uah, full_uah);
+	}
+
+	if (!battery_chg_capacity_uah_valid(pack_uah))
+		pack_uah = VENUS_BATTERY_DESIGN_UAH;
+	if (!battery_chg_capacity_uah_valid(full_uah))
+		full_uah = READ_ONCE(bcdev->battery_full_uah);
+
+	WRITE_ONCE(bcdev->battery_design_uah, pack_uah);
+	WRITE_ONCE(bcdev->battery_profile_valid, profile_valid);
+	WRITE_ONCE(bcdev->battery_expanded, expanded);
+	if (learned_full_uah)
+		*learned_full_uah = full_uah;
+	if (pst->model)
+		scnprintf(pst->model, MAX_STR_LEN, VENUS_BATTERY_MODEL_FMT,
+			  DIV_ROUND_CLOSEST(pack_uah, 1000));
+
+	return pack_uah;
+}
+
+static int battery_chg_read_fg_remaining_uah(struct battery_chg_dev *bcdev,
+					      u32 *remaining_uah)
+{
+	struct psy_state *xm_pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 value;
+	int rc;
+
+	rc = read_property_id(bcdev, xm_pst, XM_PROP_FG_RM);
+	if (rc < 0)
+		return rc;
+
+	value = READ_ONCE(xm_pst->prop[XM_PROP_FG_RM]);
+	if (value > VENUS_BATTERY_MAX_RM_UAH)
+		return -ERANGE;
+
+	*remaining_uah = value;
+	return 0;
+}
+
+static u32 battery_chg_effective_full_uah(struct battery_chg_dev *bcdev)
+{
+	u32 full_uah = READ_ONCE(bcdev->battery_full_uah);
+	u32 design_uah = READ_ONCE(bcdev->battery_design_uah);
+
+	/* FULL may follow an aged pack; fall back to the detected nominal size. */
+	if (battery_chg_capacity_uah_valid(full_uah))
+		return full_uah;
+	if (battery_chg_capacity_uah_valid(design_uah))
+		return design_uah;
+
+	return VENUS_BATTERY_DESIGN_UAH;
+}
+
+static u32 battery_chg_ui_soc_step_ms(struct battery_chg_dev *bcdev,
+				      struct psy_state *pst)
+{
+	s64 current_ua = (s32)READ_ONCE(pst->prop[BATT_CURR_NOW]);
+	u64 step_ms;
+
+	if (current_ua < 0)
+		current_ua = -current_ua;
+	if (!current_ua)
+		return VENUS_UI_SOC_FALLBACK_STEP_MS;
+
+	/*
+	 * Time physically needed to move one percent at the latest battery
+	 * current. There is deliberately no fixed 30 second floor: high-current
+	 * charging or discharge is allowed to update faster when justified.
+	 */
+	step_ms = div64_u64((u64)battery_chg_effective_full_uah(bcdev) *
+				36000ULL, current_ua);
+
+	return clamp_val(step_ms, VENUS_UI_SOC_MIN_STEP_MS,
+			 VENUS_UI_SOC_MAX_STEP_MS);
+}
+
+static int battery_chg_soc_direction(int status)
+{
+	switch (status) {
+	case POWER_SUPPLY_STATUS_CHARGING:
+	case POWER_SUPPLY_STATUS_FULL:
+		return 1;
+	case POWER_SUPPLY_STATUS_DISCHARGING:
+	case POWER_SUPPLY_STATUS_NOT_CHARGING:
+		return -1;
+	default:
+		return 0;
+	}
+}
+
+static void battery_chg_reset_ui_soc(struct battery_chg_dev *bcdev)
+{
+	cancel_delayed_work(&bcdev->ui_soc_work);
+	mutex_lock(&bcdev->ui_soc_lock);
+	bcdev->ui_soc_valid = false;
+	mutex_unlock(&bcdev->ui_soc_lock);
+}
+
+static void battery_chg_reanchor_ui_soc(struct battery_chg_dev *bcdev)
+{
+	cancel_delayed_work(&bcdev->ui_soc_work);
+	mutex_lock(&bcdev->ui_soc_lock);
+	if (bcdev->ui_soc_valid) {
+		/*
+		 * A remote subsystem restart must not expose its first recalculated
+		 * SOC directly to userspace.  Preserve the last displayed value and
+		 * make the next valid remaining-charge sample a fresh anchor.
+		 */
+		bcdev->ui_soc_target = bcdev->ui_soc;
+		bcdev->ui_soc_rm_valid = false;
+		bcdev->ui_soc_update_time = ktime_get_boottime();
+	}
+	mutex_unlock(&bcdev->ui_soc_lock);
+}
+
+static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
+				       struct psy_state *pst, int raw_soc,
+				       u32 remaining_uah, bool rm_valid,
+				       bool expanded, bool *changed)
+{
+	ktime_t now = ktime_get_boottime();
+	u32 full_uah, next_ms = 0, step_ms;
+	s64 candidate_x100, delta_rm, elapsed_ms;
+	int direction, status, target_soc;
+
+	status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
+	direction = battery_chg_soc_direction(status);
+	full_uah = battery_chg_effective_full_uah(bcdev);
+	step_ms = battery_chg_ui_soc_step_ms(bcdev, pst);
+	*changed = false;
+	/* A charger-confirmed FULL state must not leave userspace at 99%. */
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
+		raw_soc = 100;
+
+	mutex_lock(&bcdev->ui_soc_lock);
+	if (!bcdev->ui_soc_valid) {
+		bcdev->ui_soc = raw_soc;
+		bcdev->ui_soc_target = raw_soc;
+		bcdev->ui_soc_direction = direction;
+		bcdev->ui_soc_anchor_x100 = raw_soc * 100;
+		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+		bcdev->ui_soc_rm_valid = rm_valid;
+		bcdev->ui_soc_update_time = now;
+		bcdev->ui_soc_valid = true;
+		goto out;
+	}
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99) {
+		/* Re-anchor every completed charge so learned aging is retained. */
+		if (rm_valid) {
+			bcdev->ui_soc_anchor_x100 = 10000;
+			bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+			bcdev->ui_soc_rm_valid = true;
+		}
+		if (bcdev->ui_soc == 99) {
+			bcdev->ui_soc = 100;
+			bcdev->ui_soc_target = 100;
+			bcdev->ui_soc_update_time = now;
+			*changed = true;
+			goto out;
+		}
+	}
+
+	/* Do not spend elapsed discharge time immediately after a plug change. */
+	if (direction && direction != bcdev->ui_soc_direction) {
+		bcdev->ui_soc_direction = direction;
+		bcdev->ui_soc_update_time = now;
+	}
+
+	/*
+	 * Expanded packs can retain the stock remote SOC profile. Anchor once to
+	 * the remote percentage, then follow the change in the gauge remaining
+	 * charge instead of treating later remote SOC recalculations as truth.
+	 * The rate limiter below also contains discontinuities in FG_RM itself.
+	 */
+	if (expanded && rm_valid && !bcdev->ui_soc_rm_valid) {
+		bcdev->ui_soc_anchor_x100 = bcdev->ui_soc * 100;
+		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+		bcdev->ui_soc_rm_valid = true;
+	}
+	if (expanded && !rm_valid)
+		bcdev->ui_soc_rm_valid = false;
+
+	if (expanded && rm_valid && bcdev->ui_soc_rm_valid &&
+	    battery_chg_capacity_uah_valid(full_uah) &&
+	    remaining_uah <= VENUS_BATTERY_MAX_RM_UAH) {
+		delta_rm = (s64)remaining_uah -
+			   (s64)bcdev->ui_soc_anchor_rm_uah;
+		candidate_x100 = (s64)bcdev->ui_soc_anchor_x100 +
+			div_s64(delta_rm * 10000LL, full_uah);
+		candidate_x100 = clamp_val(candidate_x100, 0, 10000);
+		target_soc = div_s64(candidate_x100 + 50, 100);
+	} else {
+		/* A failed RM read falls back to the remote SOC, still rate limited. */
+		target_soc = raw_soc;
+	}
+	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
+		target_soc = 100;
+
+	/*
+	 * RM recalculation must not reverse the displayed direction or grant
+	 * charge credit that makes the next real percent appear late.  Drop the
+	 * opposite-direction delta and continue from the current displayed SOC.
+	 */
+	if (expanded && rm_valid &&
+	    ((direction > 0 && target_soc < bcdev->ui_soc) ||
+	     (direction < 0 && target_soc > bcdev->ui_soc))) {
+		bcdev->ui_soc_anchor_x100 = bcdev->ui_soc * 100;
+		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
+		target_soc = bcdev->ui_soc;
+	} else if (expanded && direction > 0) {
+		target_soc = max(target_soc, bcdev->ui_soc);
+	} else if (expanded && direction < 0) {
+		target_soc = min(target_soc, bcdev->ui_soc);
+	}
+
+	target_soc = clamp_val(target_soc, 0, 100);
+	bcdev->ui_soc_target = target_soc;
+	if (target_soc == bcdev->ui_soc)
+		goto out;
+
+	/* Keep the stock path unchanged for normal one-percent updates. */
+	if (!expanded && abs(target_soc - bcdev->ui_soc) == 1) {
+		bcdev->ui_soc = target_soc;
+		bcdev->ui_soc_update_time = now;
+		*changed = true;
+		goto out;
+	}
+
+	elapsed_ms = ktime_ms_delta(now, bcdev->ui_soc_update_time);
+	if (elapsed_ms < 0)
+		elapsed_ms = 0;
+	if (elapsed_ms >= step_ms) {
+		bcdev->ui_soc += target_soc > bcdev->ui_soc ? 1 : -1;
+		bcdev->ui_soc_update_time = now;
+		*changed = true;
+		if (bcdev->ui_soc != target_soc)
+			next_ms = step_ms;
+	} else {
+		next_ms = step_ms - elapsed_ms;
+	}
+
+out:
+	raw_soc = bcdev->ui_soc;
+	mutex_unlock(&bcdev->ui_soc_lock);
+
+	if (next_ms)
+		mod_delayed_work(system_wq, &bcdev->ui_soc_work,
+				 msecs_to_jiffies(next_ms));
+	else
+		cancel_delayed_work(&bcdev->ui_soc_work);
+
+	return raw_soc;
+}
+
+static void battery_chg_ui_soc_work(struct work_struct *work)
+{
+	struct battery_chg_dev *bcdev = container_of(to_delayed_work(work),
+						struct battery_chg_dev,
+						ui_soc_work);
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	u32 remaining_uah = 0;
+	bool changed, rm_valid;
+	int raw_soc, rc;
+
+	if (!READ_ONCE(bcdev->initialized) || !pst->psy)
+		return;
+
+	rc = read_property_id(bcdev, pst, BATT_CAPACITY);
+	if (rc < 0)
+		return;
+	raw_soc = clamp_val(DIV_ROUND_CLOSEST(
+		READ_ONCE(pst->prop[BATT_CAPACITY]), 100), 0, 100);
+
+	read_property_id(bcdev, pst, BATT_STATUS);
+	read_property_id(bcdev, pst, BATT_CURR_NOW);
+	rm_valid = READ_ONCE(bcdev->battery_expanded) &&
+		!battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+	battery_chg_get_ui_capacity(bcdev, pst, raw_soc, remaining_uah,
+				    rm_valid,
+				    READ_ONCE(bcdev->battery_expanded), &changed);
+	if (changed)
+		power_supply_changed(pst->psy);
+}
+
 static int battery_psy_get_prop(struct power_supply *psy,
 		enum power_supply_property prop,
 		union power_supply_propval *pval)
 {
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	u32 learned_full_uah, pack_uah, raw_value, remaining_uah = 0;
+	bool changed, expanded, rm_valid;
 	int prop_id, rc;
 
 	pval->intval = -ENODATA;
 
 	if (prop == POWER_SUPPLY_PROP_MODEL_NAME) {
+		battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
 		pval->strval = pst->model ? pst->model : VENUS_BATTERY_MODEL_NAME;
 		return 0;
 	}
 
+	/* TIME_TO_FULL_NOW and TIME_TO_FULL_AVG use the same remote property. */
+	if (prop == POWER_SUPPLY_PROP_TIME_TO_FULL_NOW)
+		prop = POWER_SUPPLY_PROP_TIME_TO_FULL_AVG;
+
+	if (prop == POWER_SUPPLY_PROP_CHARGE_COUNTER &&
+	    READ_ONCE(bcdev->battery_expanded) &&
+	    !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah)) {
+		pval->intval = remaining_uah;
+		return 0;
+	}
+
+	if (prop == POWER_SUPPLY_PROP_CHARGE_FULL) {
+		battery_chg_refresh_pack_capacity_uah(bcdev, pst,
+						       &learned_full_uah);
+		if (!battery_chg_capacity_uah_valid(learned_full_uah))
+			return -ENODATA;
+		pval->intval = learned_full_uah;
+		return 0;
+	}
+
 	if (prop == POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN) {
-		pval->intval = bcdev->battery_design_uah;
+		pack_uah = battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
+		pval->intval = pack_uah;
 		return 0;
 	}
 
 	prop_id = get_property_id(pst, prop);
 	if (prop_id < 0)
 		return prop_id;
-
-	if (prop == POWER_SUPPLY_PROP_STATUS && bcdev->charger_state_valid) {
-		pval->intval = pst->prop[prop_id];
-		return 0;
-	}
 
 	rc = read_property_id(bcdev, pst, prop_id);
 	if (rc < 0)
@@ -2011,24 +2572,32 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		pval->strval = pst->model;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
-#if defined(CONFIG_BQ_FUEL_GAUGE)
-		pval->intval = pst->prop[prop_id] / 100;
-#else
-		pval->intval = DIV_ROUND_CLOSEST(pst->prop[prop_id], 100);
-#endif
-		/*if (IS_ENABLED(CONFIG_QTI_PMIC_GLINK_CLIENT_DEBUG) &&
-		   (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100))
-			pval->intval = bcdev->fake_soc;*/
-		if(bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100)
+		pval->intval = clamp_val(DIV_ROUND_CLOSEST(
+			pst->prop[prop_id], 100), 0, 100);
+		if (bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100) {
+			battery_chg_reset_ui_soc(bcdev);
 			pval->intval = bcdev->fake_soc;
+			break;
+		}
+
+		if (!READ_ONCE(bcdev->battery_profile_valid))
+			battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
+		expanded = READ_ONCE(bcdev->battery_expanded);
+		read_property_id(bcdev, pst, BATT_STATUS);
+		read_property_id(bcdev, pst, BATT_CURR_NOW);
+		rm_valid = expanded &&
+			!battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+		pval->intval = battery_chg_get_ui_capacity(bcdev, pst,
+				pval->intval, remaining_uah, rm_valid,
+				expanded, &changed);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
-#if defined(CONFIG_BQ_FUEL_GAUGE)
-		pval->intval = pst->prop[prop_id];
-		pval->intval = pval->intval / 10;
-#else
 		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
-#endif
+		break;
+	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
+		raw_value = pst->prop[prop_id];
+		pval->intval = raw_value > 65535 / 60 ?
+			65535 : raw_value * 60;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		pval->intval = bcdev->curr_thermal_level;
@@ -2057,25 +2626,6 @@ static int battery_psy_set_prop(struct power_supply *psy,
 		return prop_id;
 
 	switch (prop) {
-	case POWER_SUPPLY_PROP_MODEL_NAME:
-		if (!pst->model || !pval->strval || !pval->strval[0])
-			return -EINVAL;
-
-		strlcpy(pst->model, pval->strval, MAX_STR_LEN);
-		strim(pst->model);
-		if (!pst->model[0])
-			return -EINVAL;
-
-		power_supply_changed(psy);
-		break;
-	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-		if (pval->intval <= 0)
-			return -EINVAL;
-
-		bcdev->battery_design_uah = pval->intval;
-		pst->prop[prop_id] = pval->intval;
-		power_supply_changed(psy);
-		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		return battery_psy_set_charge_current(bcdev, pval->intval);
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
@@ -2092,8 +2642,6 @@ static int battery_psy_prop_is_writeable(struct power_supply *psy,
 		enum power_supply_property prop)
 {
 	switch (prop) {
-	case POWER_SUPPLY_PROP_MODEL_NAME:
-	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 		return 1;
@@ -2125,6 +2673,7 @@ static enum power_supply_property battery_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_FULL,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
+	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
 	POWER_SUPPLY_PROP_POWER_NOW,
 	POWER_SUPPLY_PROP_POWER_AVG,
@@ -2148,33 +2697,51 @@ static int power_supply_read_temp(struct thermal_zone_device *tzd,
 		int *temp)
 {
 	struct power_supply *psy;
-	struct battery_chg_dev *bcdev = NULL;
-	struct psy_state *pst = NULL;
-	int rc = 0, batt_temp;
-	static int last_temp;
+	struct battery_chg_dev *bcdev;
+	struct psy_state *pst;
+	int rc, batt_temp;
 	ktime_t time_now;
-	static ktime_t last_read_time;
 	s64 delta;
 
-	WARN_ON(tzd == NULL);
+	if (WARN_ON(!tzd || !temp))
+		return -EINVAL;
+
 	psy = tzd->devdata;
+	if (!psy)
+		return -ENODEV;
+
 	bcdev = power_supply_get_drvdata(psy);
+	if (!bcdev)
+		return -ENODEV;
+
 	pst = &bcdev->psy_list[PSY_TYPE_XM];
 
 	time_now = ktime_get();
-	delta = ktime_ms_delta(time_now, last_read_time);
-	if(delta < 5000){
-		batt_temp = last_temp;
+	mutex_lock(&bcdev->thermal_temp_lock);
+	delta = ktime_ms_delta(time_now, bcdev->thermal_temp_read_time);
+	if (bcdev->thermal_temp_valid && delta < 5000) {
+		batt_temp = bcdev->thermal_temp;
 	} else {
 		rc = read_property_id(bcdev, pst, XM_PROP_THERMAL_TEMP);
-		batt_temp = pst->prop[XM_PROP_THERMAL_TEMP];
-		last_temp = batt_temp;
-		last_read_time = time_now;
+		if (rc < 0) {
+			if (!bcdev->thermal_temp_valid) {
+				mutex_unlock(&bcdev->thermal_temp_lock);
+				return rc;
+			}
+			batt_temp = bcdev->thermal_temp;
+		} else {
+			batt_temp = (int)pst->prop[XM_PROP_THERMAL_TEMP];
+			bcdev->thermal_temp = batt_temp;
+			bcdev->thermal_temp_read_time = time_now;
+			bcdev->thermal_temp_valid = true;
+		}
 	}
-
 	*temp = batt_temp * 1000;
-	pr_err("batt_thermal temp:%d ,delta:%ld blank_state=%d chg_type=%s tl:=%d  ffc:=%d, pd_verifed:=%d\n",
-		batt_temp,delta, bcdev->blank_state, power_supply_usb_type_text[pst->prop[XM_PROP_REAL_TYPE]],
+	mutex_unlock(&bcdev->thermal_temp_lock);
+
+	pr_debug("batt_thermal temp:%d delta:%lld blank_state=%d chg_type=%s tl:%d ffc:%d pd_verified:%d\n",
+		batt_temp, delta, bcdev->blank_state,
+		get_usb_type_name(pst->prop[XM_PROP_REAL_TYPE]),
 		bcdev->curr_thermal_level, pst->prop[XM_PROP_FASTCHGMODE], pst->prop[XM_PROP_PD_VERIFED]);
 	return 0;
 }
@@ -2255,6 +2822,12 @@ static void battery_chg_subsys_up_work(struct work_struct *work)
 			pr_err("Failed to set ICL(%u uA), rc=%d\n",
 				bcdev->usb_icl_ua, rc);
 	}
+
+	/* Refresh the data after SSR without dropping the displayed SOC state. */
+	battery_chg_reanchor_ui_soc(bcdev);
+	battery_chg_report_psy_changed(bcdev, PSY_TYPE_BATTERY);
+	battery_chg_report_psy_changed(bcdev, PSY_TYPE_USB);
+	battery_chg_report_psy_changed(bcdev, PSY_TYPE_WLS);
 }
 
 static int wireless_fw_send_firmware(struct battery_chg_dev *bcdev,
@@ -4505,9 +5078,13 @@ static ssize_t apdo_max_show(struct class *c,
 					struct class_attribute *attr, char *buf)
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
-						battery_class);
+							battery_class);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
 	int rc;
+
+	if (get_quick_charge_type(bcdev) == QUICK_CHARGE_FLASH)
+		return scnprintf(buf, PAGE_SIZE, "%u\n",
+				VENUS_QUICK_CHARGE_FLASH_POWER_MAX_W);
 
 	rc = read_property_id(bcdev, pst, XM_PROP_APDO_MAX);
 	if (rc < 0)
@@ -4558,14 +5135,14 @@ static ssize_t fg_rm_show(struct class *c,
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
-	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
+	u32 remaining_uah;
 	int rc;
 
-	rc = read_property_id(bcdev, pst, XM_PROP_FG_RM);
+	rc = battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
 	if (rc < 0)
 		return rc;
 
-	return scnprintf(buf, PAGE_SIZE, "%u\n", pst->prop[XM_PROP_FG_RM]);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", remaining_uah);
 }
 static CLASS_ATTR_RO(fg_rm);
 
@@ -4830,12 +5407,11 @@ static void battery_chg_add_debugfs(struct battery_chg_dev *bcdev)
 static void battery_chg_add_debugfs(struct battery_chg_dev *bcdev) { }
 #endif
 
-#define MAX_UEVENT_LENGTH 50
 static void generate_xm_charge_uvent(struct work_struct *work)
 {
 	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev, xm_prop_change_work.work);
 
-	static char uevent_string[][MAX_UEVENT_LENGTH+1] = {
+	char uevent_string[XM_CHARGE_UEVENT_COUNT][MAX_UEVENT_LENGTH + 1] = {
 		"POWER_SUPPLY_REVERSE_CHG_STATE=\n",	//length=31+1
 		"POWER_SUPPLY_REVERSE_CHG_MODE=\n",	//length=30+1
 		"POWER_SUPPLY_TX_MAC=\n",		//length=20+16
@@ -4846,7 +5422,7 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 		"POWER_SUPPLY_SHUTDOWN_DELAY=\n",//28+8
 		"POWER_SUPPLY_WLS_CAR_ADAPTER=\n",//length=29+1
 	};
-	static char *envp[] = {
+	char *envp[XM_CHARGE_UEVENT_COUNT + 1] = {
 		uevent_string[0],
 		uevent_string[1],
 		uevent_string[2],
@@ -4860,6 +5436,7 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 
 	};
 	char *prop_buf = NULL;
+	bool changed;
 
 	prop_buf = (char *)get_zeroed_page(GFP_KERNEL);
 	if (!prop_buf)
@@ -4896,61 +5473,24 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 
 	/*add our prop end*/
 
-	dev_err(bcdev->dev,"uevent test : %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n",
+	changed = !bcdev->xm_uevent_valid ||
+		memcmp(bcdev->xm_uevent_cache, uevent_string,
+				sizeof(uevent_string));
+	if (!changed)
+		goto out;
+
+	memcpy(bcdev->xm_uevent_cache, uevent_string, sizeof(uevent_string));
+	bcdev->xm_uevent_valid = true;
+
+	dev_dbg(bcdev->dev,"xm charge uevent: %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n %s\n",
 			envp[0], envp[1], envp[2], envp[3], envp[4], envp[5], envp[6], envp[7], envp[8]);
 
 	kobject_uevent_env(&bcdev->dev->kobj, KOBJ_CHANGE, envp);
 
+out:
 	free_page((unsigned long)prop_buf);
 	return;
 }
-
-#define CHARGING_PERIOD_S		60
-#define DISCHARGE_PERIOD_S		300
-static void xm_charger_debug_info_print_work(struct work_struct *work)
-{
-	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev, charger_debug_info_print_work.work);
-	struct power_supply *usb_psy = NULL;
-	int rc, usb_present = 0;
-	int vbus_vol_uv, ibus_ua;
-	int interval = DISCHARGE_PERIOD_S;
-	union power_supply_propval val = {0, };
-	//struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
-
-	usb_psy = bcdev->psy_list[PSY_TYPE_USB].psy;
-	if (usb_psy != NULL) {
-		rc = usb_psy_get_prop(usb_psy, POWER_SUPPLY_PROP_ONLINE, &val);
-		if (!rc)
-			usb_present = val.intval;
-		else
-			usb_present = 0;
-		pr_err("usb_present: %d\n", usb_present);
-	} else {
-		return;
-	}
-
-	if (usb_present == 1) {
-		rc = usb_psy_get_prop(usb_psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
-		if (!rc)
-			vbus_vol_uv = val.intval;
-		else
-			vbus_vol_uv = 0;
-
-		rc = usb_psy_get_prop(usb_psy, POWER_SUPPLY_PROP_CURRENT_NOW, &val);
-		if (!rc)
-			ibus_ua = val.intval;
-		else
-			ibus_ua = 0;
-
-		pr_err("vbus_vol_uv: %d, ibus_ua: %d\n", vbus_vol_uv, ibus_ua);
-		interval = CHARGING_PERIOD_S;
-	} else {
-		interval = DISCHARGE_PERIOD_S;
-	}
-
-	schedule_delayed_work(&bcdev->charger_debug_info_print_work, interval * HZ);
-}
-
 
 static int battery_chg_parse_dt(struct battery_chg_dev *bcdev)
 {
@@ -5112,6 +5652,9 @@ static int battery_chg_probe(struct platform_device *pdev)
 		devm_kzalloc(&pdev->dev, MAX_STR_LEN, GFP_KERNEL);
 
 	mutex_init(&bcdev->rw_lock);
+	mutex_init(&bcdev->ui_soc_lock);
+	mutex_init(&bcdev->quick_charge_lock);
+	mutex_init(&bcdev->thermal_temp_lock);
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
 	init_completion(&bcdev->fw_update_ack);
@@ -5119,8 +5662,10 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_WORK(&bcdev->usb_type_work, battery_chg_update_usb_type_work);
 	INIT_WORK(&bcdev->battery_check_work, battery_chg_check_status_work);
 	INIT_WORK(&bcdev->charger_status_work, battery_chg_charger_status_work);
+	INIT_DELAYED_WORK(&bcdev->ui_soc_work, battery_chg_ui_soc_work);
+	INIT_DELAYED_WORK(&bcdev->quick_charge_type_work,
+			battery_chg_quick_charge_type_work);
 	INIT_DELAYED_WORK(&bcdev->xm_prop_change_work, generate_xm_charge_uvent);
-	INIT_DELAYED_WORK(&bcdev->charger_debug_info_print_work, xm_charger_debug_info_print_work);
 	atomic_set(&bcdev->state, PMIC_GLINK_STATE_UP);
 	bcdev->dev = dev;
 	client_data.id = MSG_OWNER_BC;
@@ -5188,6 +5733,8 @@ static int battery_chg_probe(struct platform_device *pdev)
 error:
 	bcdev->initialized = false;
 	complete(&bcdev->ack);
+	cancel_delayed_work_sync(&bcdev->ui_soc_work);
+	cancel_delayed_work_sync(&bcdev->quick_charge_type_work);
 	pmic_glink_unregister_client(bcdev->client);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
@@ -5200,6 +5747,8 @@ static int battery_chg_remove(struct platform_device *pdev)
 	int rc;
 
 	device_init_wakeup(bcdev->dev, false);
+	cancel_delayed_work_sync(&bcdev->ui_soc_work);
+	cancel_delayed_work_sync(&bcdev->quick_charge_type_work);
 	debugfs_remove_recursive(bcdev->debugfs_dir);
 	class_unregister(&bcdev->battery_class);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
@@ -5216,7 +5765,7 @@ static int chg_suspend(struct device *dev)
 {
 	//struct battery_chg_dev *bcdev = dev_get_drvdata(dev);
 
-	pr_err("chg suspend\n");
+	pr_debug("chg suspend\n");
 	return 0;
 }
 
@@ -5224,7 +5773,7 @@ static int chg_resume(struct device *dev)
 {
 	//struct battery_chg_dev *bcdev = dev_get_drvdata(dev);
 
-	pr_err("chg resume\n");
+	pr_debug("chg resume\n");
 	return 0;
 }
 static const struct of_device_id battery_chg_match_table[] = {
