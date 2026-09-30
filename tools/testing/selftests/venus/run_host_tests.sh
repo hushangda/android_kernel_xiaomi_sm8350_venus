@@ -15,14 +15,18 @@ extract_function() {
   sed -n "/^$1(/,/^}/p" "$2"
 }
 
-for variant in packing core_ctl touch touch_factory; do
+for variant in packing core_ctl touch touch_factory battery; do
   test="${variant%_factory}"
   variant_flags=()
   [[ "$variant" != touch_factory ]] || variant_flags+=(-DCONFIG_FACTORY_BUILD)
   {
-    if [[ "$test" != touch ]]; then
+    if [[ "$test" == packing || "$test" == core_ctl ]]; then
       sed -n '/^#define MIUI_POWER_ENHANCE_CLUSTER_PACKING/,/^extern unsigned int miui_power_enhance;/p' \
         "$source_dir/include/linux/sched/sysctl.h"
+    fi
+    if [[ "$test" == battery ]]; then
+      sed -n '/^#define VENUS_BATTERY_MODEL_NAME/,/^#define VENUS_UI_SOC_FALLBACK_STEP_MS/p' \
+        "$source_dir/drivers/power/supply/qti_battery_charger_venus.c"
     fi
     sed -n '1,$p' "$test_dir/${test}_test.c"
     case "$test" in
@@ -39,6 +43,22 @@ for variant in packing core_ctl touch touch_factory; do
           extract_function "static void $function" "$source_dir/drivers/input/touchscreen/fts_spi/fts.c"
         done
         extract_function 'static int fts_drm_state_chg_callback' "$source_dir/drivers/input/touchscreen/fts_spi/fts.c"
+        ;;
+      battery)
+        battery_source="$source_dir/drivers/power/supply/qti_battery_charger_venus.c"
+        for signature in \
+          'static bool battery_chg_capacity_uah_valid' \
+          'static u32 battery_chg_refresh_pack_capacity_uah' \
+          'static int battery_chg_read_fg_remaining_uah' \
+          'static u32 battery_chg_effective_full_uah' \
+          'static u32 battery_chg_ui_soc_step_ms' \
+          'static void battery_chg_reset_ui_soc' \
+          'static void battery_chg_restart_ui_soc' \
+          'static int battery_chg_get_ui_capacity' \
+          'static void battery_chg_ui_soc_work' \
+          'static int battery_psy_get_prop'; do
+          extract_function "$signature" "$battery_source"
+        done
         ;;
     esac
   } | "$compiler" "${compile_flags[@]}" "${variant_flags[@]}" -o "$output_dir/${variant}_test" -

@@ -443,15 +443,12 @@ struct battery_chg_dev {
 	u32				battery_design_uah;
 	u32				battery_full_uah;
 	bool				battery_profile_valid;
-	bool				battery_expanded;
+	bool				battery_expanded; /* Pack identity only. */
 	struct mutex			ui_soc_lock;
 	bool				ui_soc_valid;
+	bool				ui_soc_from_gauge;
 	int				ui_soc;
 	int				ui_soc_target;
-	int				ui_soc_direction;
-	int				ui_soc_anchor_x100;
-	u32				ui_soc_anchor_rm_uah;
-	bool				ui_soc_rm_valid;
 	ktime_t			ui_soc_update_time;
 	u32				reverse_chg_flag;
 	bool				xm_uevent_valid;
@@ -2307,40 +2304,26 @@ static u32 battery_chg_ui_soc_step_ms(struct battery_chg_dev *bcdev,
 			 VENUS_UI_SOC_MAX_STEP_MS);
 }
 
-static int battery_chg_soc_direction(int status)
-{
-	switch (status) {
-	case POWER_SUPPLY_STATUS_CHARGING:
-	case POWER_SUPPLY_STATUS_FULL:
-		return 1;
-	case POWER_SUPPLY_STATUS_DISCHARGING:
-	case POWER_SUPPLY_STATUS_NOT_CHARGING:
-		return -1;
-	default:
-		return 0;
-	}
-}
-
 static void battery_chg_reset_ui_soc(struct battery_chg_dev *bcdev)
 {
 	cancel_delayed_work(&bcdev->ui_soc_work);
 	mutex_lock(&bcdev->ui_soc_lock);
 	bcdev->ui_soc_valid = false;
+	bcdev->ui_soc_from_gauge = false;
 	mutex_unlock(&bcdev->ui_soc_lock);
 }
 
-static void battery_chg_reanchor_ui_soc(struct battery_chg_dev *bcdev)
+static void battery_chg_restart_ui_soc(struct battery_chg_dev *bcdev)
 {
 	cancel_delayed_work(&bcdev->ui_soc_work);
 	mutex_lock(&bcdev->ui_soc_lock);
 	if (bcdev->ui_soc_valid) {
 		/*
 		 * A remote subsystem restart must not expose its first recalculated
-		 * SOC directly to userspace.  Preserve the last displayed value and
-		 * make the next valid remaining-charge sample a fresh anchor.
+		 * SOC directly to userspace. Preserve the display and let fresh gauge
+		 * samples correct it through the normal rate limiter.
 		 */
 		bcdev->ui_soc_target = bcdev->ui_soc;
-		bcdev->ui_soc_rm_valid = false;
 		bcdev->ui_soc_update_time = ktime_get_boottime();
 	}
 	mutex_unlock(&bcdev->ui_soc_lock);
@@ -2349,115 +2332,68 @@ static void battery_chg_reanchor_ui_soc(struct battery_chg_dev *bcdev)
 static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
 				       struct psy_state *pst, int raw_soc,
 				       u32 remaining_uah, bool rm_valid,
-				       bool expanded, bool *changed)
+				       bool *changed)
 {
 	ktime_t now = ktime_get_boottime();
 	u32 full_uah, next_ms = 0, step_ms;
-	s64 candidate_x100, delta_rm, elapsed_ms;
-	int direction, status, target_soc;
+	s64 elapsed_ms;
+	int status, target_soc;
 
 	status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
-	direction = battery_chg_soc_direction(status);
 	full_uah = battery_chg_effective_full_uah(bcdev);
 	step_ms = battery_chg_ui_soc_step_ms(bcdev, pst);
 	*changed = false;
-	/* A charger-confirmed FULL state must not leave userspace at 99%. */
-	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
-		raw_soc = 100;
+	target_soc = raw_soc;
+	/* Do not treat an uninitialized zero RM as empty while remote SOC is high. */
+	if (!remaining_uah && raw_soc > 1)
+		rm_valid = false;
+	/*
+	 * RM is an absolute remaining-charge measurement. Adding its delta to a
+	 * remote SOC anchor preserves any error in that anchor indefinitely (for
+	 * example, 75% with 4739 mAh remaining out of a 4800 mAh full capacity).
+	 * Use the measured ratio for both stock and replacement packs, including
+	 * initialization, gauge recovery and learned full-capacity changes.
+	 */
+	rm_valid = rm_valid && battery_chg_capacity_uah_valid(full_uah) &&
+		remaining_uah <= VENUS_BATTERY_MAX_RM_UAH;
+	if (rm_valid)
+		target_soc = min_t(u64, 100,
+			div64_u64((u64)remaining_uah * 100 + full_uah / 2,
+				  full_uah));
+	if (status == POWER_SUPPLY_STATUS_FULL &&
+	    (target_soc >= 99 || raw_soc >= 99))
+		target_soc = 100;
+	target_soc = clamp_val(target_soc, 0, 100);
 
 	mutex_lock(&bcdev->ui_soc_lock);
-	if (!bcdev->ui_soc_valid) {
-		bcdev->ui_soc = raw_soc;
-		bcdev->ui_soc_target = raw_soc;
-		bcdev->ui_soc_direction = direction;
-		bcdev->ui_soc_anchor_x100 = raw_soc * 100;
-		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
-		bcdev->ui_soc_rm_valid = rm_valid;
+	if (!bcdev->ui_soc_valid || (rm_valid && !bcdev->ui_soc_from_gauge)) {
+		/* Replace a boot-time fallback as soon as the gauge is available. */
+		*changed = bcdev->ui_soc_valid && bcdev->ui_soc != target_soc;
+		bcdev->ui_soc = target_soc;
+		bcdev->ui_soc_target = target_soc;
 		bcdev->ui_soc_update_time = now;
 		bcdev->ui_soc_valid = true;
+		bcdev->ui_soc_from_gauge = rm_valid;
 		goto out;
 	}
-	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99) {
-		/* Re-anchor every completed charge so learned aging is retained. */
-		if (rm_valid) {
-			bcdev->ui_soc_anchor_x100 = 10000;
-			bcdev->ui_soc_anchor_rm_uah = remaining_uah;
-			bcdev->ui_soc_rm_valid = true;
-		}
-		if (bcdev->ui_soc == 99) {
-			bcdev->ui_soc = 100;
-			bcdev->ui_soc_target = 100;
-			bcdev->ui_soc_update_time = now;
-			*changed = true;
-			goto out;
-		}
-	}
-
-	/* Do not spend elapsed discharge time immediately after a plug change. */
-	if (direction && direction != bcdev->ui_soc_direction) {
-		bcdev->ui_soc_direction = direction;
-		bcdev->ui_soc_update_time = now;
-	}
-
-	/*
-	 * Expanded packs can retain the stock remote SOC profile. Anchor once to
-	 * the remote percentage, then follow the change in the gauge remaining
-	 * charge instead of treating later remote SOC recalculations as truth.
-	 * The rate limiter below also contains discontinuities in FG_RM itself.
-	 */
-	if (expanded && rm_valid && !bcdev->ui_soc_rm_valid) {
-		bcdev->ui_soc_anchor_x100 = bcdev->ui_soc * 100;
-		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
-		bcdev->ui_soc_rm_valid = true;
-	}
-	if (expanded && !rm_valid)
-		bcdev->ui_soc_rm_valid = false;
-
-	if (expanded && rm_valid && bcdev->ui_soc_rm_valid &&
-	    battery_chg_capacity_uah_valid(full_uah) &&
-	    remaining_uah <= VENUS_BATTERY_MAX_RM_UAH) {
-		delta_rm = (s64)remaining_uah -
-			   (s64)bcdev->ui_soc_anchor_rm_uah;
-		candidate_x100 = (s64)bcdev->ui_soc_anchor_x100 +
-			div_s64(delta_rm * 10000LL, full_uah);
-		candidate_x100 = clamp_val(candidate_x100, 0, 10000);
-		target_soc = div_s64(candidate_x100 + 50, 100);
-	} else {
-		/* A failed RM read falls back to the remote SOC, still rate limited. */
-		target_soc = raw_soc;
-	}
-	if (status == POWER_SUPPLY_STATUS_FULL && raw_soc >= 99)
-		target_soc = 100;
-
-	/*
-	 * RM recalculation must not reverse the displayed direction or grant
-	 * charge credit that makes the next real percent appear late.  Drop the
-	 * opposite-direction delta and continue from the current displayed SOC.
-	 */
-	if (expanded && rm_valid &&
-	    ((direction > 0 && target_soc < bcdev->ui_soc) ||
-	     (direction < 0 && target_soc > bcdev->ui_soc))) {
-		bcdev->ui_soc_anchor_x100 = bcdev->ui_soc * 100;
-		bcdev->ui_soc_anchor_rm_uah = remaining_uah;
-		target_soc = bcdev->ui_soc;
-	} else if (expanded && direction > 0) {
-		target_soc = max(target_soc, bcdev->ui_soc);
-	} else if (expanded && direction < 0) {
-		target_soc = min(target_soc, bcdev->ui_soc);
-	}
-
-	target_soc = clamp_val(target_soc, 0, 100);
-	bcdev->ui_soc_target = target_soc;
-	if (target_soc == bcdev->ui_soc)
-		goto out;
-
-	/* Keep the stock path unchanged for normal one-percent updates. */
-	if (!expanded && abs(target_soc - bcdev->ui_soc) == 1) {
-		bcdev->ui_soc = target_soc;
+	if (status == POWER_SUPPLY_STATUS_FULL && target_soc == 100 &&
+	    bcdev->ui_soc == 99) {
+		bcdev->ui_soc = 100;
+		bcdev->ui_soc_target = 100;
 		bcdev->ui_soc_update_time = now;
 		*changed = true;
 		goto out;
 	}
+
+	/*
+	 * Charging status describes the charger, not the direction of every gauge
+	 * correction. Let the display converge in either direction; resetting an
+	 * anchor or clamping to the old UI value would preserve a stale reading.
+	 * The rate limiter absorbs measurement and calibration discontinuities.
+	 */
+	bcdev->ui_soc_target = target_soc;
+	if (target_soc == bcdev->ui_soc)
+		goto out;
 
 	elapsed_ms = ktime_ms_delta(now, bcdev->ui_soc_update_time);
 	if (elapsed_ms < 0)
@@ -2506,11 +2442,10 @@ static void battery_chg_ui_soc_work(struct work_struct *work)
 
 	read_property_id(bcdev, pst, BATT_STATUS);
 	read_property_id(bcdev, pst, BATT_CURR_NOW);
-	rm_valid = READ_ONCE(bcdev->battery_expanded) &&
-		!battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+	battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
+	rm_valid = !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
 	battery_chg_get_ui_capacity(bcdev, pst, raw_soc, remaining_uah,
-				    rm_valid,
-				    READ_ONCE(bcdev->battery_expanded), &changed);
+				    rm_valid, &changed);
 	if (changed)
 		power_supply_changed(pst->psy);
 }
@@ -2522,7 +2457,7 @@ static int battery_psy_get_prop(struct power_supply *psy,
 	struct battery_chg_dev *bcdev = power_supply_get_drvdata(psy);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	u32 learned_full_uah, pack_uah, raw_value, remaining_uah = 0;
-	bool changed, expanded, rm_valid;
+	bool changed, rm_valid;
 	int prop_id, rc;
 
 	pval->intval = -ENODATA;
@@ -2538,7 +2473,6 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		prop = POWER_SUPPLY_PROP_TIME_TO_FULL_AVG;
 
 	if (prop == POWER_SUPPLY_PROP_CHARGE_COUNTER &&
-	    READ_ONCE(bcdev->battery_expanded) &&
 	    !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah)) {
 		pval->intval = remaining_uah;
 		return 0;
@@ -2580,16 +2514,13 @@ static int battery_psy_get_prop(struct power_supply *psy,
 			break;
 		}
 
-		if (!READ_ONCE(bcdev->battery_profile_valid))
-			battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
-		expanded = READ_ONCE(bcdev->battery_expanded);
+		battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
 		read_property_id(bcdev, pst, BATT_STATUS);
 		read_property_id(bcdev, pst, BATT_CURR_NOW);
-		rm_valid = expanded &&
-			!battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
+		rm_valid = !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
 		pval->intval = battery_chg_get_ui_capacity(bcdev, pst,
 				pval->intval, remaining_uah, rm_valid,
-				expanded, &changed);
+				&changed);
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		pval->intval = DIV_ROUND_CLOSEST((int)pst->prop[prop_id], 10);
@@ -2824,7 +2755,7 @@ static void battery_chg_subsys_up_work(struct work_struct *work)
 	}
 
 	/* Refresh the data after SSR without dropping the displayed SOC state. */
-	battery_chg_reanchor_ui_soc(bcdev);
+	battery_chg_restart_ui_soc(bcdev);
 	battery_chg_report_psy_changed(bcdev, PSY_TYPE_BATTERY);
 	battery_chg_report_psy_changed(bcdev, PSY_TYPE_USB);
 	battery_chg_report_psy_changed(bcdev, PSY_TYPE_WLS);
@@ -4237,6 +4168,40 @@ static ssize_t tx_mac_show(struct class *c,
 }
 static CLASS_ATTR_RO(tx_mac);
 
+/* Remote SOC in hundredths of one percent, before the UI calculation. */
+static ssize_t soc_raw_show(struct class *c, struct class_attribute *attr,
+			    char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+	int rc;
+
+	rc = read_property_id(bcdev, pst, BATT_CAPACITY);
+	if (rc < 0)
+		return rc;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", pst->prop[BATT_CAPACITY]);
+}
+static CLASS_ATTR_RO(soc_raw);
+
+static ssize_t soc_target_show(struct class *c, struct class_attribute *attr,
+			       char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int target;
+
+	mutex_lock(&bcdev->ui_soc_lock);
+	target = bcdev->ui_soc_valid ? bcdev->ui_soc_target : -ENODATA;
+	mutex_unlock(&bcdev->ui_soc_lock);
+	if (target < 0)
+		return target;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", target);
+}
+static CLASS_ATTR_RO(soc_target);
+
 static ssize_t soc_decimal_show(struct class *c,
 					struct class_attribute *attr, char *buf)
 {
@@ -5335,6 +5300,8 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_slave_smb1396_online.attr,
 	&class_attr_slave_smb1396_iin.attr,
 	&class_attr_smb_iin_diff.attr,
+	&class_attr_soc_raw.attr,
+	&class_attr_soc_target.attr,
 	&class_attr_soc_decimal.attr,
 	&class_attr_shutdown_delay.attr,
 	&class_attr_soc_decimal_rate.attr,
