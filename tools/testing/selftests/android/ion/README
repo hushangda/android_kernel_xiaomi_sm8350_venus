@@ -99,3 +99,25 @@ Fill buffer content:
 ion_test.sh: heap_type: 0 - [PASS]
 
 ion_test.sh: done
+
+QSEE TA allocation regression test
+----------------------------------
+ion_qsee_ta_test is a manually run test for devices exposing the qsecom_ta
+heap. It queries the heap by name and tests the 10,952,704-byte gfvenus TA
+allocation, page rounding, cached/uncached mmap, zeroing after reuse and
+non-overlap with a live small allocation. It exits 4 if the device or heap
+is absent, 1 on failure, and 0 on success.
+
+Run as root during a controlled test window with no concurrent TA loading;
+the test temporarily consumes roughly 11 MiB of the TA heap. It does not
+load firmware, change enrolled fingerprints or restart services. Build it
+with the same userspace toolchain as the other ION tests and execute:
+
+  ./ion_qsee_ta_test
+
+For the reserved-pool fix, also check that
+/sys/kernel/debug/ion/qsecom_ta/qsecom_ta_stats reports
+allocation_mode: reserved. With no other TA allocations, pool_free_bytes
+must return to pool_size_bytes after the test. A successful allocation test
+alone does not establish that the reservation was enabled or that the
+fingerprint HAL successfully loaded its TA.

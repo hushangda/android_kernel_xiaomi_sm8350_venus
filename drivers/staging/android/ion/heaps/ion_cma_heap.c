@@ -14,7 +14,9 @@
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <linux/cma.h>
+#include <linux/genalloc.h>
 #include <linux/scatterlist.h>
+#include <linux/seq_file.h>
 #include <soc/qcom/secure_buffer.h>
 #include <linux/highmem.h>
 #include <linux/of.h>
@@ -24,6 +26,7 @@
 struct ion_cma_heap {
 	struct msm_ion_heap heap;
 	struct cma *cma;
+	struct gen_pool *pool;
 };
 
 struct ion_cma_buffer_info {
@@ -45,13 +48,115 @@ static bool ion_cma_has_kernel_mapping(struct ion_cma_heap *cma_heap)
 {
 	struct device *dev = cma_heap->heap.dev;
 	struct device_node *mem_region;
+	bool mapped;
 
 	mem_region = of_parse_phandle(dev->of_node, "memory-region", 0);
 	if (!mem_region)
 		return false;
 
-	return !of_property_read_bool(mem_region, "no-map");
+	mapped = !of_property_read_bool(mem_region, "no-map");
+	of_node_put(mem_region);
+	return mapped;
 }
+
+/*
+ * Keep the QSEE TA region allocated for the lifetime of the heap. Otherwise,
+ * ordinary movable allocations can occupy this reusable CMA region between
+ * TA loads. A pinned page can then prevent even the first TA allocation from
+ * succeeding, despite the ION heap having no outstanding buffers.
+ *
+ * Claim the region during heap creation, before userspace starts loading TAs,
+ * and return freed buffers to this pool instead of the buddy allocator.
+ */
+static int ion_cma_reserve_pool(struct ion_cma_heap *cma_heap)
+{
+	unsigned long size = cma_get_size(cma_heap->cma);
+	struct gen_pool *pool;
+	struct page *pages;
+	phys_addr_t base;
+	int ret;
+
+	if (!size)
+		return -EINVAL;
+
+	pool = gen_pool_create(PAGE_SHIFT, -1);
+	if (!pool)
+		return -ENOMEM;
+
+	pages = cma_alloc(cma_heap->cma, size >> PAGE_SHIFT, 0, false);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto destroy_pool;
+	}
+
+	base = page_to_phys(pages);
+	/* gen_pool_alloc() uses zero as its failure sentinel. */
+	if (!base || base != (unsigned long)base) {
+		ret = -EINVAL;
+		goto release_pages;
+	}
+
+	ret = gen_pool_add(pool, (unsigned long)base, size, -1);
+	if (ret)
+		goto release_pages;
+
+	cma_heap->pool = pool;
+	dev_info(cma_heap->heap.dev, "reserved %lu KiB for QSEE TA allocations\n",
+		 size >> 10);
+	return 0;
+
+release_pages:
+	cma_release(cma_heap->cma, pages, size >> PAGE_SHIFT);
+destroy_pool:
+	gen_pool_destroy(pool);
+	return ret;
+}
+
+static struct page *ion_cma_alloc_pages(struct ion_cma_heap *cma_heap,
+					unsigned long nr_pages,
+					unsigned int align)
+{
+	struct genpool_data_align data = { .align = PAGE_SIZE << align };
+	unsigned long addr;
+
+	if (!cma_heap->pool)
+		return cma_alloc(cma_heap->cma, nr_pages, align, false);
+
+	addr = gen_pool_alloc_algo(cma_heap->pool, nr_pages << PAGE_SHIFT,
+				   gen_pool_first_fit_align, &data);
+	return addr ? pfn_to_page(PFN_DOWN(addr)) : NULL;
+}
+
+static void ion_cma_free_pages(struct ion_cma_heap *cma_heap,
+			       struct page *pages, unsigned long nr_pages)
+{
+	if (cma_heap->pool)
+		gen_pool_free(cma_heap->pool, page_to_phys(pages),
+			      nr_pages << PAGE_SHIFT);
+	else
+		cma_release(cma_heap->cma, pages, nr_pages);
+}
+
+static int ion_cma_pool_debug_show(struct ion_heap *heap, struct seq_file *s,
+				   void *unused)
+{
+	struct ion_cma_heap *cma_heap = to_cma_heap(heap);
+
+	if (cma_heap->pool) {
+		seq_puts(s, "allocation_mode: reserved\n");
+		seq_printf(s, "pool_size_bytes: %zu\n",
+			   gen_pool_size(cma_heap->pool));
+		seq_printf(s, "pool_free_bytes: %zu\n",
+			   gen_pool_avail(cma_heap->pool));
+	} else {
+		seq_puts(s, "allocation_mode: cma\n");
+	}
+	return 0;
+}
+
+static struct msm_ion_heap_ops ion_cma_pool_ops = {
+	.debug_show = ion_cma_pool_debug_show,
+};
 
 static int ion_cma_allocate(struct ion_heap *heap, struct ion_buffer *buffer,
 			    unsigned long len,
@@ -93,7 +198,7 @@ static int ion_cma_allocate(struct ion_heap *heap, struct ion_buffer *buffer,
 		}
 		pages = pfn_to_page(PFN_DOWN(info->handle));
 	} else {
-		pages = cma_alloc(cma_heap->cma, nr_pages, align, false);
+		pages = ion_cma_alloc_pages(cma_heap, nr_pages, align);
 		if (!pages)
 			goto free_info;
 		if (hlos_accessible_buffer(buffer)) {
@@ -143,7 +248,7 @@ err_alloc:
 	if (info->cpu_addr)
 		dma_free_attrs(dev, size, info->cpu_addr, info->handle, 0);
 	else
-		cma_release(cma_heap->cma, pages, nr_pages);
+		ion_cma_free_pages(cma_heap, pages, nr_pages);
 free_info:
 	kfree(info);
 	return -ENOMEM;
@@ -167,7 +272,7 @@ static void ion_cma_free(struct ion_buffer *buffer)
 
 		unsigned long nr_pages = PAGE_ALIGN(buffer->size) >> PAGE_SHIFT;
 		/* release memory */
-		cma_release(cma_heap->cma, pages, nr_pages);
+		ion_cma_free_pages(cma_heap, pages, nr_pages);
 	}
 	/* release sg table */
 	sg_free_table(buffer->sg_table);
@@ -184,6 +289,7 @@ struct ion_heap *ion_cma_heap_create(struct ion_platform_heap *data)
 {
 	struct ion_cma_heap *cma_heap;
 	struct device *dev = (struct device *)data->priv;
+	int ret;
 
 	cma_heap = kzalloc(sizeof(*cma_heap), GFP_KERNEL);
 
@@ -199,6 +305,16 @@ struct ion_heap *ion_cma_heap_create(struct ion_platform_heap *data)
 	cma_heap->heap.dev = dev;
 	cma_heap->cma = dev->cma_area;
 	cma_heap->heap.ion_heap.type = ION_HEAP_TYPE_DMA;
+	if (data->id == ION_QSECOM_TA_HEAP_ID) {
+		cma_heap->heap.msm_heap_ops = &ion_cma_pool_ops;
+		if (cma_heap->cma && ion_cma_has_kernel_mapping(cma_heap)) {
+			ret = ion_cma_reserve_pool(cma_heap);
+			if (ret)
+				dev_warn(dev,
+					 "QSEE TA reservation failed (%d), using CMA\n",
+					 ret);
+		}
+	}
 	return &cma_heap->heap.ion_heap;
 }
 
