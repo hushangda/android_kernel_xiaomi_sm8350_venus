@@ -2,6 +2,15 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEBUG="${DEBUG:-0}"
+if [[ "$DEBUG" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
+  DEBUG=1
+elif [[ "$DEBUG" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
+  DEBUG=0
+else
+  echo "ERROR: DEBUG must be 1 or 0" >&2
+  exit 1
+fi
 KPM="${KPM:-0}"
 if [[ "$KPM" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
   KPM=1
@@ -33,6 +42,9 @@ if (( KPM )); then
   DEFAULT_OUT_DIR="$ROOT_DIR/out-venus-5.4.302-kpm"
 else
   DEFAULT_OUT_DIR="$ROOT_DIR/out-venus-5.4.302"
+fi
+if (( DEBUG )); then
+  DEFAULT_OUT_DIR+="-debug"
 fi
 OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
 
@@ -135,8 +147,27 @@ else
   CONFIG_ARGS+=(--disable KPM)
 fi
 
+if (( DEBUG )); then
+  CONFIG_ARGS+=(--enable VENUS_BOOTTRACE
+                --set-val VENUS_BOOTTRACE_KMSG_MAX_MB 8
+                --set-str LOCALVERSION "-DSL-qgki-debug")
+else
+  CONFIG_ARGS+=(--disable VENUS_BOOTTRACE)
+fi
+
 "$ROOT_DIR/scripts/config" --file "$OUT_DIR/.config" "${CONFIG_ARGS[@]}"
 make "${MAKE_ARGS[@]}" olddefconfig
+if (( DEBUG )); then
+  grep -q '^CONFIG_VENUS_BOOTTRACE=y$' "$OUT_DIR/.config" || {
+    echo "ERROR: metadata logger must be enabled for DEBUG=1" >&2
+    exit 1
+  }
+else
+  grep -q '^# CONFIG_VENUS_BOOTTRACE is not set$' "$OUT_DIR/.config" || {
+    echo "ERROR: metadata logger must be disabled for DEBUG=0" >&2
+    exit 1
+  }
+fi
 grep -q '^CONFIG_ZRAM_DEF_COMP="lz4"$' "$OUT_DIR/.config" || {
   echo "ERROR: ZRAM default compressor is not lz4" >&2
   exit 1
@@ -279,5 +310,6 @@ echo "F2FS performance options: unfair rwsem + checkpoint fsync optimization ena
 echo "Vendor freezer protocol 29: HANS/MILLET auto multiplex enabled"
 echo "ZRAM multi-compressor recompression: enabled"
 echo "Recovery/TWRP KSU userspace hook guard: enabled"
+echo "Metadata boot trace + printk logger: $([[ "$DEBUG" == 1 ]] && echo enabled || echo disabled) (DEBUG=$DEBUG)"
 echo "Image (for TWRP prebuilt/venus/kernel): $KERNEL_IMAGE"
 echo "Image.gz: $KERNEL_IMAGE_GZ"

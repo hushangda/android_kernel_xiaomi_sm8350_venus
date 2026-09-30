@@ -30,6 +30,7 @@
 #include <uapi/linux/mount.h>
 #include <linux/fs_context.h>
 #include <linux/shmem_fs.h>
+#include <linux/venus_boottrace.h>
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 #include <linux/susfs_def.h>
 #endif
@@ -3695,6 +3696,20 @@ int ksys_mount(const char __user *dev_name, const char __user *dir_name,
 		goto out_data;
 
 	ret = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
+
+#ifdef CONFIG_VENUS_BOOTTRACE
+	/* Start capture only after the real, writable metadata mount exists. */
+	if (!ret && !(flags & (MS_RDONLY | MS_BIND | MS_MOVE)) && kernel_type &&
+	    (!strcmp(kernel_type, "ext4") || !strcmp(kernel_type, "f2fs"))) {
+		char *kernel_dir = copy_mount_string(dir_name);
+
+		if (!IS_ERR(kernel_dir)) {
+			if (kernel_dir && !strcmp(kernel_dir, "/metadata"))
+				venus_boottrace_dump_metadata();
+			kfree(kernel_dir);
+		}
+	}
+#endif
 
 	kfree(options);
 out_data:

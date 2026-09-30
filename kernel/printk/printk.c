@@ -45,6 +45,7 @@
 #include <linux/irq_work.h>
 #include <linux/ctype.h>
 #include <linux/uio.h>
+#include <linux/venus_boottrace.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/debug.h>
 #include <linux/sched/task_stack.h>
@@ -1422,6 +1423,42 @@ static size_t msg_print_text(const struct printk_log *msg, bool syslog,
 
 	return len;
 }
+
+#ifdef CONFIG_VENUS_BOOTTRACE
+/* Independent cursor: neither consume syslog nor depend on /dev/kmsg access. */
+ssize_t venus_printk_read_record(char *buf, size_t count, u64 *seq, u32 *idx)
+{
+	struct printk_log *msg;
+	size_t len;
+
+	if (!buf || !count || !seq || !idx)
+		return -EINVAL;
+
+	logbuf_lock_irq();
+	if (*seq == U64_MAX) {
+		*seq = log_first_seq;
+		*idx = log_first_idx;
+	} else if (*seq < log_first_seq) {
+		*seq = log_first_seq;
+		*idx = log_first_idx;
+		logbuf_unlock_irq();
+		return -EPIPE;
+	}
+
+	if (*seq == log_next_seq) {
+		logbuf_unlock_irq();
+		return 0;
+	}
+
+	msg = log_from_idx(*idx);
+	len = msg_print_text(msg, true, true, buf, count);
+	*idx = log_next(*idx);
+	(*seq)++;
+	logbuf_unlock_irq();
+
+	return len ? (ssize_t)len : -ENOSPC;
+}
+#endif
 
 static int syslog_print(char __user *buf, int size)
 {

@@ -97,6 +97,7 @@
 #include <linux/jump_label.h>
 #include <linux/mem_encrypt.h>
 #include <linux/kcsan.h>
+#include <linux/venus_boottrace.h>
 
 #include <asm/io.h>
 #include <asm/setup.h>
@@ -589,6 +590,7 @@ asmlinkage __visible void __init start_kernel(void)
 	char *command_line;
 	char *after_dashes;
 
+	venus_boottrace_stage(0);
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
@@ -607,6 +609,7 @@ asmlinkage __visible void __init start_kernel(void)
 	pr_notice("%s", linux_banner);
 	early_security_init();
 	setup_arch(&command_line);
+	venus_boottrace_stage(1);
 	setup_command_line(command_line);
 	setup_nr_cpu_ids();
 	setup_per_cpu_areas();
@@ -637,6 +640,7 @@ asmlinkage __visible void __init start_kernel(void)
 	sort_main_extable();
 	trap_init();
 	mm_init();
+	venus_boottrace_stage(2);
 	poking_init();
 	ftrace_init();
 
@@ -649,6 +653,7 @@ asmlinkage __visible void __init start_kernel(void)
 	 * time - but meanwhile we still have a functioning scheduler.
 	 */
 	sched_init();
+	venus_boottrace_stage(3);
 	/*
 	 * Disable preemption - early bootup scheduling is extremely
 	 * fragile until we cpu_idle() for the first time.
@@ -693,6 +698,8 @@ asmlinkage __visible void __init start_kernel(void)
 	timekeeping_init();
 	kfence_init();
 	time_init();
+	venus_boottrace_clock_ready();
+	venus_boottrace_stage(4);
 
 	/*
 	 * For best initial stack canary entropy, prepare it after:
@@ -720,6 +727,7 @@ asmlinkage __visible void __init start_kernel(void)
 	 * this. But we do want output early, in case something goes wrong.
 	 */
 	console_init();
+	venus_boottrace_stage(5);
 	if (panic_later)
 		panic("Too many boot %s vars at `%s'", panic_later,
 		      panic_param);
@@ -784,6 +792,7 @@ asmlinkage __visible void __init start_kernel(void)
 	kcsan_init();
 
 	/* Do the rest non-__init'ed, we're now alive */
+	venus_boottrace_stage(6);
 	arch_call_rest_init();
 
 	prevent_tail_call_optimization();
@@ -940,7 +949,9 @@ int __init_or_module do_one_initcall(initcall_t fn)
 		return -EPERM;
 
 	do_trace_initcall_start(fn);
+	venus_boottrace_initcall_start(fn);
 	ret = fn();
+	venus_boottrace_initcall_finish(fn, ret);
 	do_trace_initcall_finish(fn, ret);
 
 	msgbuf[0] = 0;
@@ -1047,6 +1058,7 @@ static void __init do_pre_smp_initcalls(void)
 
 static int run_init_process(const char *init_filename)
 {
+	venus_boottrace_stage(12);
 	argv_init[0] = init_filename;
 	pr_info("Run %s as init process\n", init_filename);
 	return do_execve(getname_kernel(init_filename),
@@ -1187,11 +1199,14 @@ static noinline void __init kernel_init_freeable(void)
 	smp_prepare_cpus(setup_max_cpus);
 
 	workqueue_init();
+	venus_boottrace_stage(7);
 
 	init_mm_internals();
 
 	rcu_init_tasks_generic();
+	venus_boottrace_stage(8);
 	do_pre_smp_initcalls();
+	venus_boottrace_stage(9);
 	lockup_detector_init();
 
 	smp_init();
@@ -1201,7 +1216,9 @@ static noinline void __init kernel_init_freeable(void)
 	/* Initialize page ext after all struct pages are initialized. */
 	page_ext_init();
 
+	venus_boottrace_stage(10);
 	do_basic_setup();
+	venus_boottrace_stage(11);
 
 	/* Open the /dev/console on the rootfs, this should never fail */
 	if (ksys_open((const char __user *) "/dev/console", O_RDWR, 0) < 0)

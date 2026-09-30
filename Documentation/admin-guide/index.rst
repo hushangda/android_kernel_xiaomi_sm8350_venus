@@ -37,6 +37,7 @@ problems and bugs in particular.
    bug-bisect
    tainted-kernels
    ramoops
+   venus-boottrace
    dynamic-debug-howto
    init
    kdump/index

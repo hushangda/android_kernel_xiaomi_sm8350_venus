@@ -92,6 +92,28 @@ menu "General setup"
 config BROKEN
 	bool
 
+config VENUS_BOOTTRACE
+	bool "Xiaomi Venus boot trace and persistent kernel log"
+	depends on ARM64 && PRINTK
+	default n
+	help
+	  Record early boot stages and initcall entry/exit in a static RAM
+	  buffer. After Android mounts /metadata, export the trace and start
+	  a thread that saves printk records to /metadata/venus-kmsg-A.log or
+	  venus-kmsg-B.log. Both kinds of logs use two slots, replacing the
+	  older slot on the next boot. No early filesystem I/O is performed.
+	  This is intended for debugging on Xiaomi Venus; say N for normal use.
+
+config VENUS_BOOTTRACE_KMSG_MAX_MB
+	int "Maximum persistent kernel log size per slot (MiB)"
+	depends on VENUS_BOOTTRACE
+	range 1 64
+	default 8
+	help
+	  Stop capture when this size is reached or /metadata has less than
+	  4 MiB available. The two boot trace files are bounded separately
+	  to 8192 records each. This avoids unbounded debug log growth.
+
 config BROKEN_ON_SMP
 	bool
 	depends on BROKEN || !SMP
