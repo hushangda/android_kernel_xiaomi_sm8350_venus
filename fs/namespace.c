@@ -30,7 +30,7 @@
 #include <uapi/linux/mount.h>
 #include <linux/fs_context.h>
 #include <linux/shmem_fs.h>
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
 #endif
 
@@ -135,7 +135,7 @@ static int mnt_alloc_id(struct mount *mnt)
 static void mnt_free_id(struct mount *mnt)
 {
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	if (mnt->mnt.mnt_flags & VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT)
+	if (unlikely(mnt->mnt.mnt_flags & VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT))
 		return;
 
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
@@ -760,6 +760,20 @@ struct mount *__lookup_mnt(struct vfsmount *mnt, struct dentry *dentry)
 {
 	struct hlist_head *head = m_hash(mnt, dentry);
 	struct mount *p;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	// - The hook here is needed as a temp solution to hide sus mnts for zygote_next
+	//   spawned process since it just inherits the init mount namespace, and here
+	//   we also spoof for the zygote spawned processes that are marked umounted,
+	//   with this hack, we do not even need to umount those sus mounts.
+	// - The solution here is simply to return the legit mount.
+	if (susfs_is_current_proc_umounted()) {
+		hlist_for_each_entry_rcu(p, head, mnt_hash)
+			if (p->mnt_id < DEFAULT_KSU_MNT_ID && &p->mnt_parent->mnt == mnt && p->mnt_mountpoint == dentry)
+				return p;
+		return NULL;
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
 	hlist_for_each_entry_rcu(p, head, mnt_hash)
 		if (&p->mnt_parent->mnt == mnt && p->mnt_mountpoint == dentry)
@@ -4366,11 +4380,14 @@ const struct proc_ns_operations mntns_operations = {
 	.owner		= mntns_owner,
 };
 
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#ifdef CONFIG_KSU_SUSFS
 /* - To retrieve the non sus mnt_id from mount */
 int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt) {
 	struct mount *mnt = orig_mnt;
 	int mnt_id;
+
+	if (mnt->mnt_id < DEFAULT_KSU_MNT_ID)
+		return mnt->mnt_id;
 
 	lock_mount_hash();
 	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent && mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
@@ -4382,6 +4399,12 @@ int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt) {
 /* - To retrieve the non sus vfsmount from vfsmount, takes a reference on &mnt->mnt and mnt->mnt.mnt_root */
 struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt) {
 	struct mount *mnt = real_mount(vfsmnt);
+
+	if (mnt->mnt_id < DEFAULT_KSU_MNT_ID) {
+		mntget(&mnt->mnt);
+		dget(mnt->mnt.mnt_root);
+		return &mnt->mnt;
+	}
 
 	lock_mount_hash();
 	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent && mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
@@ -4395,4 +4418,4 @@ struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt) {
 	unlock_mount_hash();
 	return &mnt->mnt;
 }
-#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#endif // #ifdef CONFIG_KSU_SUSFS

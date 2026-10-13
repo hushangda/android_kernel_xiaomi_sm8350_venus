@@ -101,7 +101,6 @@ CONFIG_ARGS=(
   --enable KSU \
   --set-str KSU_FULL_NAME_FORMAT "%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%" \
   --enable KSU_MULTI_MANAGER_SUPPORT \
-  --enable KSU_DISABLE_IN_RECOVERY \
   --disable KSU_TRACEPOINT_HOOK \
   --disable KSU_MANUAL_HOOK \
   --enable KSU_SUSFS \
@@ -129,6 +128,19 @@ else
   CONFIG_ARGS+=(--disable LRU_GEN_ENABLED)
 fi
 
+HAS_KPM=0
+HAS_RECOVERY_GUARD=0
+if grep -q '^config KPM$' "$ROOT_DIR/KernelSU/kernel/Kconfig"; then
+  HAS_KPM=1
+elif (( KPM )); then
+  echo "ERROR: this ReSukiSU version has removed KPM support" >&2
+  exit 1
+fi
+if grep -q '^config KSU_DISABLE_IN_RECOVERY$' "$ROOT_DIR/KernelSU/kernel/Kconfig"; then
+  HAS_RECOVERY_GUARD=1
+  CONFIG_ARGS+=(--enable KSU_DISABLE_IN_RECOVERY)
+fi
+
 if (( KPM )); then
   CONFIG_ARGS+=(--enable KPM)
 else
@@ -137,6 +149,16 @@ fi
 
 "$ROOT_DIR/scripts/config" --file "$OUT_DIR/.config" "${CONFIG_ARGS[@]}"
 make "${MAKE_ARGS[@]}" olddefconfig
+# Check the requested config after Kconfig dependencies have been resolved.
+# PAGE_OWNER must stay disabled because it selects DEBUG_FS.
+for required_config in \
+  'CONFIG_MODULES=y' \
+  '# CONFIG_DEBUG_FS is not set'; do
+  grep -Fxq "$required_config" "$OUT_DIR/.config" || {
+    echo "ERROR: Venus kernel config requires $required_config" >&2
+    exit 1
+  }
+done
 grep -q '^CONFIG_ZRAM_DEF_COMP="lz4"$' "$OUT_DIR/.config" || {
   echo "ERROR: ZRAM default compressor is not lz4" >&2
   exit 1
@@ -184,7 +206,6 @@ grep -q '^# CONFIG_LRU_GEN_STATS is not set$' "$OUT_DIR/.config" || {
 for required_config in \
   'CONFIG_KSU=y' \
   'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' \
-  'CONFIG_KSU_DISABLE_IN_RECOVERY=y' \
   'CONFIG_KSU_SUSFS=y' \
   'CONFIG_KSU_SUSFS_SUS_PATH=y' \
   'CONFIG_KSU_SUSFS_SUS_MOUNT=y' \
@@ -213,9 +234,16 @@ if (( KPM )); then
     echo "ERROR: CONFIG_KPM is not enabled" >&2
     exit 1
   }
-else
+elif (( HAS_KPM )); then
   grep -q '^# CONFIG_KPM is not set$' "$OUT_DIR/.config" || {
     echo "ERROR: CONFIG_KPM must be disabled for this build" >&2
+    exit 1
+  }
+fi
+
+if (( HAS_RECOVERY_GUARD )); then
+  grep -Fxq 'CONFIG_KSU_DISABLE_IN_RECOVERY=y' "$OUT_DIR/.config" || {
+    echo "ERROR: recovery guard was requested but is not enabled" >&2
     exit 1
   }
 fi
@@ -278,6 +306,6 @@ echo "F2FS compression: enabled"
 echo "F2FS performance options: unfair rwsem + checkpoint fsync optimization enabled"
 echo "Vendor freezer protocol 29: HANS/MILLET auto multiplex enabled"
 echo "ZRAM multi-compressor recompression: enabled"
-echo "Recovery/TWRP KSU userspace hook guard: enabled"
+echo "Recovery/TWRP custom KSU guard: $([[ "$HAS_RECOVERY_GUARD" == 1 ]] && echo enabled || echo absent-in-upstream)"
 echo "Image (for TWRP prebuilt/venus/kernel): $KERNEL_IMAGE"
 echo "Image.gz: $KERNEL_IMAGE_GZ"
