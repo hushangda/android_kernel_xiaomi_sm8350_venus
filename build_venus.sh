@@ -101,6 +101,8 @@ CONFIG_ARGS=(
   --enable KSU \
   --set-str KSU_FULL_NAME_FORMAT "%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%" \
   --enable KSU_MULTI_MANAGER_SUPPORT \
+  --disable KSU_SUKISU_420_COMPAT \
+  --enable KSU_SUKISU_UAPI5_COMPAT \
   --disable KSU_TRACEPOINT_HOOK \
   --disable KSU_MANUAL_HOOK \
   --enable KSU_SUSFS \
@@ -206,6 +208,7 @@ grep -q '^# CONFIG_LRU_GEN_STATS is not set$' "$OUT_DIR/.config" || {
 for required_config in \
   'CONFIG_KSU=y' \
   'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' \
+  'CONFIG_KSU_SUKISU_UAPI5_COMPAT=y' \
   'CONFIG_KSU_SUSFS=y' \
   'CONFIG_KSU_SUSFS_SUS_PATH=y' \
   'CONFIG_KSU_SUSFS_SUS_MOUNT=y' \
@@ -221,6 +224,10 @@ for required_config in \
     exit 1
   }
 done
+grep -Fxq '# CONFIG_KSU_SUKISU_420_COMPAT is not set' "$OUT_DIR/.config" || {
+  echo "ERROR: legacy SukiSU UAPI 2 mode must be disabled" >&2
+  exit 1
+}
 grep -q '^# CONFIG_KSU_TRACEPOINT_HOOK is not set$' "$OUT_DIR/.config" || {
   echo "ERROR: CONFIG_KSU_TRACEPOINT_HOOK must be disabled for this 5.4 tree" >&2
   exit 1

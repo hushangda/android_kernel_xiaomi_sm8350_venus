@@ -11,12 +11,20 @@ The Linux 5.4.302 Venus tree uses these pinned upstream sources:
 
 ## Retained local behavior
 
-`CONFIG_KSU_SUKISU_420_COMPAT=y` selects the SukiSU Ultra 4.2.0 ABI:
-version code 40900, UAPI 2, legacy driver-fd discovery and mount-list ioctl.
-Per-fd authorization and certificate validation remain enforced. The SukiSU
-certificate is accepted only with this compatibility option enabled. Disabling
-it restores BakaSU's native UAPI 5. The full-version query identifies the actual
-source plus the compatibility suffix.
+`CONFIG_KSU_SUKISU_UAPI5_COMPAT=y` selects SukiSU Ultra 4.2.1 compatibility
+using native UAPI 5 and scoped driver-fd permissions. The SukiSU certificate
+remains validated. Its mount-list ioctl and absent-KPM probe are translated;
+GET_INFO retains BakaSU's real version and UAPI. The full-version query includes
+`+sukisu-uapi5-compat`. Do not use the old 40900/UAPI 2 identity for this manager.
+
+The separate, opt-in `CONFIG_KSU_SUKISU_420_COMPAT` remains available for an
+actual SukiSU 4.2.0 manager/daemon, but is disabled in the Venus defconfig and
+build script. The two compatibility modes cannot be enabled together.
+
+When upgrading a phone from the legacy mode, install the official manager's
+UAPI 5 ksud together with the new kernel. An old `/data/adb/ksud` reporting
+UAPI 2 must not be retained for the new kernel. Preserve both the original boot
+image and daemon for rollback. Host compilation does not perform this upgrade.
 
 The previously reverted LSPosed port remains absent. Linux modules stay enabled;
 DEBUG_FS and PAGE_OWNER stay disabled. CI can produce explicitly unsigned
@@ -50,7 +58,7 @@ other SuSFS kernel integrations retain a build error until separately ported.
 Build with a separate output directory:
 
 ```sh
-JOBS=4 OUT_DIR="$PWD/out-venus-bakasu-susfs-20261015" KPM=0 MGLRU=0 ./build_venus.sh
+JOBS=4 OUT_DIR="$PWD/out-venus-sukisu-uapi5-20261016" KPM=0 MGLRU=0 ./build_venus.sh
 ```
 
 Build and host tests do not establish device boot, root authorization, module
