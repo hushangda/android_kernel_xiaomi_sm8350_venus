@@ -146,6 +146,17 @@ static inline kernel_cap_t cap_invert(const kernel_cap_t c)
 	return dest;
 }
 
+static inline bool cap_isidentical(const kernel_cap_t a, const kernel_cap_t b)
+{
+	unsigned int i;
+
+	CAP_FOR_EACH_U32(i) {
+		if (a.cap[i] != b.cap[i])
+			return false;
+	}
+	return true;
+}
+
 static inline bool cap_isclear(const kernel_cap_t a)
 {
 	unsigned __capi;
@@ -254,6 +265,11 @@ extern bool ptracer_capable(struct task_struct *tsk, struct user_namespace *ns);
 static inline bool perfmon_capable(void)
 {
 	return capable(CAP_PERFMON) || capable(CAP_SYS_ADMIN);
+}
+
+static inline bool bpf_capable(void)
+{
+	return capable(CAP_BPF) || capable(CAP_SYS_ADMIN);
 }
 
 /* audit system wants to get cap info from files as well */

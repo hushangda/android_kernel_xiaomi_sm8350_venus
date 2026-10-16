@@ -51,6 +51,7 @@
 #include <linux/types.h>
 #include <linux/fcntl.h>
 #include <linux/module.h>
+#include <linux/oplus_linkpower.h>
 #include <linux/random.h>
 #include <linux/cache.h>
 #include <linux/jhash.h>
@@ -323,6 +324,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 
 	if (err)
 		goto failure;
+	oplus_linkpower_tcp_connected(sk);
 
 	return 0;
 

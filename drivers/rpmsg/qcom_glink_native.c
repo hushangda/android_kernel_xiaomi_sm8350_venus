@@ -1266,7 +1266,8 @@ static irqreturn_t qcom_glink_native_intr(int irq, void *data)
 	int ret = 0;
 
 	if (should_wake) {
-		pr_info("%s: %d triggered %s\n", __func__, irq, glink->irqname);
+		pr_debug("%s: %d triggered %s\n", __func__, irq,
+			 glink->irqname);
 		glink_resume_pkt = true;
 		pm_system_wakeup();
 	}

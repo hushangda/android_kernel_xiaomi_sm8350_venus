@@ -579,6 +579,9 @@ void dma_buf_detach(struct dma_buf *dmabuf,
 
 struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info);
 
+int is_dma_buf_file(struct file *file);
+int dma_buf_get_each(int (*callback)(const struct dma_buf *dmabuf,
+			     void *private), void *private);
 int dma_buf_fd(struct dma_buf *dmabuf, int flags);
 struct dma_buf *dma_buf_get(int fd);
 void dma_buf_put(struct dma_buf *dmabuf);

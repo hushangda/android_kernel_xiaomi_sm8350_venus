@@ -2306,23 +2306,33 @@ exit_rt_resume:
 
 static int spi_geni_resume(struct device *dev)
 {
-	return 0;
+	struct spi_master *spi = get_spi_master(dev);
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	if (ret)
+		return ret;
+
+	ret = spi_master_resume(spi);
+	if (ret)
+		pm_runtime_force_suspend(dev);
+
+	return ret;
 }
 
 static int spi_geni_suspend(struct device *dev)
 {
-	int ret = 0;
 	struct spi_master *spi = get_spi_master(dev);
-	struct spi_geni_master *geni_mas = spi_master_get_devdata(spi);
+	int ret;
 
-	if (!pm_runtime_status_suspended(dev)) {
-		GENI_SE_ERR(geni_mas->ipc, true, dev,
-			":%s: runtime PM is active\n", __func__);
-		ret = -EBUSY;
+	ret = spi_master_suspend(spi);
+	if (ret)
 		return ret;
-	}
 
-	GENI_SE_ERR(geni_mas->ipc, true, dev, ":%s: End\n", __func__);
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		spi_master_resume(spi);
+
 	return ret;
 }
 #else

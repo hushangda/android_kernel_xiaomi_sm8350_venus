@@ -108,6 +108,9 @@ struct selinux_state selinux_state __rticdata;
 #else
 struct selinux_state selinux_state;
 #endif
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_selinux.h>
+#endif
 
 /* SECMARK reference count */
 static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
@@ -6468,6 +6471,10 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
 	u32 mysid = current_sid(), sid = 0, ptsid;
 	int error;
 	char *str = value;
+#ifdef CONFIG_KSU_SUSFS
+	bool should_check_current = !strcmp(name, "current") &&
+		current_uid().val >= 10000 && READ_ONCE(ksu_selinux_hide_running);
+#endif
 
 	/*
 	 * Basic control over ability to set these attributes at all.
@@ -6503,7 +6510,19 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
 			str[size-1] = 0;
 			size--;
 		}
-		error = security_context_to_sid(&selinux_state, value, size,
+#ifdef CONFIG_KSU_SUSFS
+		if (should_check_current) {
+			u32 hidden_sid = 0;
+			int hidden_error;
+
+			/* Parse both policies once, retaining the live SID and error. */
+			hidden_error = ksu_susfs_context_to_sid(value, size,
+					&hidden_sid, &sid, &error);
+			if (hidden_error || error)
+				return hidden_error ?: error;
+		} else
+#endif
+			error = security_context_to_sid(&selinux_state, value, size,
 						&sid, GFP_KERNEL);
 		if (error == -EINVAL && !strcmp(name, "fscreate")) {
 			if (!has_cap_mac_admin(true)) {

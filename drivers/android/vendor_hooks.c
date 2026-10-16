@@ -8,10 +8,13 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/hooks/vendor_hooks.h>
+#include <trace/hooks/memory.h>
+#include <trace/hooks/syscall_check.h>
 #include <trace/hooks/sched.h>
 #include <trace/hooks/dtask.h>
 #include <trace/hooks/net.h>
 #include <trace/hooks/binder.h>
+#include <trace/hooks/signal.h>
 #include <trace/hooks/rwsem.h>
 #include <trace/hooks/futex.h>
 #include <trace/hooks/fpsimd.h>
@@ -27,6 +30,13 @@
  * Export tracepoints that act as a bare tracehook (ie: have no trace event
  * associated with them) to allow external modules to probe them.
  */
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_set_memory_x);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_set_memory_nx);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_set_memory_ro);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_set_memory_rw);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_check_mmap_file);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_check_file_open);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_check_bpf_syscall);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_rvh_select_task_rq_fair);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_rvh_select_task_rq_rt);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_rvh_select_fallback_rq);
@@ -57,6 +67,11 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_arch_set_freq_scale);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_transaction_init);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_set_priority);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_restore_priority);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_preset);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_trans);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_reply);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_binder_alloc_new_buf_locked);
+EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_do_send_sig_info);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_rwsem_init);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_rwsem_wake);
 EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_rwsem_write_finished);

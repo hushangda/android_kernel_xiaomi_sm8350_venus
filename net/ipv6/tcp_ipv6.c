@@ -21,6 +21,7 @@
 
 #include <linux/bottom_half.h>
 #include <linux/module.h>
+#include <linux/oplus_linkpower.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/socket.h>
@@ -332,6 +333,7 @@ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
 	err = tcp_connect(sk);
 	if (err)
 		goto late_failure;
+	oplus_linkpower_tcp_connected(sk);
 
 	return 0;
 

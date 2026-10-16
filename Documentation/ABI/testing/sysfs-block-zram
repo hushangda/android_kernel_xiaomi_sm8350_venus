@@ -38,6 +38,23 @@ Description:
 		available and selected compression algorithms, change
 		compression algorithm selection.
 
+What:		/sys/block/zram<id>/recomp_algorithm
+Date:		November 2022
+Contact:	Sergey Senozhatsky <senozhatsky@chromium.org>
+Description:
+		The recomp_algorithm file is read-write and allows secondary
+		compression algorithms and their priorities to be set or shown.
+		This attribute is available with CONFIG_ZRAM_MULTI_COMP.
+
+What:		/sys/block/zram<id>/recompress
+Date:		November 2022
+Contact:	Sergey Senozhatsky <senozhatsky@chromium.org>
+Description:
+		The recompress file is write-only and triggers recompression
+		with the configured secondary compression algorithms. It accepts
+		type=idle, type=huge, type=huge_idle, threshold=<bytes>, and
+		algo=<name> selectors.
+
 What:		/sys/block/zram<id>/mem_used_max
 Date:		August 2014
 Contact:	Minchan Kim <minchan@kernel.org>

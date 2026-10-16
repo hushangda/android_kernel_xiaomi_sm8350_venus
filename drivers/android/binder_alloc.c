@@ -25,6 +25,7 @@
 #include <linux/sizes.h>
 #include "binder_alloc.h"
 #include "binder_trace.h"
+#include <trace/hooks/binder.h>
 #ifdef CONFIG_OEM_KERNEL
 #include "binder_oem.h"
 
@@ -447,6 +448,7 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 
 	/* Pad 0-size buffers so they get assigned unique addresses */
 	size = max(size, sizeof(void *));
+	trace_android_vh_binder_alloc_new_buf_locked(size, alloc, is_async);
 
 #ifdef CONFIG_OEM_KERNEL
 	if (oem_binder_hook_set.oem_buf_overflow_hook && is_async

@@ -166,6 +166,9 @@ static unsigned int pkg_ip4_in(void *priv, struct sk_buff *skb,
 	int found;
 	int protocol;
 
+	if (!millet_is_active())
+		return NF_ACCEPT;
+
 	protocol = ip_hdr(skb)->protocol;
 	if (protocol != IPPROTO_TCP)
 		return NF_ACCEPT;
@@ -199,6 +202,9 @@ static unsigned int pkg_ip6_in(void *priv, struct sk_buff *skb,
 	int protohdr;
 	uid_t uid;
 	int found;
+
+	if (!millet_is_active())
+		return NF_ACCEPT;
 
 	protohdr = ipv6_find_hdr(skb, &thoff, -1, &frag_off, NULL);
 	if (protohdr != IPPROTO_TCP)

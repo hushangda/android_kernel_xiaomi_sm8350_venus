@@ -319,6 +319,7 @@ struct aw8697 {
 	struct work_struct vibrator_work;
 	struct work_struct rtp_work;
 	struct work_struct set_gain_work;
+	struct led_classdev vib_dev;
 	struct delayed_work ram_work;
 
 	struct fileops fileops;
@@ -354,6 +355,7 @@ struct aw8697 {
 	int vmax;
 	int gain;
 	u16 new_gain;
+	bool ff_gain_valid;
 	unsigned char level;
 
 	unsigned char seq[AW8697_SEQUENCER_SIZE];

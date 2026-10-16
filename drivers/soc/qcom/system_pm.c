@@ -7,6 +7,7 @@
 #include <linux/kernel.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 #include <soc/qcom/rpmh.h>
 #include <clocksource/arm_arch_timer.h>
 #include <soc/qcom/lpm_levels.h>
@@ -32,6 +33,17 @@ static int setup_wakeup(uint32_t lo, uint32_t hi)
 static int system_sleep_update_wakeup(bool from_idle)
 {
 	uint32_t lo = ~0U, hi = ~0U;
+
+	/*
+	 * The architectural broadcast timer also carries non-wakeup hrtimers.
+	 * It is a valid wake source while entering an idle state, but must not
+	 * be forwarded to the PDC during system suspend. Wakeup alarms are
+	 * programmed independently by alarmtimer/RTC.
+	 */
+#ifdef CONFIG_SUSPEND
+	if (!from_idle && pm_suspend_target_state == PM_SUSPEND_MEM)
+		return setup_wakeup(lo, hi);
+#endif
 
 	/* Read the hardware to get the most accurate value */
 	arch_timer_mem_get_cval(&lo, &hi);

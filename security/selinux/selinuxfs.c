@@ -40,6 +40,14 @@
 #include "security.h"
 #include "objsec.h"
 #include "conditional.h"
+#include "ss/services.h"
+
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_selinux.h>
+extern struct page *fake_status;
+extern struct static_key_false fake_status_initialize_key;
+extern void initialize_fake_status(void);
+#endif // #ifdef CONFIG_KSU_SUSFS
 
 enum sel_inos {
 	SEL_ROOT_INO = 2,
@@ -222,10 +230,28 @@ static int sel_open_handle_status(struct inode *inode, struct file *filp)
 	struct selinux_fs_info *fsi = file_inode(filp)->i_sb->s_fs_info;
 	struct page    *status = selinux_kernel_status_page(fsi->state);
 
+#ifdef CONFIG_KSU_SUSFS
+	struct page *data;
+
+	if (current_uid().val >= 10000 && READ_ONCE(ksu_selinux_hide_running)) {
+		mutex_lock(&selinux_state.ss->status_lock);
+		data = fake_status;
+		mutex_unlock(&selinux_state.ss->status_lock);
+		if (data) {
+			filp->private_data = data;
+			return 0;
+		}
+	}
+#endif
+
 	if (!status)
 		return -ENOMEM;
 
 	filp->private_data = status;
+#ifdef CONFIG_KSU_SUSFS
+	if (static_branch_unlikely(&fake_status_initialize_key) && !fake_status)
+		initialize_fake_status();
+#endif
 
 	return 0;
 }
@@ -599,6 +625,10 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 	char *canon = NULL;
 	u32 sid, len;
 	ssize_t length;
+#ifdef CONFIG_KSU_SUSFS
+	bool should_check_current = current_uid().val >= 10000 &&
+		READ_ONCE(ksu_selinux_hide_running);
+#endif
 
 	length = avc_has_perm(&selinux_state,
 			      current_sid(), SECINITSID_SECURITY,
@@ -606,11 +636,21 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_context_to_sid(state, buf, size, &sid, GFP_KERNEL);
+#ifdef CONFIG_KSU_SUSFS
+	if (should_check_current)
+		length = ksu_susfs_context_to_sid(buf, size, &sid, NULL, NULL);
+	else
+#endif
+		length = security_context_to_sid(state, buf, size, &sid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = security_sid_to_context(state, sid, &canon, &len);
+#ifdef CONFIG_KSU_SUSFS
+	if (should_check_current)
+		length = ksu_susfs_sid_to_context(sid, &canon, &len);
+	else
+#endif
+		length = security_sid_to_context(state, sid, &canon, &len);
 	if (length)
 		goto out;
 
@@ -821,6 +861,10 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	u16 tclass;
 	struct av_decision avd;
 	ssize_t length;
+#ifdef CONFIG_KSU_SUSFS
+	bool should_check_current = current_uid().val >= 10000 &&
+		READ_ONCE(ksu_selinux_hide_running);
+#endif
 
 	length = avc_has_perm(&selinux_state,
 			      current_sid(), SECINITSID_SECURITY,
@@ -842,15 +886,30 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
 		goto out;
 
-	length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
+#ifdef CONFIG_KSU_SUSFS
+	if (should_check_current)
+		length = ksu_susfs_context_to_sid(scon, strlen(scon), &ssid, NULL, NULL);
+	else
+#endif
+		length = security_context_str_to_sid(state, scon, &ssid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
+#ifdef CONFIG_KSU_SUSFS
+	if (should_check_current)
+		length = ksu_susfs_context_to_sid(tcon, strlen(tcon), &tsid, NULL, NULL);
+	else
+#endif
+		length = security_context_str_to_sid(state, tcon, &tsid, GFP_KERNEL);
 	if (length)
 		goto out;
 
-	security_compute_av_user(state, ssid, tsid, tclass, &avd);
+#ifdef CONFIG_KSU_SUSFS
+	if (should_check_current)
+		ksu_susfs_compute_av(ssid, tsid, tclass, &avd);
+	else
+#endif
+		security_compute_av_user(state, ssid, tsid, tclass, &avd);
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",

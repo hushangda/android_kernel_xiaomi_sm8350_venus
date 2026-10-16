@@ -1,6 +1,7 @@
 config MILLET
 	bool "frozen framework"
 	default y
-	depends on MIHW
+	depends on MIHW && ANDROID && NET && SYSFS
+	select ANDROID_VENDOR_FREEZER_COMPAT
 	---help---
 	  Mi frozen function

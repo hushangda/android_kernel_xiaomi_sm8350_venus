@@ -9,6 +9,9 @@ void millet_sig(int sig, struct task_struct *killer, struct task_struct *dst)
 {
 	struct millet_data data;
 
+	if (!millet_is_active())
+		return;
+
 	if (sig == SIGKILL
 			|| sig == SIGTERM
 			|| sig == SIGABRT
@@ -63,4 +66,3 @@ static int __init sig_mod_init(void)
 
 module_init(sig_mod_init);
 MODULE_LICENSE("GPL");
-

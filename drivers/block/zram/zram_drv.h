@@ -50,6 +50,9 @@ enum zram_pageflags {
 	ZRAM_UNDER_WB,	/* page is under writeback */
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
+	ZRAM_INCOMPRESSIBLE, /* secondary algorithms made no progress */
+	ZRAM_COMP_PRIORITY_BIT1,
+	ZRAM_COMP_PRIORITY_BIT2,
 
 	__NR_ZRAM_PAGEFLAGS,
 };
@@ -63,7 +66,7 @@ struct zram_table_entry {
 		unsigned long element;
 	};
 	unsigned long flags;
-#ifdef CONFIG_ZRAM_MEMORY_TRACKING
+#ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
 	ktime_t ac_time;
 #endif
 };
@@ -89,10 +92,22 @@ struct zram_stats {
 #endif
 };
 
+#ifdef CONFIG_ZRAM_MULTI_COMP
+#define ZRAM_PRIMARY_COMP	0U
+#define ZRAM_SECONDARY_COMP	1U
+#define ZRAM_MAX_COMPS		4U
+#else
+#define ZRAM_PRIMARY_COMP	0U
+#define ZRAM_SECONDARY_COMP	0U
+#define ZRAM_MAX_COMPS		1U
+#endif
+
+#define ZRAM_COMP_PRIORITY_MASK	0x3
+
 struct zram {
 	struct zram_table_entry *table;
 	struct zs_pool *mem_pool;
-	struct zcomp *comp;
+	struct zcomp *comps[ZRAM_MAX_COMPS];
 	struct gendisk *disk;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
@@ -107,7 +122,8 @@ struct zram {
 	 * we can store in a disk.
 	 */
 	u64 disksize;	/* bytes */
-	char compressor[CRYPTO_MAX_ALG_NAME];
+	const char *comp_algs[ZRAM_MAX_COMPS];
+	s8 num_active_comps;
 	/*
 	 * zram is claimed so open request will be failed
 	 */

@@ -59,6 +59,16 @@
 #define AW8697_MAX_FIRMWARE_LOAD_CNT 20
 
 #define AW8697_MAX_BST_VO 0x1f
+#define AW8697_GAIN_LEVEL_MIN 0x1E
+#define AW8697_GAIN_LEVEL_MAX 0x80
+#define AW8697_COLOROS_FF_GAIN_MIN 0x4736
+#define AW8697_COLOROS_FF_GAIN_MAX 0x7FFF
+#define AW8697_COLOROS_BST_VOL_MIN 0x11
+#define AW8697_COLOROS_BST_VOL_MAX AW8697_MAX_BST_VO
+#define AW8697_COLOROS_WEAK_GAIN 0x20
+#define AW8697_COLOROS_STRONG_GAIN AW8697_GAIN_LEVEL_MAX
+#define AW8697_COLOROS_RAM_REPEATS 1
+#define AW8697_OPLUS_GAIN_MAX 2400
 
 #define OSC_CALIBRATION_T_LENGTH 5100000
 #define PM_QOS_VALUE_VB 400
@@ -1365,10 +1375,95 @@ static int aw8697_haptic_rtp_init(struct aw8697 *aw8697)
 	return 0;
 }
 
+static unsigned char aw8697_haptic_ff_gain_to_level(u16 gain)
+{
+	u32 range;
+	u32 offset;
+	u32 level;
+
+	if (!gain || gain <= AW8697_COLOROS_FF_GAIN_MIN)
+		return AW8697_COLOROS_WEAK_GAIN;
+	if (gain >= AW8697_COLOROS_FF_GAIN_MAX)
+		return AW8697_COLOROS_STRONG_GAIN;
+
+	range = AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN;
+	offset = gain - AW8697_COLOROS_FF_GAIN_MIN;
+	level = AW8697_COLOROS_WEAK_GAIN +
+		(offset * (AW8697_COLOROS_STRONG_GAIN -
+			   AW8697_COLOROS_WEAK_GAIN) + range / 2) / range;
+
+	return level;
+}
+
+static unsigned char aw8697_haptic_ff_gain_to_bst_vol(u16 gain)
+{
+	u32 range;
+	u32 offset;
+	u32 bst_vol;
+
+	if (!gain || gain <= AW8697_COLOROS_FF_GAIN_MIN)
+		return AW8697_COLOROS_BST_VOL_MIN;
+	if (gain >= AW8697_COLOROS_FF_GAIN_MAX)
+		return AW8697_COLOROS_BST_VOL_MAX;
+
+	range = AW8697_COLOROS_FF_GAIN_MAX - AW8697_COLOROS_FF_GAIN_MIN;
+	offset = gain - AW8697_COLOROS_FF_GAIN_MIN;
+	bst_vol = AW8697_COLOROS_BST_VOL_MIN +
+		(offset * (AW8697_COLOROS_BST_VOL_MAX -
+			   AW8697_COLOROS_BST_VOL_MIN) + range / 2) / range;
+
+	return bst_vol;
+}
+
+static u16 aw8697_haptic_oplus_gain_to_ff_gain(unsigned int gain)
+{
+	if (!gain)
+		return 0;
+	if (gain <= AW8697_GAIN_LEVEL_MAX)
+		return gain * 0xFFFF / AW8697_GAIN_LEVEL_MAX;
+	if (gain <= AW8697_OPLUS_GAIN_MAX)
+		return gain * 0xFFFF / AW8697_OPLUS_GAIN_MAX;
+	if (gain <= HAP_VMAX_MV_MAX)
+		return gain * 0xFFFF / HAP_VMAX_MV_MAX;
+	if (gain > 0xFFFF)
+		return 0xFFFF;
+
+	return gain;
+}
+
+static unsigned char aw8697_haptic_magnitude_to_level(u16 magnitude)
+{
+	unsigned char level;
+
+	if (magnitude >= 0x7FFF)
+		level = AW8697_GAIN_LEVEL_MAX;
+	else if (magnitude <= 0x3FFF)
+		level = AW8697_GAIN_LEVEL_MIN;
+	else
+		level = (magnitude - 16383) / 128;
+
+	if (level < AW8697_GAIN_LEVEL_MIN)
+		level = AW8697_GAIN_LEVEL_MIN;
+
+	return level;
+}
+
 static int16_t aw8697_haptic_effect_strength(struct aw8697 *aw8697)
 {
 	pr_debug("%s enter\n", __func__);
 	pr_debug("%s: aw8697->play.vmax_mv =0x%x\n", __func__, aw8697->play.vmax_mv);
+	if (aw8697->ff_gain_valid) {
+		unsigned char bst_vol;
+
+		aw8697->level =
+			aw8697_haptic_ff_gain_to_level(aw8697->new_gain);
+		bst_vol = aw8697_haptic_ff_gain_to_bst_vol(aw8697->new_gain);
+		aw8697->vmax = bst_vol;
+		aw8697_haptic_set_bst_vol(aw8697, bst_vol);
+		pr_info("%s: ff_gain=0x%x level=0x%x bst=0x%x\n", __func__,
+			aw8697->new_gain, aw8697->level, bst_vol);
+		return 0;
+	}
 #if 0
 	switch (aw8697->play.vmax_mv) {
 	case AW8697_LIGHT_MAGNITUDE:
@@ -1384,14 +1479,8 @@ static int16_t aw8697_haptic_effect_strength(struct aw8697 *aw8697)
 		break;
 	}
 #else
-	if (aw8697->play.vmax_mv >= 0x7FFF)
-		aw8697->level = 0x80; /*128*/
-	else if (aw8697->play.vmax_mv <= 0x3FFF)
-		aw8697->level = 0x1E; /*30*/
-    else
-		aw8697->level = (aw8697->play.vmax_mv - 16383) / 128;
-	if( aw8697->level < 0x1E)
-		aw8697->level = 0x1E; /*30*/
+	aw8697->level =
+		aw8697_haptic_magnitude_to_level(aw8697->play.vmax_mv);
 #endif
 
 	pr_info("%s: aw8697->level =0x%x\n", __func__, aw8697->level);
@@ -1408,10 +1497,16 @@ static int aw8697_haptic_play_effect_seq(struct aw8697 *aw8697,
 
 	if (flag) {
 		if (aw8697->activate_mode == AW8697_HAPTIC_ACTIVATE_RAM_MODE) {
-			aw8697_haptic_set_wav_seq(aw8697, 0x00,
-						(char)aw8697->effect_id + 1);
-			aw8697_haptic_set_wav_seq(aw8697, 0x01, 0x00);
-			aw8697_haptic_set_wav_loop(aw8697, 0x00, 0x00);
+			unsigned char i;
+			unsigned char seq = (char)aw8697->effect_id + 1;
+			unsigned char repeats = AW8697_COLOROS_RAM_REPEATS;
+
+			for (i = 0; i < AW8697_SEQUENCER_SIZE; i++) {
+				aw8697_haptic_set_wav_seq(aw8697, i,
+							  i < repeats ? seq : 0);
+				aw8697_haptic_set_wav_loop(aw8697, i, 0);
+			}
+
 			aw8697_haptic_play_mode(aw8697, AW8697_HAPTIC_RAM_MODE);
 			if (aw8697->info.bst_vol_ram <= AW8697_MAX_BST_VO)
 				aw8697_haptic_set_bst_vol(aw8697, aw8697->info.bst_vol_ram);
@@ -1419,6 +1514,9 @@ static int aw8697_haptic_play_effect_seq(struct aw8697 *aw8697,
 				aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
 			aw8697_haptic_effect_strength(aw8697);
 			aw8697_haptic_set_gain(aw8697, aw8697->level);
+			if (aw8697->ff_gain_valid)
+				pr_info("%s: coloros linear level=0x%x bst=0x%x\n",
+					__func__, aw8697->level, aw8697->vmax);
 			aw8697_haptic_start(aw8697);
 		}
 		if (aw8697->activate_mode == AW8697_HAPTIC_ACTIVATE_RAM_LOOP_MODE) {
@@ -3209,15 +3307,9 @@ static void set_gain(struct work_struct * work)
 	int comp_gain = 0;
 	pr_debug("%s enter set_gain queue work\n", __func__);
 
-	if (aw8697->new_gain >= 0x7FFF)
-		aw8697->level = 0x80; /*128*/
-	else if (aw8697->new_gain <= 0x3FFF)
-		aw8697->level = 0x1E; /*30*/
-	else
-		aw8697->level = (aw8697->new_gain - 16383) / 128;
-
-	if( aw8697->level < 0x1E)
-		aw8697->level = 0x1E; /*30*/
+	aw8697->level = aw8697_haptic_ff_gain_to_level(aw8697->new_gain);
+	aw8697->vmax = aw8697_haptic_ff_gain_to_bst_vol(aw8697->new_gain);
+	aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
 
 	if ((aw8697->activate_mode == AW8697_HAPTIC_ACTIVATE_RAM_LOOP_MODE) &&
 		(aw8697->ram_vbat_comp == AW8697_HAPTIC_RAM_VBAT_COMP_ENABLE) &&
@@ -3242,6 +3334,7 @@ static void aw8697_haptics_set_gain(struct input_dev *dev, u16 gain)
 	struct aw8697 *aw8697 = input_get_drvdata(dev);
 	pr_debug("%s enter\n", __func__);
 	aw8697->new_gain = gain;
+	aw8697->ff_gain_valid = true;
 	queue_work(aw8697->work_queue, &aw8697->set_gain_work);
 }
 
@@ -3828,6 +3921,144 @@ static ssize_t aw8697_rtp_store(struct device *dev,
 		pr_err("%s: rtp_file_num 0x%02x over max value \n", __func__,
 		       aw8697->rtp_file_num);
 	}
+
+	return count;
+}
+
+static struct aw8697 *aw8697_from_led_dev(struct device *dev)
+{
+	struct led_classdev *cdev = dev_get_drvdata(dev);
+
+	return container_of(cdev, struct aw8697, vib_dev);
+}
+
+static enum led_brightness
+aw8697_led_brightness_get(struct led_classdev *cdev)
+{
+	struct aw8697 *aw8697 = container_of(cdev, struct aw8697, vib_dev);
+
+	return aw8697->amplitude;
+}
+
+static int aw8697_led_brightness_set(struct led_classdev *cdev,
+				     enum led_brightness value)
+{
+	struct aw8697 *aw8697 = container_of(cdev, struct aw8697, vib_dev);
+
+	aw8697->amplitude = value;
+	mutex_lock(&aw8697->lock);
+	aw8697->state = value > 0;
+	aw8697->activate_mode = AW8697_HAPTIC_ACTIVATE_RAM_MODE;
+	mutex_unlock(&aw8697->lock);
+
+	hrtimer_cancel(&aw8697->timer);
+	queue_work(aw8697->work_queue, &aw8697->vibrator_work);
+
+	return 0;
+}
+
+static ssize_t aw8697_led_vmax_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct aw8697 *aw8697 = aw8697_from_led_dev(dev);
+
+	return snprintf(buf, PAGE_SIZE, "0x%02x\n", aw8697->vmax);
+}
+
+static ssize_t aw8697_led_vmax_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct aw8697 *aw8697 = aw8697_from_led_dev(dev);
+	unsigned int val;
+	int rc;
+
+	rc = kstrtouint(buf, 0, &val);
+	if (rc < 0)
+		return rc;
+
+	mutex_lock(&aw8697->lock);
+	if (val <= AW8697_MAX_BST_VO) {
+		aw8697->vmax = val;
+		aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
+	} else {
+		aw8697->new_gain = aw8697_haptic_oplus_gain_to_ff_gain(val);
+		aw8697->ff_gain_valid = true;
+		aw8697->level =
+			aw8697_haptic_ff_gain_to_level(aw8697->new_gain);
+		aw8697->vmax =
+			aw8697_haptic_ff_gain_to_bst_vol(aw8697->new_gain);
+		aw8697_haptic_set_bst_vol(aw8697, aw8697->vmax);
+		aw8697_haptic_set_gain(aw8697, aw8697->level);
+	}
+	mutex_unlock(&aw8697->lock);
+
+	return count;
+}
+
+static ssize_t aw8697_led_rtp_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct aw8697 *aw8697 = aw8697_from_led_dev(dev);
+
+	return snprintf(buf, PAGE_SIZE, "rtp play: %d\n", aw8697->rtp_cnt);
+}
+
+static ssize_t aw8697_led_rtp_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct aw8697 *aw8697 = aw8697_from_led_dev(dev);
+	unsigned int val;
+	int rc;
+
+	rc = kstrtouint(buf, 0, &val);
+	if (rc < 0)
+		return rc;
+
+	aw8697_haptic_stop(aw8697);
+	aw8697_haptic_set_rtp_aei(aw8697, false);
+	aw8697_interrupt_clear(aw8697);
+	if (val < (sizeof(aw8697_rtp_name) / AW8697_RTP_NAME_MAX)) {
+		aw8697->rtp_file_num = val;
+		if (val)
+			queue_work(aw8697->work_queue, &aw8697->rtp_work);
+	} else {
+		pr_err("%s: rtp_file_num 0x%02x over max value\n", __func__,
+		       aw8697->rtp_file_num);
+	}
+
+	return count;
+}
+
+static ssize_t aw8697_led_waveform_index_show(struct device *dev,
+					      struct device_attribute *attr,
+					      char *buf)
+{
+	struct aw8697 *aw8697 = aw8697_from_led_dev(dev);
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", aw8697->effect_id);
+}
+
+static ssize_t aw8697_led_waveform_index_store(struct device *dev,
+					       struct device_attribute *attr,
+					       const char *buf, size_t count)
+{
+	struct aw8697 *aw8697 = aw8697_from_led_dev(dev);
+	unsigned int val;
+	int rc;
+
+	rc = kstrtouint(buf, 0, &val);
+	if (rc < 0)
+		return rc;
+
+	if (val > aw8697->info.effect_max)
+		val = aw8697->info.effect_max;
+
+	mutex_lock(&aw8697->lock);
+	aw8697->effect_id = val;
+	aw8697->index = val;
+	mutex_unlock(&aw8697->lock);
 
 	return count;
 }
@@ -4500,6 +4731,15 @@ static DEVICE_ATTR(seq, S_IWUSR | S_IRUGO, aw8697_seq_show, aw8697_seq_store);
 static DEVICE_ATTR(loop, S_IWUSR | S_IRUGO, aw8697_loop_show,
 		   aw8697_loop_store);
 static DEVICE_ATTR(rtp, S_IWUSR | S_IRUGO, aw8697_rtp_show, aw8697_rtp_store);
+static DEVICE_ATTR(waveform_index, S_IWUSR | S_IRUGO,
+		   aw8697_led_waveform_index_show,
+		   aw8697_led_waveform_index_store);
+static struct device_attribute dev_attr_vibrator_vmax =
+	__ATTR(vmax, S_IWUSR | S_IRUGO, aw8697_led_vmax_show,
+	       aw8697_led_vmax_store);
+static struct device_attribute dev_attr_vibrator_rtp =
+	__ATTR(rtp, S_IWUSR | S_IRUGO, aw8697_led_rtp_show,
+	       aw8697_led_rtp_store);
 static DEVICE_ATTR(ram_update, S_IWUSR | S_IRUGO, aw8697_ram_update_show,
 		   aw8697_ram_update_store);
 static DEVICE_ATTR(f0, S_IWUSR | S_IRUGO, aw8697_f0_show, aw8697_f0_store);
@@ -4573,6 +4813,17 @@ static struct attribute *aw8697_vibrator_attributes[] = {
 
 static struct attribute_group aw8697_vibrator_attribute_group = {
 	.attrs = aw8697_vibrator_attributes
+};
+
+static struct attribute *aw8697_led_vibrator_attributes[] = {
+	&dev_attr_vibrator_vmax.attr,
+	&dev_attr_vibrator_rtp.attr,
+	&dev_attr_waveform_index.attr,
+	NULL
+};
+
+static struct attribute_group aw8697_led_vibrator_attribute_group = {
+	.attrs = aw8697_led_vibrator_attributes
 };
 
 /******************************************************
@@ -4763,6 +5014,25 @@ static int aw8697_i2c_probe(struct i2c_client *i2c,
 		goto err_sysfs;
 	}
 
+	aw8697->vib_dev.name = "vibrator";
+	aw8697->vib_dev.max_brightness = 255;
+	aw8697->vib_dev.brightness_get = aw8697_led_brightness_get;
+	aw8697->vib_dev.brightness_set_blocking = aw8697_led_brightness_set;
+	ret = devm_led_classdev_register(&i2c->dev, &aw8697->vib_dev);
+	if (ret < 0) {
+		dev_info(&i2c->dev, "%s error creating led vibrator\n",
+			 __func__);
+		goto err_led;
+	}
+
+	ret = sysfs_create_group(&aw8697->vib_dev.dev->kobj,
+				 &aw8697_led_vibrator_attribute_group);
+	if (ret < 0) {
+		dev_info(&i2c->dev, "%s error creating led vibrator attrs\n",
+			 __func__);
+		goto err_led;
+	}
+
 	g_aw8697 = aw8697;
 
 	ret =  create_rb();
@@ -4779,9 +5049,12 @@ static int aw8697_i2c_probe(struct i2c_client *i2c,
 	return 0;
 
 	err_rb:
-	sysfs_remove_group(&i2c->dev.kobj, &aw8697_vibrator_attribute_group);
-      err_sysfs:
-	devm_free_irq(&i2c->dev, gpio_to_irq(aw8697->irq_gpio), aw8697);
+		sysfs_remove_group(&aw8697->vib_dev.dev->kobj,
+				   &aw8697_led_vibrator_attribute_group);
+	err_led:
+		sysfs_remove_group(&i2c->dev.kobj, &aw8697_vibrator_attribute_group);
+	      err_sysfs:
+		devm_free_irq(&i2c->dev, gpio_to_irq(aw8697->irq_gpio), aw8697);
       destroy_ff:
 	input_ff_destroy(aw8697->input_dev);
       err_irq:
@@ -4804,6 +5077,8 @@ static int aw8697_i2c_remove(struct i2c_client *i2c)
 	struct aw8697 *aw8697 = i2c_get_clientdata(i2c);
 
 	pr_info("%s enter\n", __func__);
+	sysfs_remove_group(&aw8697->vib_dev.dev->kobj,
+			   &aw8697_led_vibrator_attribute_group);
 
 	sysfs_remove_group(&i2c->dev.kobj, &aw8697_vibrator_attribute_group);
 
