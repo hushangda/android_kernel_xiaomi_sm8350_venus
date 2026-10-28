@@ -449,6 +449,7 @@ struct battery_chg_dev {
 	bool				ui_soc_from_gauge;
 	int				ui_soc;
 	int				ui_soc_target;
+	int				ui_soc_status;
 	ktime_t			ui_soc_update_time;
 	u32				reverse_chg_flag;
 	bool				xm_uevent_valid;
@@ -2329,17 +2330,51 @@ static void battery_chg_restart_ui_soc(struct battery_chg_dev *bcdev)
 	mutex_unlock(&bcdev->ui_soc_lock);
 }
 
+static int battery_chg_read_ui_status(struct battery_chg_dev *bcdev,
+				      struct psy_state *pst)
+{
+	struct psy_state *usb_pst = &bcdev->psy_list[PSY_TYPE_USB];
+	struct psy_state *wls_pst = &bcdev->psy_list[PSY_TYPE_WLS];
+	bool online;
+	int rc, status;
+
+	/* GLINK deliberately returns cached values while transport is down. */
+	if (atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP ||
+	    (bcdev->debug_battery_detected && bcdev->block_tx))
+		return POWER_SUPPLY_STATUS_UNKNOWN;
+
+	rc = read_property_id(bcdev, pst, BATT_STATUS);
+	if (rc < 0)
+		return POWER_SUPPLY_STATUS_UNKNOWN;
+	status = READ_ONCE(pst->prop[BATT_STATUS]);
+	if (status != POWER_SUPPLY_STATUS_CHARGING &&
+	    status != POWER_SUPPLY_STATUS_FULL)
+		return status;
+
+	/* A delayed CHARGING/FULL report must not permit a rise after unplug. */
+	rc = read_property_id(bcdev, usb_pst, USB_ONLINE);
+	online = !rc && READ_ONCE(usb_pst->prop[USB_ONLINE]);
+	rc = read_property_id(bcdev, wls_pst, WLS_ONLINE);
+	online |= !rc && READ_ONCE(wls_pst->prop[WLS_ONLINE]);
+	if (!online || atomic_read(&bcdev->state) != PMIC_GLINK_STATE_UP ||
+	    (bcdev->debug_battery_detected && bcdev->block_tx))
+		return POWER_SUPPLY_STATUS_UNKNOWN;
+
+	return status;
+}
+
 static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
 				       struct psy_state *pst, int raw_soc,
 				       u32 remaining_uah, bool rm_valid,
 				       bool *changed)
 {
-	ktime_t now = ktime_get_boottime();
+	ktime_t now;
 	u32 full_uah, next_ms = 0, step_ms;
 	s64 elapsed_ms;
 	int status, target_soc;
 
-	status = (int)READ_ONCE(pst->prop[BATT_STATUS]);
+	status = battery_chg_read_ui_status(bcdev, pst);
+	now = ktime_get_boottime();
 	full_uah = battery_chg_effective_full_uah(bcdev);
 	step_ms = battery_chg_ui_soc_step_ms(bcdev, pst);
 	*changed = false;
@@ -2366,15 +2401,21 @@ static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
 	target_soc = clamp_val(target_soc, 0, 100);
 
 	mutex_lock(&bcdev->ui_soc_lock);
-	if (!bcdev->ui_soc_valid || (rm_valid && !bcdev->ui_soc_from_gauge)) {
-		/* Replace a boot-time fallback as soon as the gauge is available. */
-		*changed = bcdev->ui_soc_valid && bcdev->ui_soc != target_soc;
+	if (!bcdev->ui_soc_valid) {
+		/* Seed the first display; later gauge recovery uses the limiter. */
 		bcdev->ui_soc = target_soc;
 		bcdev->ui_soc_target = target_soc;
+		bcdev->ui_soc_status = status;
 		bcdev->ui_soc_update_time = now;
 		bcdev->ui_soc_valid = true;
 		bcdev->ui_soc_from_gauge = rm_valid;
 		goto out;
+	}
+	if (rm_valid)
+		bcdev->ui_soc_from_gauge = true;
+	if (status != bcdev->ui_soc_status) {
+		bcdev->ui_soc_status = status;
+		bcdev->ui_soc_update_time = now;
 	}
 	if (status == POWER_SUPPLY_STATUS_FULL && target_soc == 100 &&
 	    bcdev->ui_soc == 99) {
@@ -2386,11 +2427,14 @@ static int battery_chg_get_ui_capacity(struct battery_chg_dev *bcdev,
 	}
 
 	/*
-	 * Charging status describes the charger, not the direction of every gauge
-	 * correction. Let the display converge in either direction; resetting an
-	 * anchor or clamping to the old UI value would preserve a stale reading.
-	 * The rate limiter absorbs measurement and calibration discontinuities.
+	 * Adapt the direction guard in LineageOS's Xiaomi psyche/munch BQ SOC
+	 * smoothing to Venus's GLINK status/online properties. Gauge calibration
+	 * or a smaller learned FULL must not raise the display without charging.
+	 * Keep downward corrections possible even while externally powered.
 	 */
+	if (status != POWER_SUPPLY_STATUS_CHARGING &&
+	    status != POWER_SUPPLY_STATUS_FULL)
+		target_soc = min(target_soc, bcdev->ui_soc);
 	bcdev->ui_soc_target = target_soc;
 	if (target_soc == bcdev->ui_soc)
 		goto out;
@@ -2440,7 +2484,6 @@ static void battery_chg_ui_soc_work(struct work_struct *work)
 	raw_soc = clamp_val(DIV_ROUND_CLOSEST(
 		READ_ONCE(pst->prop[BATT_CAPACITY]), 100), 0, 100);
 
-	read_property_id(bcdev, pst, BATT_STATUS);
 	read_property_id(bcdev, pst, BATT_CURR_NOW);
 	battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
 	rm_valid = !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
@@ -2515,7 +2558,6 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		}
 
 		battery_chg_refresh_pack_capacity_uah(bcdev, pst, NULL);
-		read_property_id(bcdev, pst, BATT_STATUS);
 		read_property_id(bcdev, pst, BATT_CURR_NOW);
 		rm_valid = !battery_chg_read_fg_remaining_uah(bcdev, &remaining_uah);
 		pval->intval = battery_chg_get_ui_capacity(bcdev, pst,

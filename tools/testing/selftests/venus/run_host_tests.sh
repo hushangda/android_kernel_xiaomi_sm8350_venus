@@ -54,6 +54,7 @@ for variant in packing core_ctl touch touch_factory battery; do
           'static u32 battery_chg_ui_soc_step_ms' \
           'static void battery_chg_reset_ui_soc' \
           'static void battery_chg_restart_ui_soc' \
+          'static int battery_chg_read_ui_status' \
           'static int battery_chg_get_ui_capacity' \
           'static void battery_chg_ui_soc_work' \
           'static int battery_psy_get_prop'; do
