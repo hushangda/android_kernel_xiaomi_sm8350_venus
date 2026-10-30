@@ -81,6 +81,9 @@ mkdir -p "$OUT_DIR"
 
 make "${MAKE_ARGS[@]}" venus_defconfig
 CONFIG_ARGS=(
+  --enable VSOCKETS \
+  --enable VSOCKETS_DIAG \
+  --enable VIRTIO_VSOCKETS \
   --enable ZRAM \
   --enable ZRAM_MULTI_COMP \
   --enable CRYPTO_LZ4 \
@@ -155,6 +158,11 @@ make "${MAKE_ARGS[@]}" olddefconfig
 # PAGE_OWNER must stay disabled because it selects DEBUG_FS.
 for required_config in \
   'CONFIG_MODULES=y' \
+  'CONFIG_VSOCKETS=y' \
+  'CONFIG_VSOCKETS_DIAG=y' \
+  'CONFIG_VIRTIO=y' \
+  'CONFIG_VIRTIO_VSOCKETS=y' \
+  'CONFIG_VIRTIO_VSOCKETS_COMMON=y' \
   '# CONFIG_DEBUG_FS is not set'; do
   grep -Fxq "$required_config" "$OUT_DIR/.config" || {
     echo "ERROR: Venus kernel config requires $required_config" >&2
