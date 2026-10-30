@@ -611,6 +611,12 @@ config ADI
 	  and SSM (Silicon Secured Memory).  Intended consumers of this
 	  driver include crash and makedumpfile.
 
+config XLOGCHAR
+	tristate "Xiaomi xlog record transport"
+	help
+	  Provide the /dev/xlog record FIFO used by the stock Xiaomi vendor.
+	  Each record is 512 bytes and the FIFO holds 1 MiB of records.
+
 config RANDOM_TRUST_CPU
 	bool "Initialize RNG using CPU RNG instructions"
 	default y

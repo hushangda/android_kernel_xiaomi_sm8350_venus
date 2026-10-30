@@ -22,6 +22,7 @@
  */
 
 #include "wlan_pmo_wow.h"
+#include <linux/mi_cnss_statistic.h>
 #include "wlan_pmo_tgt_api.h"
 #include "wlan_pmo_main.h"
 #include "wlan_pmo_obj_mgmt_public_struct.h"
@@ -955,6 +956,8 @@ QDF_STATUS pmo_core_psoc_bus_suspend_req(struct wlan_objmgr_psoc *psoc,
 						   type);
 	else
 		status = pmo_core_psoc_suspend_target(psoc, 0);
+	if (wow_mode_selected && QDF_IS_STATUS_SUCCESS(status))
+		cnss_statistic_set_suspend_type(type == QDF_RUNTIME_SUSPEND);
 	end = qdf_get_log_timestamp_usecs();
 	pmo_debug("fw took total time %lu microseconds to enable wow",
 		  end - begin);

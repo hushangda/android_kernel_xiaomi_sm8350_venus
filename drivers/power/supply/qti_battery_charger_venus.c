@@ -845,7 +845,7 @@ static void battery_chg_state_cb(void *priv, enum pmic_glink_state state)
  * @val: Pointer to value that needs to be updated
  *
  * Return: 0 if success, negative on error.
- *
+ */
 int qti_battery_charger_get_prop(const char *name,
 				enum battery_charger_prop prop_id, int *val)
 {
@@ -854,7 +854,7 @@ int qti_battery_charger_get_prop(const char *name,
 	struct psy_state *pst;
 	int rc = 0;
 
-	if (prop_id >= BATTERY_CHARGER_PROP_MAX)
+	if (!name || !val || (unsigned int)prop_id >= BATTERY_CHARGER_PROP_MAX)
 		return -EINVAL;
 
 	if (strcmp(name, "battery") && strcmp(name, "usb") &&
@@ -866,10 +866,10 @@ int qti_battery_charger_get_prop(const char *name,
 		return -ENODEV;
 
 	bcdev = power_supply_get_drvdata(psy);
-	if (!bcdev)
-		return -ENODEV;
-
-	power_supply_put(psy);
+	if (!bcdev || !bcdev->initialized) {
+		rc = -ENODEV;
+		goto out;
+	}
 
 	switch (prop_id) {
 	case BATTERY_RESISTANCE:
@@ -882,10 +882,11 @@ int qti_battery_charger_get_prop(const char *name,
 		break;
 	}
 
+out:
+	power_supply_put(psy);
 	return rc;
 }
 EXPORT_SYMBOL(qti_battery_charger_get_prop);
-*/
 
 static bool validate_message(struct battery_charger_resp_msg *resp_msg,
 				size_t len)

@@ -13,9 +13,8 @@
 
 #define NETLINK_TEST 25
 #define MAX_MSGSIZE 32
-int stringlength(char *s);
 void sendnlmsg(char *message);
-static int pid = -1;
+static u32 pid;
 struct sock *nl_sk;
 
 void sendnlmsg(char *message)
@@ -23,10 +22,10 @@ void sendnlmsg(char *message)
 	struct sk_buff *skb_1;
 	struct nlmsghdr *nlh;
 	int len = NLMSG_SPACE(MAX_MSGSIZE);
-	int slen = 0;
 	int ret = 0;
+	u32 portid = READ_ONCE(pid);
 
-	if (!message || !nl_sk || !pid) {
+	if (!message || !nl_sk || !portid) {
 		return;
 	}
 
@@ -37,34 +36,35 @@ void sendnlmsg(char *message)
 		return;
 	}
 
-	slen = strlen(message);
 	nlh = nlmsg_put(skb_1, 0, 0, 0, MAX_MSGSIZE, 0);
+	if (!nlh) {
+		kfree_skb(skb_1);
+		return;
+	}
 	NETLINK_CB(skb_1).portid = 0;
 	NETLINK_CB(skb_1).dst_group = 0;
-	message[slen] = '\0';
-	memcpy(NLMSG_DATA(nlh), message, slen + 1);
-	ret = netlink_unicast(nl_sk, skb_1, pid, MSG_DONTWAIT);
+	/* Stock HAL messages contain one event byte in a 32-byte payload. */
+	memset(NLMSG_DATA(nlh), 0, MAX_MSGSIZE);
+	*(u8 *)NLMSG_DATA(nlh) = *(u8 *)message;
+	ret = netlink_unicast(nl_sk, skb_1, portid, MSG_DONTWAIT);
 
-	if (!ret) {
+	if (ret < 0) {
 		/*kfree_skb(skb_1); */
 		pr_err("send msg from kernel to usespace failed ret 0x%x\n",
 		       ret);
 	}
 }
 
-void nl_data_ready(struct sk_buff *__skb)
+void nl_data_ready(struct sk_buff *skb)
 {
-	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
-	char str[100];
-	skb = skb_get(__skb);
 
-	if (skb->len >= NLMSG_SPACE(0)) {
-		nlh = nlmsg_hdr(skb);
-		memcpy(str, NLMSG_DATA(nlh), sizeof(str));
-		pid = nlh->nlmsg_pid;
-		kfree_skb(skb);
-	}
+	if (skb->len < NLMSG_HDRLEN)
+		return;
+	nlh = nlmsg_hdr(skb);
+	if (!nlmsg_ok(nlh, skb->len))
+		return;
+	WRITE_ONCE(pid, NETLINK_CB(skb).portid);
 }
 
 int netlink_init(void)
@@ -88,6 +88,7 @@ int netlink_init(void)
 void netlink_exit(void)
 {
 	if (nl_sk != NULL) {
+		WRITE_ONCE(pid, 0);
 		netlink_kernel_release(nl_sk);
 		nl_sk = NULL;
 	}

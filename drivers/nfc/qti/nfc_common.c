@@ -643,6 +643,22 @@ unsigned int nfc_ioctl_nfcc_info(struct file *filp, unsigned long arg)
 	return r;
 }
 
+static int nfc_ioctl_nfcc_irq_info(struct nfc_dev *nfc_dev)
+{
+	struct i2c_dev *i2c_dev = &nfc_dev->i2c_dev;
+	unsigned long flags;
+	u32 info;
+
+	if (nfc_dev->interface != PLATFORM_IF_I2C)
+		return -EOPNOTSUPP;
+	spin_lock_irqsave(&i2c_dev->irq_enabled_lock, flags);
+	info = (i2c_dev->irq_count & GENMASK(23, 0)) |
+		((u32)i2c_dev->irq_enabled << 24);
+	spin_unlock_irqrestore(&i2c_dev->irq_enabled_lock, flags);
+	info |= (u32)!!gpio_get_value(nfc_dev->gpio.clkreq) << 25;
+	return info;
+}
+
 /** @brief   IOCTL function  to be used to set or get data from upper layer.
  *
  *  @param   pfile  fil node for opened device.
@@ -679,6 +695,9 @@ long nfc_dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 		break;
 	case NFC_GET_IRQ_STATE:
 		ret = gpio_get_value(nfc_dev->gpio.irq);
+		break;
+	case NFC_GET_IRQ_INFO:
+		ret = nfc_ioctl_nfcc_irq_info(nfc_dev);
 		break;
 	default:
 		pr_err("%s bad cmd %lu\n", __func__, arg);

@@ -17,6 +17,7 @@ obj-y     := route.o inetpeer.o protocol.o \
 	     metrics.o netlink.o nexthop.o
 
 obj-$(CONFIG_BPFILTER) += bpfilter/
+obj-$(CONFIG_MI_SLA) += mi_sla.o
 
 obj-$(CONFIG_NET_IP_TUNNEL) += ip_tunnel.o
 obj-$(CONFIG_SYSCTL) += sysctl_net_ipv4.o

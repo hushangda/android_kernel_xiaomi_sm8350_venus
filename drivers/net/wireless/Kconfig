@@ -135,6 +135,12 @@ config CLD_LL_CORE
 	  Select Y to compile the driver in order to have WLAN functionality
 	  support.
 
+config MI_CNSS_STATISTIC
+	tristate "Xiaomi Wi-Fi wakeup statistics"
+	help
+	  Provide the stock cnss_statistic generic-netlink family and Wi-Fi
+	  wakeup protocol/port reports used by Xiaomi vendor services.
+
 config CNSS_CRYPTO
 	tristate "Enable CNSS crypto support"
 	help

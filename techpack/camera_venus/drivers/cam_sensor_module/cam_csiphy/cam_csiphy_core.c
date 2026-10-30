@@ -55,11 +55,7 @@ static int csiphy_override_cnt  = 6;
 static int csiphy_override[100] = {0x9B4,0x8,0xAB4,0x8,0xBB4,0x8};
 module_param_array(csiphy_override, int, &csiphy_override_cnt, 0644);
 
-#if defined(CONFIG_MACH_XIAOMI_VENUS)
-static int csiphy_hack_rate_mb = 3500;
-#else
 static int csiphy_hack_rate_mb = 2000;
-#endif
 
 module_param(csiphy_hack_rate_mb, int, 0644);
 

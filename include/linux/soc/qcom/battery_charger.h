@@ -11,7 +11,8 @@ enum battery_charger_prop {
 	BATTERY_CHARGER_PROP_MAX,
 };
 
-#if IS_ENABLED(CONFIG_QTI_BATTERY_CHARGER)
+#if IS_REACHABLE(CONFIG_QTI_BATTERY_CHARGER) || \
+	IS_REACHABLE(CONFIG_QTI_BATTERY_CHARGER_VENUS)
 int qti_battery_charger_get_prop(const char *name,
 				enum battery_charger_prop prop_id, int *val);
 #else

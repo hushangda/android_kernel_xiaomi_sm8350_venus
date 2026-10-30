@@ -125,6 +125,14 @@ config SCSI_UFS_DWC_TC_PLATFORM
 
 	  If unsure, say N.
 
+config MI_MEMORY_SYSFS
+	bool "Xiaomi UFS and DDR memory information"
+	depends on SCSI_UFSHCD=y && SCSI_UFSHCD_QTI && SCSI_UFS_QCOM=y
+	depends on QCOM_SMEM=y && PROC_FS
+	help
+	  Build the stock Xiaomi memory information interfaces into the kernel,
+	  including UFS health reports and the UFS error history.
+
 config SCSI_UFS_QCOM
 	tristate "QCOM specific hooks to UFS controller platform driver"
 	depends on SCSI_UFSHCD_PLATFORM && ARCH_QCOM && PHY_QCOM_UFS

@@ -2298,8 +2298,11 @@ int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	ret = __ufshcd_send_uic_cmd(hba, uic_cmd, true);
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
-	if (!ret)
+	if (!ret) {
 		ret = ufshcd_wait_for_uic_cmd(hba, uic_cmd);
+		if (ret)
+			mi_memory_record_error(hba, "wait_for_uic_cmd_fail\n");
+	}
 
 	mutex_unlock(&hba->uic_cmd_mutex);
 
@@ -2872,6 +2875,8 @@ static int ufshcd_wait_for_dev_cmd(struct ufs_hba *hba,
 		 * field in hba
 		 */
 		ufshcd_outstanding_req_clear(hba, lrbp->task_tag);
+		if (err == -ETIMEDOUT)
+			mi_memory_record_error(hba, "wait_for_dev_cmd_fail\n");
 	}
 
 	return err;
@@ -4082,6 +4087,7 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
 		}
 
 		ret = -ETIMEDOUT;
+		mi_memory_record_error(hba, "uic_pwr_ctrl_timeout\n");
 		goto out;
 	}
 
@@ -4192,10 +4198,11 @@ int ufshcd_uic_hibern8_enter(struct ufs_hba *hba)
 	trace_ufshcd_profile_hibern8(dev_name(hba->dev), "enter",
 			     ktime_to_us(ktime_sub(ktime_get(), start)), ret);
 
-	if (ret)
+	if (ret) {
+		mi_memory_record_error(hba, "hibern8_enter_fail\n");
 		dev_err(hba->dev, "%s: hibern8 enter failed. ret = %d\n",
 			__func__, ret);
-	else
+	} else
 		ufshcd_vops_hibern8_notify(hba, UIC_CMD_DME_HIBER_ENTER,
 								POST_CHANGE);
 
@@ -4217,6 +4224,7 @@ int ufshcd_uic_hibern8_exit(struct ufs_hba *hba)
 			     ktime_to_us(ktime_sub(ktime_get(), start)), ret);
 
 	if (ret) {
+		mi_memory_record_error(hba, "uic_hibern8_exit_failed\n");
 		dev_err(hba->dev, "%s: hibern8 exit failed. ret = %d\n",
 			__func__, ret);
 	} else {
@@ -4419,6 +4427,7 @@ static int ufshcd_change_power_mode(struct ufs_hba *hba,
 			| pwr_mode->pwr_tx);
 
 	if (ret) {
+		mi_memory_record_error(hba, "change_power_mode_fail\n");
 		dev_err(hba->dev,
 			"%s: power mode change failed %d\n", __func__, ret);
 	} else {
@@ -4739,6 +4748,7 @@ link_startup:
 
 		/* check if device is detected by inter-connect layer */
 		if (!ret && !ufshcd_is_device_present(hba)) {
+			mi_memory_record_error(hba, "device_present_fail\n");
 			ufshcd_update_reg_hist(&hba->ufs_stats.link_startup_err,
 					       0);
 			dev_err(hba->dev, "%s: Device not present\n", __func__);
@@ -4751,10 +4761,13 @@ link_startup:
 		 * but we can't be sure if the link is up until link startup
 		 * succeeds. So reset the local Uni-Pro and try again.
 		 */
-		if (ret && ufshcd_hba_enable(hba)) {
-			ufshcd_update_reg_hist(&hba->ufs_stats.link_startup_err,
-					       (u32)ret);
-			goto out;
+		if (ret) {
+			mi_memory_record_error(hba, "link_startup_fail\n");
+			if (ufshcd_hba_enable(hba)) {
+				ufshcd_update_reg_hist(&hba->ufs_stats.link_startup_err,
+						       (u32)ret);
+				goto out;
+			}
 		}
 	} while (ret && retries--);
 
@@ -5162,6 +5175,8 @@ ufshcd_transfer_rsp_status(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
 	if ((host_byte(result) != DID_OK) &&
 	    (host_byte(result) != DID_REQUEUE) && !hba->silence_err_logs)
 		ufshcd_print_trs(hba, 1 << lrbp->task_tag, true);
+	if (host_byte(result) == DID_ERROR || host_byte(result) == DID_ABORT)
+		mi_memory_record_error(hba, "transfer_rsp_status_fail\n");
 	return result;
 }
 
@@ -5992,6 +6007,7 @@ static void ufshcd_err_handler(struct work_struct *work)
 	bool needs_reset = false;
 
 	hba = container_of(work, struct ufs_hba, eh_work);
+	mi_memory_record_error(hba, "ufshcd_err_handler\n");
 
 	spin_lock_irqsave(hba->host->host_lock, flags);
 	if (ufshcd_err_handling_should_stop(hba)) {
@@ -6140,6 +6156,9 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 {
 	u32 reg;
 	irqreturn_t retval = IRQ_NONE;
+#ifdef CONFIG_SCSI_UFSHCD_QTI
+	int bit;
+#endif
 
 	/* PHY layer lane error */
 	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER);
@@ -6150,6 +6169,14 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 	/* Ignore LINERESET indication, as this is not an error */
 	if ((reg & UIC_PHY_ADAPTER_LAYER_ERROR) &&
 	    (reg & UIC_PHY_ADAPTER_LAYER_LANE_ERR_MASK)) {
+#ifdef CONFIG_SCSI_UFSHCD_QTI
+		for (bit = 0; bit < UFS_EC_PA_MAX; bit++) {
+			if (reg & BIT(bit)) {
+				hba->ufs_stats.pa_err_cnt[bit]++;
+				hba->ufs_stats.pa_err_cnt_total++;
+			}
+		}
+#endif
 		/*
 		 * To know whether this error is fatal or not, DB timeout
 		 * must be checked but this error is handled separately.
@@ -6163,6 +6190,14 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER);
 	if ((reg & UIC_DATA_LINK_LAYER_ERROR) &&
 	    (reg & UIC_DATA_LINK_LAYER_ERROR_CODE_MASK)) {
+#ifdef CONFIG_SCSI_UFSHCD_QTI
+		for (bit = 0; bit < UFS_EC_DL_MAX; bit++) {
+			if (reg & BIT(bit)) {
+				hba->ufs_stats.dl_err_cnt[bit]++;
+				hba->ufs_stats.dl_err_cnt_total++;
+			}
+		}
+#endif
 		ufshcd_update_reg_hist(&hba->ufs_stats.dl_err, reg);
 
 		if (reg & UIC_DATA_LINK_LAYER_ERROR_PA_INIT)
@@ -6198,6 +6233,9 @@ static irqreturn_t ufshcd_update_uic_error(struct ufs_hba *hba)
 	reg = ufshcd_readl(hba, REG_UIC_ERROR_CODE_DME);
 	if ((reg & UIC_DME_ERROR) &&
 	    (reg & UIC_DME_ERROR_CODE_MASK)) {
+#ifdef CONFIG_SCSI_UFSHCD_QTI
+		hba->ufs_stats.dme_err_cnt++;
+#endif
 		ufshcd_update_reg_hist(&hba->ufs_stats.dme_err, reg);
 		hba->uic_error |= UFSHCD_UIC_DME_ERROR;
 		retval |= IRQ_HANDLED;
@@ -6809,6 +6847,7 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 
 	host = cmd->device->host;
 	hba = shost_priv(host);
+	mi_memory_record_error(hba, "ufshcd_abort\n");
 	tag = cmd->request->tag;
 	lrbp = &hba->lrb[tag];
 	if (!ufshcd_valid_tag(hba, tag)) {
@@ -8937,8 +8976,10 @@ set_link_active:
 	ufshcd_vreg_set_hpm(hba);
 	if (ufshcd_is_link_hibern8(hba) && !ufshcd_uic_hibern8_exit(hba))
 		ufshcd_set_link_active(hba);
-	else if (ufshcd_is_link_off(hba))
+	else if (ufshcd_is_link_off(hba)) {
+		mi_memory_record_error(hba, "ufshcd_link_off_fail\n");
 		ufshcd_host_reset_and_restore(hba);
+	}
 set_dev_active:
 	if (!ufshcd_set_dev_pwr_mode(hba, UFS_ACTIVE_PWR_MODE))
 		ufshcd_disable_auto_bkops(hba);
@@ -8957,8 +8998,10 @@ out:
 
 	hba->pm_op_in_progress = 0;
 
-	if (ret)
+	if (ret) {
+		mi_memory_record_error(hba, "ufshcd_suspend_fail\n");
 		ufshcd_update_reg_hist(&hba->ufs_stats.suspend_err, (u32)ret);
+	}
 	return ret;
 }
 
@@ -9039,8 +9082,10 @@ static int ufshcd_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 		 * ufshcd_reset_and_restore() should have already
 		 * set the link state as active
 		 */
-		if (ret || !ufshcd_is_link_active(hba))
+		if (ret || !ufshcd_is_link_active(hba)) {
+			mi_memory_record_error(hba, "ufshcd_link_off_fail\n");
 			goto vendor_suspend;
+		}
 	}
 
 	if (!ufshcd_is_ufs_dev_active(hba)) {
@@ -9123,8 +9168,10 @@ disable_vreg:
 #endif
 out:
 	hba->pm_op_in_progress = 0;
-	if (ret)
+	if (ret) {
+		mi_memory_record_error(hba, "ufshcd_resume_fail\n");
 		ufshcd_update_reg_hist(&hba->ufs_stats.resume_err, (u32)ret);
+	}
 	return ret;
 }
 
@@ -9416,6 +9463,7 @@ int ufshcd_alloc_host(struct device *dev, struct ufs_hba **hba_handle)
 	hba = shost_priv(host);
 	hba->host = host;
 	hba->dev = dev;
+	mi_memory_error_init(hba);
 	*hba_handle = hba;
 	hba->dev_ref_clk_freq = REF_CLK_FREQ_INVAL;
 	hba->sg_entry_size = sizeof(struct ufshcd_sg_entry);

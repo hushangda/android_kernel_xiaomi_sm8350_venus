@@ -72,6 +72,7 @@
 #include "ufs.h"
 #include "ufs_quirks.h"
 #include "ufshci.h"
+#include "mi-memory.h"
 
 #define UFSHCD "ufshcd"
 #define UFSHCD_DRIVER_VERSION "0.2"
@@ -747,6 +748,10 @@ struct ufs_hba_variant_params {
  * @ksm: the keyslot manager tied to this hba
  */
 struct ufs_hba {
+#ifdef CONFIG_MI_MEMORY_SYSFS
+	struct mi_memory_errors mi_errors;
+	struct mi_memory *mi_memory;
+#endif
 	void __iomem *mmio_base;
 
 	/* Virtual memory reference */

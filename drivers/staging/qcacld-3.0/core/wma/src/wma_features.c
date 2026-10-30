@@ -26,6 +26,7 @@
 /* Header files */
 
 #include "cds_ieee80211_common.h"	/* ieee80211_frame */
+#include <linux/mi_cnss_statistic.h>
 #include "wma.h"
 #include "wma_api.h"
 #include "cds_api.h"
@@ -2085,7 +2086,8 @@ static void wma_log_pkt_icmpv6(uint8_t *data, uint32_t length)
 		 qdf_cpu_to_be16(pkt_len), qdf_cpu_to_be16(seq_num));
 }
 
-static void wma_log_pkt_ipv4(uint8_t *data, uint32_t length)
+static void wma_log_pkt_ipv4(uint8_t *data, uint32_t length,
+			     enum qdf_proto_subtype subtype)
 {
 	uint16_t pkt_len, src_port, dst_port;
 	char *ip_addr;
@@ -2106,9 +2108,12 @@ static void wma_log_pkt_ipv4(uint8_t *data, uint32_t length)
 		qdf_cpu_to_be16(pkt_len),
 		qdf_cpu_to_be16(src_port),
 		qdf_cpu_to_be16(dst_port));
+	cnss_statistic_wow_wakeup(subtype, qdf_cpu_to_be16(src_port),
+				  qdf_cpu_to_be16(dst_port));
 }
 
-static void wma_log_pkt_ipv6(uint8_t *data, uint32_t length)
+static void wma_log_pkt_ipv6(uint8_t *data, uint32_t length,
+			     enum qdf_proto_subtype subtype)
 {
 	uint16_t pkt_len, src_port, dst_port;
 	char *ip_addr;
@@ -2137,6 +2142,8 @@ static void wma_log_pkt_ipv6(uint8_t *data, uint32_t length)
 		 qdf_cpu_to_be16(pkt_len),
 		 qdf_cpu_to_be16(src_port),
 		 qdf_cpu_to_be16(dst_port));
+	cnss_statistic_wow_wakeup(subtype, qdf_cpu_to_be16(src_port),
+				  qdf_cpu_to_be16(dst_port));
 }
 
 static void wma_log_pkt_tcpv4(uint8_t *data, uint32_t length)
@@ -2225,6 +2232,8 @@ static void wma_wow_parse_data_pkt(t_wma_handle *wma,
 	case QDF_PROTO_EAPOL_M3:
 	case QDF_PROTO_EAPOL_M4:
 		wma_log_pkt_eapol(data, length);
+		if (length >= WMA_EAPOL_INFO_GET_MIN_LEN)
+			cnss_statistic_wow_wakeup(proto_subtype, 0, 0);
 		break;
 
 	case QDF_PROTO_DHCP_DISCOVER:
@@ -2236,6 +2245,8 @@ static void wma_wow_parse_data_pkt(t_wma_handle *wma,
 	case QDF_PROTO_DHCP_INFORM:
 	case QDF_PROTO_DHCP_DECLINE:
 		wma_log_pkt_dhcp(data, length);
+		if (length >= WMA_DHCP_INFO_GET_MIN_LEN)
+			cnss_statistic_wow_wakeup(proto_subtype, 0, 0);
 		break;
 
 	case QDF_PROTO_ICMP_REQ:
@@ -2243,6 +2254,8 @@ static void wma_wow_parse_data_pkt(t_wma_handle *wma,
 		wma_wow_inc_wake_lock_stats_by_protocol(wma, vdev_id,
 							proto_subtype);
 		wma_log_pkt_icmpv4(data, length);
+		if (length >= WMA_IPV4_PKT_INFO_GET_MIN_LEN)
+			cnss_statistic_wow_wakeup(proto_subtype, 0, 0);
 		break;
 
 	case QDF_PROTO_ICMPV6_REQ:
@@ -2254,21 +2267,23 @@ static void wma_wow_parse_data_pkt(t_wma_handle *wma,
 		wma_wow_inc_wake_lock_stats_by_protocol(wma, vdev_id,
 							proto_subtype);
 		wma_log_pkt_icmpv6(data, length);
+		if (length >= WMA_IPV6_PKT_INFO_GET_MIN_LEN)
+			cnss_statistic_wow_wakeup(proto_subtype, 0, 0);
 		break;
 
 	case QDF_PROTO_IPV4_UDP:
-		wma_log_pkt_ipv4(data, length);
+		wma_log_pkt_ipv4(data, length, proto_subtype);
 		break;
 	case QDF_PROTO_IPV4_TCP:
-		wma_log_pkt_ipv4(data, length);
+		wma_log_pkt_ipv4(data, length, proto_subtype);
 		wma_log_pkt_tcpv4(data, length);
 		break;
 
 	case QDF_PROTO_IPV6_UDP:
-		wma_log_pkt_ipv6(data, length);
+		wma_log_pkt_ipv6(data, length, proto_subtype);
 		break;
 	case QDF_PROTO_IPV6_TCP:
-		wma_log_pkt_ipv6(data, length);
+		wma_log_pkt_ipv6(data, length, proto_subtype);
 		wma_log_pkt_tcpv6(data, length);
 		break;
 	default:

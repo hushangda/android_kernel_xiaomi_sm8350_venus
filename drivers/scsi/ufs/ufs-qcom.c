@@ -3733,6 +3733,12 @@ static int ufs_qcom_probe(struct platform_device *pdev)
 	err = ufshcd_pltfrm_init(pdev, &ufs_hba_qcom_vops);
 	if (err)
 		dev_err(dev, "ufshcd_pltfrm_init() failed %d\n", err);
+	else {
+		int memory_err = mi_memory_register(platform_get_drvdata(pdev));
+
+		if (memory_err)
+			dev_err(dev, "mi_memory registration failed %d\n", memory_err);
+	}
 
 	return err;
 }
@@ -3751,6 +3757,7 @@ static int ufs_qcom_remove(struct platform_device *pdev)
 	struct qos_cpu_group *qcg = r->qcg;
 	int i;
 
+	mi_memory_unregister(hba);
 	pm_runtime_get_sync(&(pdev)->dev);
 	for (i = 0; i < r->num_groups; i++, qcg++)
 		remove_group_qos(qcg);

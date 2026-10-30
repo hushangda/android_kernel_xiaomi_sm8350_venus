@@ -2,6 +2,13 @@
 #
 # IP configuration
 #
+config MI_SLA
+	tristate "Xiaomi SLA traffic statistics"
+	depends on NETFILTER && PROC_FS && MMU
+	help
+	  Provide the /proc/sla control and shared traffic-statistics ABI
+	  required by the stock Xiaomi SLA daemon.
+
 config IP_MULTICAST
 	bool "IP: multicasting"
 	help

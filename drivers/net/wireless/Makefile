@@ -31,6 +31,7 @@ obj-$(CONFIG_MAC80211_HWSIM)	+= mac80211_hwsim.o
 obj-$(CONFIG_VIRT_WIFI)	+= virt_wifi.o
 
 obj-$(CONFIG_CNSS2) += cnss2/
+obj-$(CONFIG_MI_CNSS_STATISTIC) += mi_cnss_statistic.o
 obj-$(CONFIG_CNSS) += cnss/
 obj-$(CONFIG_CNSS_UTILS) += cnss_utils/
 obj-$(CONFIG_CNSS_GENL) += cnss_genl/

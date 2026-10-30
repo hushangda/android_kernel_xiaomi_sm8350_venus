@@ -18,6 +18,7 @@ struct i2c_dev {
 	// IRQ parameters
 	bool irq_enabled;
 	spinlock_t irq_enabled_lock;
+	u32 irq_count;
 	// NFC_IRQ wake-up state
 	bool irq_wake_up;
 };
