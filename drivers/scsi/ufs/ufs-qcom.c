@@ -422,9 +422,9 @@ static int ufs_qcom_check_hibern8(struct ufs_hba *hba)
 		dev_err(hba->dev, "%s: unable to get TX_FSM_STATE, err %d\n",
 				__func__, err);
 	} else if (tx_fsm_val != TX_FSM_HIBERN8) {
-		err = tx_fsm_val;
-		dev_err(hba->dev, "%s: invalid TX_FSM_STATE = %d\n",
-				__func__, err);
+		err = -ETIMEDOUT;
+		dev_err(hba->dev, "%s: invalid TX_FSM_STATE = %u\n",
+				__func__, tx_fsm_val);
 	}
 
 	return err;
@@ -454,14 +454,16 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
 	}
 
 	reenable_intr = hba->is_irq_enabled;
-	disable_irq(hba->irq);
-	hba->is_irq_enabled = false;
+	if (reenable_intr) {
+		disable_irq(hba->irq);
+		hba->is_irq_enabled = false;
+	}
 
 	ret = reset_control_assert(host->core_reset);
 	if (ret) {
 		dev_err(hba->dev, "%s: core_reset assert failed, err = %d\n",
 				 __func__, ret);
-		goto out;
+		goto out_restore_irq;
 	}
 
 	/*
@@ -478,6 +480,7 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
 
 	usleep_range(1000, 1100);
 
+out_restore_irq:
 	if (reenable_intr) {
 		enable_irq(hba->irq);
 		hba->is_irq_enabled = true;
@@ -538,9 +541,11 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 
 	/* Reset UFS Host Controller and PHY */
 	ret = ufs_qcom_host_reset(hba);
-	if (ret)
+	if (ret) {
 		dev_warn(hba->dev, "%s: host reset returned %d\n",
 				  __func__, ret);
+		goto out;
+	}
 
 	if (host->hw_ver.major < 0x4)
 		submode = UFS_QCOM_PHY_SUBMODE_NON_G4;
@@ -548,7 +553,12 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 	if (hba->limit_phy_submode == 0)
 		submode = UFS_QCOM_PHY_SUBMODE_NON_G4;
 #endif
-	phy_set_mode_ext(phy, mode, submode);
+	ret = phy_set_mode_ext(phy, mode, submode);
+	if (ret) {
+		dev_err(hba->dev, "%s: phy mode set failed, ret = %d\n",
+				__func__, ret);
+		goto out;
+	}
 
 	ret = ufs_qcom_phy_power_on(hba);
 	if (ret) {
@@ -661,13 +671,17 @@ static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
 	switch (status) {
 	case PRE_CHANGE:
 		ufs_qcom_force_mem_config(hba);
-		ufs_qcom_power_up_sequence(hba);
+		err = ufs_qcom_power_up_sequence(hba);
+		if (err)
+			goto out_disable_phy;
 		/*
 		 * The PHY PLL output is the source of tx/rx lane symbol
 		 * clocks, hence, enable the lane clocks only after PHY
 		 * is initialized.
 		 */
 		err = ufs_qcom_enable_lane_clks(host);
+		if (err)
+			goto out_disable_phy;
 		break;
 	case POST_CHANGE:
 		/* check if UFS PHY moved from DISABLED to HIBERN8 */
@@ -678,6 +692,14 @@ static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
 		err = -EINVAL;
 		break;
 	}
+	return err;
+
+out_disable_phy:
+	/* Lane clocks are sourced by the PHY; release them before powering off. */
+	ufs_qcom_disable_lane_clks(host);
+	if (ufs_qcom_phy_power_off(hba))
+		dev_err(hba->dev, "%s: PHY power off failed during HCE unwind\n",
+			__func__);
 	return err;
 }
 

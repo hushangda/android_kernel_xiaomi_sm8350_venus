@@ -208,6 +208,7 @@ static inline int __msm_dma_map_sg(struct device *dev, struct scatterlist *sg,
 
 		iommu_map->sgl = clone_sgl(sg, nents);
 		if (!iommu_map->sgl) {
+			dma_unmap_sg_attrs(dev, sg, nents, dir, attrs);
 			kfree(iommu_map);
 			ret = -ENOMEM;
 			goto out_unlock;
@@ -273,6 +274,7 @@ static inline int __msm_dma_map_sg(struct device *dev, struct scatterlist *sg,
 				iommu_map->nents, attrs, iommu_map->attrs,
 				start_diff);
 			ret = -EINVAL;
+			goto out_unlock;
 		}
 	}
 	mutex_unlock(&iommu_meta->lock);

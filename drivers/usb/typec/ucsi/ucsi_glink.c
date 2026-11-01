@@ -29,9 +29,6 @@
 #define UC_UCSI_USBC_NOTIFY_IND		0x13
 #define UC_UCSI_NOTIFY_SWAP_ROLE	0x14
 
-static u64 pr_cmd;
-static u64 dr_cmd;
-
 /* Generic definitions */
 #define CMD_PENDING			1
 #define UCSI_LOG_BUF_SIZE		256
@@ -83,6 +80,11 @@ struct ucsi_dev {
 	struct mutex			write_lock;
 	struct mutex			notify_lock;
 	struct mutex			state_lock;
+	struct mutex			transition_lock;
+	bool				removing;
+	bool				ready;
+	u64				pr_cmd;
+	u64				dr_cmd;
 	struct ucsi_read_buf_resp_msg	rx_buf;
 	unsigned long			flags;
 	atomic_t			rx_valid;
@@ -250,53 +252,67 @@ static int handle_ucsi_notify_swap_role(struct ucsi_dev *udev, void *data, size_
 {
 	struct ucsi_notify_ind_msg *msg_ptr;
 	u32 cmd;
-	int target_pr = 0;
-	int target_dr = 0;
+	int target_pr, target_dr;
 
 	if (len != sizeof(*msg_ptr)) {
-		pr_err("Incorrect received length %zu expected %u\n", len, sizeof(*msg_ptr));
+		pr_err("Incorrect received length %zu expected %u\n", len,
+			sizeof(*msg_ptr));
 		return -EINVAL;
+	}
+
+	mutex_lock(&udev->state_lock);
+	if (udev->removing || !udev->ready ||
+	    atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		mutex_unlock(&udev->state_lock);
+		return -ENOTCONN;
 	}
 
 	msg_ptr = data;
 	cmd = msg_ptr->notification;
-
 	target_pr = UCSI_CMD_PR(cmd);
-	pr_cmd = UCSI_SET_PDR | UCSI_CONNECTOR_NUMBER(1);
-	pr_cmd |= UCSI_SET_PDR_ROLE(target_pr);
-	pr_cmd |= UCSI_SET_PDR_ACCEPT_ROLE_SWAPS;
-
 	target_dr = UCSI_CMD_DR(cmd);
-	dr_cmd = UCSI_SET_UOR | UCSI_CONNECTOR_NUMBER(1);
-	dr_cmd |= UCSI_SET_UOR_ROLE(target_dr);
-	dr_cmd |= UCSI_SET_UOR_ACCEPT_ROLE_SWAPS;
+	udev->pr_cmd = UCSI_SET_PDR | UCSI_CONNECTOR_NUMBER(1) |
+		UCSI_SET_PDR_ROLE(target_pr) | UCSI_SET_PDR_ACCEPT_ROLE_SWAPS;
+	udev->dr_cmd = UCSI_SET_UOR | UCSI_CONNECTOR_NUMBER(1) |
+		UCSI_SET_UOR_ROLE(target_dr) | UCSI_SET_UOR_ACCEPT_ROLE_SWAPS;
 
-	pr_info("MI SMART INTERCHG, cmd = 0x%08x, target_pr = %d, target_dr = %d\n", cmd, target_pr, target_dr);
+	pr_info("MI SMART INTERCHG, cmd = 0x%08x, target_pr = %d, target_dr = %d\n",
+		cmd, target_pr, target_dr);
 	schedule_work(&udev->swap_role_work);
-
+	mutex_unlock(&udev->state_lock);
 	return 0;
 }
 
 static void swap_role_work_func(struct work_struct *work)
 {
 	struct ucsi_dev *udev = container_of(work, struct ucsi_dev, swap_role_work);
-	int ret = 0;
+	struct ucsi *ucsi;
+	u64 pr_cmd, dr_cmd;
+	int ret;
 
-	if (!udev || !udev->ucsi)
+	mutex_lock(&udev->state_lock);
+	if (udev->removing || !udev->ready ||
+	    atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		mutex_unlock(&udev->state_lock);
 		return;
+	}
+	ucsi = udev->ucsi;
+	pr_cmd = udev->pr_cmd;
+	dr_cmd = udev->dr_cmd;
+	mutex_unlock(&udev->state_lock);
 
-	ret = ucsi_send_command(udev->ucsi, pr_cmd, NULL, 0);
+	/* DOWN/remove close the enqueue gate and drain us before destroying ucsi. */
+	ret = ucsi_send_command(ucsi, pr_cmd, NULL, 0);
 	if (ret)
 		return;
-	else
-		pr_info("MI SMART INTERCHG, sucess to swap power role to sink\n");
+	pr_info("MI SMART INTERCHG, sucess to swap power role to sink\n");
 
 	msleep(100);
-
-	ret = ucsi_send_command(udev->ucsi, dr_cmd, NULL, 0);
-	if (ret)
+	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
 		return;
-	else
+
+	ret = ucsi_send_command(ucsi, dr_cmd, NULL, 0);
+	if (!ret)
 		pr_info("MI SMART INTERCHG, sucess to swap data role to device\n");
 }
 
@@ -346,7 +362,7 @@ static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
 		return -EINVAL;
 
 	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
-		return 0;
+		return -ENOTCONN;
 
 	ucsi_buf.hdr.owner = MSG_OWNER_UC;
 	ucsi_buf.hdr.type = MSG_TYPE_REQ_RESP;
@@ -354,6 +370,12 @@ static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
 	memcpy(&ucsi_buf.buf[offset], val, val_len);
 
 	mutex_lock(&udev->write_lock);
+	mutex_lock(&udev->state_lock);
+	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		mutex_unlock(&udev->state_lock);
+		rc = -ENOTCONN;
+		goto out;
+	}
 	pr_debug("%s write\n", sync ? "sync" : "async");
 	reinit_completion(&udev->write_ack);
 
@@ -361,6 +383,7 @@ static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
 		set_bit(CMD_PENDING, &udev->flags);
 		reinit_completion(&udev->sync_write_ack);
 	}
+	mutex_unlock(&udev->state_lock);
 
 	ucsi_log(sync ? "sync_write:" : "async_write:", offset,
 			(u8 *)val, val_len);
@@ -374,6 +397,10 @@ static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
 
 	rc = wait_for_completion_timeout(&udev->write_ack,
 				msecs_to_jiffies(UCSI_WAIT_TIME_MS));
+	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		rc = -ENOTCONN;
+		goto out;
+	}
 	if (!rc) {
 		pr_err("timed out\n");
 		rc = -ETIMEDOUT;
@@ -385,6 +412,10 @@ static int ucsi_qti_glink_write(struct ucsi_dev *udev, unsigned int offset,
 	if (sync) {
 		rc = wait_for_completion_timeout(&udev->sync_write_ack,
 					msecs_to_jiffies(UCSI_WAIT_TIME_MS));
+		if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+			rc = -ENOTCONN;
+			goto out;
+		}
 		if (!rc) {
 			pr_err("timed out for sync_write_ack\n");
 			rc = -ETIMEDOUT;
@@ -504,7 +535,7 @@ static int ucsi_qti_read(struct ucsi *ucsi, unsigned int offset,
 		return -EINVAL;
 
 	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN)
-		return 0;
+		return -ENOTCONN;
 
 	ucsi_buf.hdr.owner = MSG_OWNER_UC;
 	ucsi_buf.hdr.type = MSG_TYPE_REQ_RESP;
@@ -513,7 +544,14 @@ static int ucsi_qti_read(struct ucsi *ucsi, unsigned int offset,
 	mutex_lock(&udev->read_lock);
 
 	pr_debug("read offset %s len %u\n", offset_to_name(offset), val_len);
+	mutex_lock(&udev->state_lock);
+	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		mutex_unlock(&udev->state_lock);
+		rc = -ENOTCONN;
+		goto out;
+	}
 	reinit_completion(&udev->read_ack);
+	mutex_unlock(&udev->state_lock);
 	rc = pmic_glink_write(udev->client, &ucsi_buf,
 					sizeof(ucsi_buf));
 	if (rc < 0) {
@@ -523,6 +561,10 @@ static int ucsi_qti_read(struct ucsi *ucsi, unsigned int offset,
 
 	rc = wait_for_completion_timeout(&udev->read_ack,
 				msecs_to_jiffies(UCSI_WAIT_TIME_MS));
+	if (atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		rc = -ENOTCONN;
+		goto out;
+	}
 	if (!rc) {
 		pr_err("timed out\n");
 		rc = -ETIMEDOUT;
@@ -555,36 +597,44 @@ static const struct ucsi_operations ucsi_qti_ops = {
 
 static int ucsi_setup(struct ucsi_dev *udev)
 {
+	struct ucsi *ucsi;
 	int rc;
 
+	mutex_lock(&udev->state_lock);
+	if (udev->removing ||
+	    atomic_read(&udev->state) == PMIC_GLINK_STATE_DOWN) {
+		mutex_unlock(&udev->state_lock);
+		return -ENOTCONN;
+	}
 	if (udev->ucsi) {
-		dev_err(udev->dev, "ucsi is not NULL\n");
-		return -EINVAL;
+		mutex_unlock(&udev->state_lock);
+		return 0;
 	}
 
-	mutex_lock(&udev->state_lock);
-	udev->ucsi = ucsi_create(udev->dev, &ucsi_qti_ops);
-	if (IS_ERR(udev->ucsi)) {
-		rc = PTR_ERR(udev->ucsi);
-		dev_err(udev->dev, "ucsi_create failed rc=%d\n", rc);
-		udev->ucsi = NULL;
+	ucsi = ucsi_create(udev->dev, &ucsi_qti_ops);
+	if (IS_ERR(ucsi)) {
+		rc = PTR_ERR(ucsi);
 		mutex_unlock(&udev->state_lock);
+		dev_err(udev->dev, "ucsi_create failed rc=%d\n", rc);
 		return rc;
 	}
+	ucsi_set_drvdata(ucsi, udev);
+	udev->ucsi = ucsi;
+	mutex_unlock(&udev->state_lock);
 
-	ucsi_set_drvdata(udev->ucsi, udev);
-
-	rc = ucsi_register(udev->ucsi);
+	/* Register may wait for RX; callbacks must be able to take state_lock. */
+	rc = ucsi_register(ucsi);
+	mutex_lock(&udev->state_lock);
+	if (rc)
+		udev->ucsi = NULL;
+	else if (atomic_read(&udev->state) == PMIC_GLINK_STATE_UP)
+		udev->ready = true;
+	mutex_unlock(&udev->state_lock);
 	if (rc) {
 		dev_err(udev->dev, "ucsi_register failed rc=%d\n", rc);
-		ucsi_destroy(udev->ucsi);
-		udev->ucsi = NULL;
-		mutex_unlock(&udev->state_lock);
-		return rc;
+		ucsi_destroy(ucsi);
 	}
-
-	mutex_unlock(&udev->state_lock);
-	return 0;
+	return rc;
 }
 
 static void ucsi_qti_setup_work(struct work_struct *work)
@@ -595,34 +645,68 @@ static void ucsi_qti_setup_work(struct work_struct *work)
 	ucsi_setup(udev);
 }
 
+/* Called with transition_lock held and the state/queue gate already DOWN. */
+static void ucsi_qti_stop(struct ucsi_dev *udev)
+{
+	struct ucsi *ucsi;
+
+	/* Release commands waiting for a remote which may never answer. */
+	complete_all(&udev->read_ack);
+	complete_all(&udev->write_ack);
+	complete_all(&udev->sync_write_ack);
+	cancel_work_sync(&udev->setup_work);
+	cancel_work_sync(&udev->swap_role_work);
+
+	mutex_lock(&udev->state_lock);
+	ucsi = udev->ucsi;
+	udev->ucsi = NULL;
+	mutex_unlock(&udev->state_lock);
+	if (ucsi) {
+		/* These waits must not block RX callbacks on state_lock. */
+		ucsi_unregister(ucsi);
+		ucsi_destroy(ucsi);
+	}
+	/* Internal UCSI work can queue this until unregister has completed. */
+	cancel_work_sync(&udev->notify_work);
+	atomic_set(&udev->rx_valid, 0);
+	clear_bit(CONN_STAT_REQD, &udev->cmd_requested_flags);
+}
+
 static void ucsi_qti_state_cb(void *priv, enum pmic_glink_state state)
 {
 	struct ucsi_dev *udev = priv;
 
 	dev_dbg(udev->dev, "state: %d\n", state);
-
+	mutex_lock(&udev->transition_lock);
 	mutex_lock(&udev->state_lock);
-	atomic_set(&udev->state, state);
-
-	switch (state) {
-	case PMIC_GLINK_STATE_DOWN:
-		if (!udev->ucsi) {
-			dev_err(udev->dev, "ucsi is NULL\n");
-			mutex_unlock(&udev->state_lock);
-			return;
-		}
-
-		ucsi_unregister(udev->ucsi);
-		ucsi_destroy(udev->ucsi);
-		udev->ucsi = NULL;
-		break;
-	case PMIC_GLINK_STATE_UP:
-		schedule_work(&udev->setup_work);
-		break;
-	default:
-		break;
+	if (udev->removing) {
+		mutex_unlock(&udev->state_lock);
+		mutex_unlock(&udev->transition_lock);
+		return;
 	}
+	atomic_set(&udev->state, state);
+	if (state == PMIC_GLINK_STATE_DOWN)
+		udev->ready = false;
+	else if (state == PMIC_GLINK_STATE_UP)
+		schedule_work(&udev->setup_work);
 	mutex_unlock(&udev->state_lock);
+
+	if (state == PMIC_GLINK_STATE_DOWN)
+		ucsi_qti_stop(udev);
+	mutex_unlock(&udev->transition_lock);
+}
+
+static void ucsi_qti_shutdown(struct ucsi_dev *udev)
+{
+	mutex_lock(&udev->transition_lock);
+	mutex_lock(&udev->state_lock);
+	udev->removing = true;
+	udev->ready = false;
+	atomic_set(&udev->state, PMIC_GLINK_STATE_DOWN);
+	mutex_unlock(&udev->state_lock);
+	ucsi_qti_stop(udev);
+	mutex_unlock(&udev->transition_lock);
+	/* Unregister below may wait for a state callback taking transition_lock. */
 }
 
 static int ucsi_probe(struct platform_device *pdev)
@@ -643,6 +727,7 @@ static int ucsi_probe(struct platform_device *pdev)
 	mutex_init(&udev->write_lock);
 	mutex_init(&udev->notify_lock);
 	mutex_init(&udev->state_lock);
+	mutex_init(&udev->transition_lock);
 	init_completion(&udev->read_ack);
 	init_completion(&udev->write_ack);
 	init_completion(&udev->sync_write_ack);
@@ -655,12 +740,16 @@ static int ucsi_probe(struct platform_device *pdev)
 	client_data.priv = udev;
 	client_data.state_cb = ucsi_qti_state_cb;
 
+	udev->dev = dev;
+	/* Do not expose a partially initialized transport to state callbacks. */
+	mutex_lock(&udev->transition_lock);
 	udev->client = pmic_glink_register_client(dev, &client_data);
 	if (IS_ERR(udev->client)) {
 		rc = PTR_ERR(udev->client);
 		if (rc != -EPROBE_DEFER)
 			dev_err(dev, "Error in registering with pmic_glink rc=%d\n",
 				rc);
+		mutex_unlock(&udev->transition_lock);
 		return rc;
 	}
 
@@ -672,10 +761,12 @@ static int ucsi_probe(struct platform_device *pdev)
 		dev_warn(dev, "Error in creating ipc_log_context\n");
 
 	rc = ucsi_setup(udev);
+	mutex_unlock(&udev->transition_lock);
 	if (rc) {
+		ucsi_qti_shutdown(udev);
+		pmic_glink_unregister_client(udev->client);
 		ipc_log_context_destroy(ucsi_ipc_log);
 		ucsi_ipc_log = NULL;
-		pmic_glink_unregister_client(udev->client);
 	}
 
 	return rc;
@@ -687,11 +778,7 @@ static int ucsi_remove(struct platform_device *pdev)
 	struct ucsi_dev *udev = dev_get_drvdata(dev);
 	int rc;
 
-	cancel_work_sync(&udev->notify_work);
-	cancel_work_sync(&udev->swap_role_work);
-	ucsi_unregister(udev->ucsi);
-	ucsi_destroy(udev->ucsi);
-
+	ucsi_qti_shutdown(udev);
 	rc = pmic_glink_unregister_client(udev->client);
 	if (rc < 0)
 		dev_err(dev, "pmic_glink_unregister_client failed rc=%d\n",

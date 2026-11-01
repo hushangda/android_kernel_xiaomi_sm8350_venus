@@ -2284,6 +2284,13 @@ end:
 }
 
 
+static int __cam_isp_ctx_buf_done_in_sof(struct cam_isp_context *ctx_isp,
+	void *evt_data)
+{
+	return __cam_isp_ctx_handle_buf_done_in_activated_state(ctx_isp,
+		evt_data, 0);
+}
+
 static int __cam_isp_ctx_buf_done_in_applied(struct cam_isp_context *ctx_isp,
 	void *evt_data)
 {
@@ -3035,7 +3042,7 @@ static struct cam_isp_ctx_irq_ops
 			__cam_isp_ctx_reg_upd_in_sof,
 			__cam_isp_ctx_notify_sof_in_activated_state,
 			__cam_isp_ctx_notify_eof_in_activated_state,
-			NULL,
+			__cam_isp_ctx_buf_done_in_sof,
 		},
 	},
 	/* APPLIED */

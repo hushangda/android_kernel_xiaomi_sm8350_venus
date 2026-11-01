@@ -474,29 +474,35 @@ struct spmi_pmic_arb_qpnpint_type {
 } __packed;
 
 /* Simplified accessor functions for irqchip callbacks */
-static void qpnpint_spmi_write(struct irq_data *d, u8 reg, void *buf,
+static int qpnpint_spmi_write(struct irq_data *d, u8 reg, void *buf,
 			       size_t len)
 {
 	struct spmi_pmic_arb *pmic_arb = irq_data_get_irq_chip_data(d);
 	u8 sid = hwirq_to_sid(d->hwirq);
 	u8 per = hwirq_to_per(d->hwirq);
+	int rc;
 
-	if (pmic_arb_write_cmd(pmic_arb->spmic, SPMI_CMD_EXT_WRITEL, sid,
-			       (per << 8) + reg, buf, len))
+	rc = pmic_arb_write_cmd(pmic_arb->spmic, SPMI_CMD_EXT_WRITEL, sid,
+			       (per << 8) + reg, buf, len);
+	if (rc)
 		dev_err_ratelimited(&pmic_arb->spmic->dev, "failed irqchip transaction on %x\n",
 				    d->irq);
+	return rc;
 }
 
-static void qpnpint_spmi_read(struct irq_data *d, u8 reg, void *buf, size_t len)
+static int qpnpint_spmi_read(struct irq_data *d, u8 reg, void *buf, size_t len)
 {
 	struct spmi_pmic_arb *pmic_arb = irq_data_get_irq_chip_data(d);
 	u8 sid = hwirq_to_sid(d->hwirq);
 	u8 per = hwirq_to_per(d->hwirq);
+	int rc;
 
-	if (pmic_arb_read_cmd(pmic_arb->spmic, SPMI_CMD_EXT_READL, sid,
-			      (per << 8) + reg, buf, len))
+	rc = pmic_arb_read_cmd(pmic_arb->spmic, SPMI_CMD_EXT_READL, sid,
+			      (per << 8) + reg, buf, len);
+	if (rc)
 		dev_err_ratelimited(&pmic_arb->spmic->dev, "failed irqchip transaction on %x\n",
 				    d->irq);
+	return rc;
 }
 
 static void cleanup_irq(struct spmi_pmic_arb *pmic_arb, u16 apid, int id)
@@ -623,13 +629,14 @@ static void qpnpint_irq_unmask(struct irq_data *d)
 	const struct pmic_arb_ver_ops *ver_ops = pmic_arb->ver_ops;
 	u8 irq = hwirq_to_irq(d->hwirq);
 	u16 apid = hwirq_to_apid(d->hwirq);
-	u8 buf[2];
+	u8 buf[2] = { 0 };
+	int rc;
 
 	writel_relaxed(SPMI_PIC_ACC_ENABLE_BIT,
 			ver_ops->acc_enable(pmic_arb, apid));
 
-	qpnpint_spmi_read(d, QPNPINT_REG_EN_SET, &buf[0], 1);
-	if (!(buf[0] & BIT(irq))) {
+	rc = qpnpint_spmi_read(d, QPNPINT_REG_EN_SET, &buf[0], 1);
+	if (rc || !(buf[0] & BIT(irq))) {
 		/*
 		 * Since the interrupt is currently disabled, write to both the
 		 * LATCHED_CLR and EN_SET registers so that a spurious interrupt
@@ -637,7 +644,14 @@ static void qpnpint_irq_unmask(struct irq_data *d)
 		 */
 		buf[0] = BIT(irq);
 		buf[1] = BIT(irq);
-		qpnpint_spmi_write(d, QPNPINT_REG_LATCHED_CLR, &buf, 2);
+		rc = qpnpint_spmi_write(d, QPNPINT_REG_LATCHED_CLR, buf, 2);
+		/*
+		 * The IRQ core cannot receive an error from irq_unmask. Retry
+		 * enabling once if the combined write failed. Do not clear a
+		 * newly latched interrupt again if the first write partly ran.
+		 */
+		if (rc)
+			qpnpint_spmi_write(d, QPNPINT_REG_EN_SET, &buf[1], 1);
 	}
 }
 
@@ -646,8 +660,11 @@ static int qpnpint_irq_set_type(struct irq_data *d, unsigned int flow_type)
 	struct spmi_pmic_arb_qpnpint_type type;
 	irq_flow_handler_t flow_handler;
 	u8 irq = hwirq_to_irq(d->hwirq);
+	int rc;
 
-	qpnpint_spmi_read(d, QPNPINT_REG_SET_TYPE, &type, sizeof(type));
+	rc = qpnpint_spmi_read(d, QPNPINT_REG_SET_TYPE, &type, sizeof(type));
+	if (rc)
+		return rc;
 
 	if (flow_type & (IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING)) {
 		type.type |= BIT(irq);
@@ -678,7 +695,9 @@ static int qpnpint_irq_set_type(struct irq_data *d, unsigned int flow_type)
 		flow_handler = handle_level_irq;
 	}
 
-	qpnpint_spmi_write(d, QPNPINT_REG_SET_TYPE, &type, sizeof(type));
+	rc = qpnpint_spmi_write(d, QPNPINT_REG_SET_TYPE, &type, sizeof(type));
+	if (rc)
+		return rc;
 	irq_set_handler_locked(d, flow_handler);
 
 	return 0;
@@ -697,11 +716,14 @@ static int qpnpint_get_irqchip_state(struct irq_data *d,
 {
 	u8 irq = hwirq_to_irq(d->hwirq);
 	u8 status = 0;
+	int rc;
 
 	if (which != IRQCHIP_STATE_LINE_LEVEL)
 		return -EINVAL;
 
-	qpnpint_spmi_read(d, QPNPINT_REG_RT_STS, &status, 1);
+	rc = qpnpint_spmi_read(d, QPNPINT_REG_RT_STS, &status, 1);
+	if (rc)
+		return rc;
 	*state = !!(status & BIT(irq));
 
 	return 0;
@@ -716,6 +738,7 @@ static int qpnpint_irq_domain_activate(struct irq_domain *domain,
 	u16 sid = hwirq_to_sid(d->hwirq);
 	u16 irq = hwirq_to_irq(d->hwirq);
 	u8 buf;
+	int rc;
 
 	if (pmic_arb->apid_data[apid].irq_ee != pmic_arb->ee) {
 		dev_err(&pmic_arb->spmic->dev, "failed to xlate sid = %#x, periph = %#x, irq = %u: ee=%u but owner=%u\n",
@@ -728,14 +751,18 @@ static int qpnpint_irq_domain_activate(struct irq_domain *domain,
 	 * Make sure the interrupt is assigned to primary SOC by writing the
 	 * MID value to MID_SEL register.
 	 */
-	if (pmic_arb->mid != EINVAL)
-		qpnpint_spmi_write(d, QPNPINT_REG_MID_SEL, &pmic_arb->mid, 1);
+	if (pmic_arb->mid != EINVAL) {
+		rc = qpnpint_spmi_write(d, QPNPINT_REG_MID_SEL, &pmic_arb->mid, 1);
+		if (rc)
+			return rc;
+	}
 
 	buf = BIT(irq);
-	qpnpint_spmi_write(d, QPNPINT_REG_EN_CLR, &buf, 1);
-	qpnpint_spmi_write(d, QPNPINT_REG_LATCHED_CLR, &buf, 1);
+	rc = qpnpint_spmi_write(d, QPNPINT_REG_EN_CLR, &buf, 1);
+	if (rc)
+		return rc;
 
-	return 0;
+	return qpnpint_spmi_write(d, QPNPINT_REG_LATCHED_CLR, &buf, 1);
 }
 
 static struct irq_chip pmic_arb_irqchip = {

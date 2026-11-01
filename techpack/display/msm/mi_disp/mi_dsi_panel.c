@@ -202,9 +202,17 @@ bool is_backlight_set_skip(struct dsi_panel *panel, u32 bl_lvl)
 			DSI_INFO("%s panel skip set backlight %d due to DC on\n", panel->type, bl_lvl);
 			return true;
 		}
-	} else if ((panel->mi_cfg.panel_id == 0x4B394400360200
+	} else if ((panel->mi_cfg.panel_id == 0x4A3200380800 ||
+			panel->mi_cfg.panel_id == 0x4B394400360200
                    || panel->mi_cfg.panel_id == 0x4B394400420d00 || panel->mi_cfg.panel_id == 0x4D323000360200)
 			&& !panel->mi_cfg.bl_enable) {
+		return true;
+	}
+	if (panel->mi_cfg.panel_id == 0x4A3200380800 &&
+		panel->mi_cfg.brightness_clone <= 4095 &&
+		panel->mi_cfg.feature_val[DISP_FEATURE_HBM] == FEATURE_ON) {
+		DSI_INFO("%s panel skip set backlight %d due to HBM on\n",
+			panel->type, bl_lvl);
 		return true;
 	}
 	return false;
@@ -2061,7 +2069,8 @@ void mi_dsi_panel_update_last_bl_level(struct dsi_panel *panel, int brightness)
 	mi_cfg = &panel->mi_cfg;
 
 	if ((mi_cfg->last_bl_level == 0 || mi_cfg->dimming_state == STATE_DIM_RESTORE) &&
-		brightness > 0 && !is_hbm_fod_on(panel)) {
+		brightness > 0 && !is_hbm_fod_on(panel) &&
+		panel->power_mode == SDE_MODE_DPMS_ON) {
 		disp_id = mi_get_disp_id(display);
 		mi_disp_set_dimming_queue_delayed_work(&df->d_display[disp_id], panel);
 

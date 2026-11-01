@@ -457,13 +457,15 @@ out:
 		if (data >= IOPRIO_BE_NR || data < 0)
 			return -EINVAL;
 
+		mutex_lock(&sbi->critical_task_lock);
 		cprc->ckpt_thread_ioprio = IOPRIO_PRIO_VALUE(class, data);
-		if (test_opt(sbi, MERGE_CHECKPOINT)) {
+		if (cprc->f2fs_issue_ckpt) {
 			ret = set_task_ioprio(cprc->f2fs_issue_ckpt,
 					cprc->ckpt_thread_ioprio);
-			if (ret)
-				return ret;
 		}
+		mutex_unlock(&sbi->critical_task_lock);
+		if (ret)
+			return ret;
 
 		return count;
 	}
@@ -725,6 +727,7 @@ out:
 			return -EINVAL;
 		if (!capable(CAP_SYS_NICE))
 			return -EPERM;
+		mutex_lock(&sbi->critical_task_lock);
 		sbi->critical_task_priority = t;
 		if (sbi->cprc_info.f2fs_issue_ckpt)
 			set_user_nice(sbi->cprc_info.f2fs_issue_ckpt,
@@ -732,6 +735,7 @@ out:
 		if (sbi->gc_thread && sbi->gc_thread->f2fs_gc_task)
 			set_user_nice(sbi->gc_thread->f2fs_gc_task,
 				PRIO_TO_NICE(sbi->critical_task_priority));
+		mutex_unlock(&sbi->critical_task_lock);
 		return count;
 	}
 
@@ -788,7 +792,11 @@ static ssize_t f2fs_sbi_store(struct f2fs_attr *a,
 		if (!down_read_trylock(&sbi->sb->s_umount))
 			return -EAGAIN;
 	}
+	if (gc_entry)
+		mutex_lock(&sbi->critical_task_lock);
 	ret = __sbi_store(a, sbi, buf, count);
+	if (gc_entry)
+		mutex_unlock(&sbi->critical_task_lock);
 	if (gc_entry)
 		up_read(&sbi->sb->s_umount);
 
@@ -802,7 +810,14 @@ static ssize_t f2fs_attr_show(struct kobject *kobj,
 								s_kobj);
 	struct f2fs_attr *a = container_of(attr, struct f2fs_attr, attr);
 
-	return a->show ? a->show(a, sbi, buf) : 0;
+	ssize_t ret;
+
+	if (a->struct_type == GC_THREAD)
+		mutex_lock(&sbi->critical_task_lock);
+	ret = a->show ? a->show(a, sbi, buf) : 0;
+	if (a->struct_type == GC_THREAD)
+		mutex_unlock(&sbi->critical_task_lock);
+	return ret;
 }
 
 static ssize_t f2fs_attr_store(struct kobject *kobj, struct attribute *attr,

@@ -212,6 +212,7 @@ static int __replace_atomic_write_block(struct inode *inode, pgoff_t index,
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct dnode_of_data dn;
 	struct node_info ni;
+	block_t prev_addr;
 	int err;
 
 retry:
@@ -231,6 +232,7 @@ retry:
 		return err;
 	}
 
+	prev_addr = dn.data_blkaddr;
 	if (recover) {
 		/* dn.data_blkaddr is always valid */
 		if (!__is_valid_data_blkaddr(new_addr)) {
@@ -245,7 +247,7 @@ retry:
 	} else {
 		blkcnt_t count = 1;
 
-		*old_addr = dn.data_blkaddr;
+		*old_addr = prev_addr;
 		f2fs_truncate_data_blocks_range(&dn, 1);
 		dec_valid_block_count(sbi, F2FS_I(inode)->cow_inode, count);
 		inc_valid_block_count(sbi, inode, &count);
@@ -256,7 +258,7 @@ retry:
 	f2fs_put_dnode(&dn);
 
 	trace_f2fs_replace_atomic_write_block(inode, F2FS_I(inode)->cow_inode,
-					index, *old_addr, new_addr, recover);
+					index, prev_addr, new_addr, recover);
 	return 0;
 }
 

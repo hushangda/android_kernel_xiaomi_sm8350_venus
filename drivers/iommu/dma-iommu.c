@@ -533,7 +533,15 @@ static void __iommu_dma_unmap(struct device *dev, dma_addr_t dma_addr,
 	iommu_iotlb_gather_init(&iotlb_gather);
 
 	unmapped = iommu_unmap_fast(domain, dma_addr, size, &iotlb_gather);
-	WARN_ON(unmapped != size);
+	if (WARN_ON(unmapped != size)) {
+		/*
+		 * Complete any partial invalidation, but retain the entire IOVA
+		 * allocation until domain teardown. The DMA API cannot report an
+		 * unmap failure; recycling a range with live PTEs is not safe.
+		 */
+		iommu_tlb_sync(domain, &iotlb_gather);
+		return;
+	}
 
 	if (!cookie->fq_domain)
 		iommu_tlb_sync(domain, &iotlb_gather);

@@ -72,7 +72,6 @@
 
 #define N_SPI_MINORS			32	/* ... up to 256 */
 
-
 #define GF_VDD_SUPPLY			"l11c_vdd"
 #define GF_VDD_ACTIVE_LOAD_UA		200000
 #define GF_VDD_IDLE_LOAD_UA		0
@@ -80,67 +79,30 @@
 static int gf_regulator_init(struct gf_dev *gf_dev)
 {
 	struct device *dev = &gf_dev->spi->dev;
-	int disable_rc;
 	int rc;
 
 	mutex_init(&gf_dev->power_lock);
 	gf_dev->power_enabled = false;
-
 	gf_dev->vdd = devm_regulator_get(dev, GF_VDD_SUPPLY);
 	if (IS_ERR(gf_dev->vdd)) {
 		rc = PTR_ERR(gf_dev->vdd);
 		gf_dev->vdd = NULL;
-		dev_err(dev, "failed to get %s regulator: %d\n",
-			GF_VDD_SUPPLY, rc);
 		return rc;
 	}
-
-	/*
-	 * Keep the rail enabled for the lifetime of the driver.  Goodix keeps
-	 * calibration state across idle/DOZE, so removing the rail here breaks
-	 * the next capture.  The load vote, not the enable state, is used to
-	 * move the RPMh regulator out of HPM while the sensor is idle.
-	 */
-	/* Start with an explicit HPM vote so enable applies a known mode. */
+	/* Original Venus driver: fixed 3 V and 200 mA load vote at probe. */
+	rc = regulator_set_voltage(gf_dev->vdd, 3000000, 3000000);
+	if (rc)
+		return rc;
 	rc = regulator_set_load(gf_dev->vdd, GF_VDD_ACTIVE_LOAD_UA);
 	if (rc)
 		return rc;
-
 	rc = regulator_enable(gf_dev->vdd);
 	if (rc) {
 		regulator_set_load(gf_dev->vdd, GF_VDD_IDLE_LOAD_UA);
 		return rc;
 	}
-
 	gf_dev->power_enabled = true;
-	/* A non-zero to zero transition makes RPMh DRMS select LPM now. */
-	rc = regulator_set_load(gf_dev->vdd, GF_VDD_IDLE_LOAD_UA);
-	if (rc) {
-		disable_rc = regulator_disable(gf_dev->vdd);
-		if (!disable_rc)
-			gf_dev->power_enabled = false;
-		regulator_set_load(gf_dev->vdd, GF_VDD_IDLE_LOAD_UA);
-		return rc;
-	}
-
 	return 0;
-}
-
-static int gf_regulator_set_active(struct gf_dev *gf_dev, bool active)
-{
-	int load_uA = active ? GF_VDD_ACTIVE_LOAD_UA : GF_VDD_IDLE_LOAD_UA;
-	int rc;
-
-	mutex_lock(&gf_dev->power_lock);
-	if (!gf_dev->vdd || !gf_dev->power_enabled) {
-		rc = -ENODEV;
-		goto out;
-	}
-
-	rc = regulator_set_load(gf_dev->vdd, load_uA);
-out:
-	mutex_unlock(&gf_dev->power_lock);
-	return rc;
 }
 
 static int gf_regulator_exit(struct gf_dev *gf_dev)
@@ -167,27 +129,6 @@ out:
 	return rc ? rc : load_rc;
 }
 
-static int gf_sensor_power_on(struct gf_dev *gf_dev)
-{
-	int rc;
-
-	rc = gf_regulator_set_active(gf_dev, true);
-	if (rc)
-		return rc;
-
-	rc = gf_power_on(gf_dev);
-	if (rc)
-		gf_regulator_set_active(gf_dev, false);
-
-	return rc;
-}
-
-static int gf_sensor_set_idle(struct gf_dev *gf_dev)
-{
-	/* Keep L11C enabled so DOZE FOD retains calibration and wake ability. */
-	return gf_regulator_set_active(gf_dev, false);
-}
-
 static int gf_sensor_shutdown(struct gf_dev *gf_dev)
 {
 	int regulator_rc;
@@ -209,42 +150,6 @@ static LIST_HEAD(device_list);
 static DEFINE_MUTEX(device_list_lock);
 static struct wakeup_source *fp_wakelock = NULL;
 static struct gf_dev gf;
-
-#ifdef CONFIG_PM_SLEEP
-static int gf_pm_suspend(struct device *dev)
-{
-	int rc;
-
-	/*
-	 * ColorOS and the Xiaomi Goodix HAL do not share one screen-state ABI.
-	 * The HAL normally brackets TEE traffic with the SPI-clock ioctls, but a
-	 * missed final transaction must not leave L11C's 200 mA HPM vote active
-	 * for the whole system-suspend interval.  Keep the rail enabled so FOD
-	 * calibration and IRQ wake survive, and only remove its active-load vote.
-	 */
-	rc = gf_sensor_set_idle(&gf);
-	if (rc && rc != -ENODEV)
-		dev_warn(dev, "failed to set fingerprint suspend load: %d\n", rc);
-
-	/* A diagnostic/policy bridge must never turn a recoverable vote failure
-	 * into a system-suspend failure.
-	 */
-	return 0;
-}
-
-static int gf_pm_resume(struct device *dev)
-{
-	/*
-	 * Leave L11C in LPM.  The first real TEE transaction raises the load via
-	 * GF_IOC_ENABLE_SPI_CLK and drops it again at DISABLE_SPI_CLK.
-	 */
-	return 0;
-}
-
-static const struct dev_pm_ops gf_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(gf_pm_suspend, gf_pm_resume)
-};
-#endif
 
 struct gf_key_map maps[] = {
 	{EV_KEY, GF_KEY_INPUT_HOME},
@@ -538,7 +443,6 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	gf_nav_event_t nav_event = GF_NAV_NONE;
 #endif
 	int retval = 0;
-	int power_retval;
 	u8 netlink_route = NETLINK_TEST;
 	struct gf_ioc_chip_info info;
 
@@ -599,11 +503,6 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case GF_IOC_RESET:
 		pr_debug("%s GF_IOC_RESET.\n", __func__);
 		gf_hw_reset(gf_dev, 3);
-		if (gf_dev->pinctrl && gf_dev->gf_default_state) {
-			if (pinctrl_select_state(gf_dev->pinctrl, gf_dev->gf_default_state) < 0) {
-				pr_err("Set gf default state error\n");
-			}
-		}
 		break;
 
 	case GF_IOC_INPUT_KEY_EVENT:
@@ -636,23 +535,8 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 #endif
 
 	case GF_IOC_ENABLE_SPI_CLK:
-		/*
-		 * The ColorOS HAL brackets every TEE transaction with the SPI
-		 * clock ioctls, even when AP clock control is not compiled in.
-		 * Use that real transaction boundary for the regulator HPM vote.
-		 */
-		retval = gf_regulator_set_active(gf_dev, true);
-		if (retval)
-			break;
 #ifdef AP_CONTROL_CLK
 		retval = gfspi_ioctl_clk_enable(gf_dev);
-		if (retval) {
-			power_retval = gf_sensor_set_idle(gf_dev);
-			if (power_retval)
-				dev_warn(&gf_dev->spi->dev,
-					 "failed to restore idle load: %d\n",
-					 power_retval);
-		}
 #endif
 		break;
 
@@ -660,17 +544,13 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 #ifdef AP_CONTROL_CLK
 		retval = gfspi_ioctl_clk_disable(gf_dev);
 #endif
-		power_retval = gf_sensor_set_idle(gf_dev);
-		if (power_retval)
-			dev_warn(&gf_dev->spi->dev,
-				 "failed to clear transaction load: %d\n",
-				 power_retval);
 		break;
 
 	case GF_IOC_ENABLE_POWER:
 		pr_debug("%s GF_IOC_ENABLE_POWER\n", __func__);
 
-		retval = gf_sensor_power_on(gf_dev);
+		if (!gf_dev->device_available)
+			retval = gf_power_on(gf_dev);
 		if (!retval)
 			gf_dev->device_available = 1;
 		break;
@@ -678,14 +558,14 @@ static long gf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case GF_IOC_DISABLE_POWER:
 		pr_debug("%s GF_IOC_DISABLE_POWER\n", __func__);
 
-		retval = gf_sensor_set_idle(gf_dev);
+		if (gf_dev->device_available)
+			retval = gf_power_off(gf_dev);
 		if (!retval)
 			gf_dev->device_available = 0;
 		break;
 
 	case GF_IOC_ENTER_SLEEP_MODE:
 		pr_debug("%s GF_IOC_ENTER_SLEEP_MODE\n", __func__);
-		retval = gf_sensor_set_idle(gf_dev);
 		break;
 
 	case GF_IOC_GET_FW_INFO:
@@ -905,7 +785,6 @@ static int gf_fasync(int fd, struct file *filp, int mode)
 static int gf_release(struct inode *inode, struct file *filp)
 {
 	struct gf_dev *gf_dev;
-	int power_rc;
 	int wake_rc;
 	int status = 0;
 	pr_debug("%s\n", __func__);
@@ -939,12 +818,6 @@ static int gf_release(struct inode *inode, struct file *filp)
 				gf_dev->irq_wake_enabled = false;
 			}
 		}
-		/* Drop the HPM vote, but preserve power and calibration. */
-		power_rc = gf_sensor_set_idle(gf_dev);
-		if (power_rc)
-			dev_err(&gf_dev->spi->dev,
-				"failed to set sensor idle on release: %d\n",
-				power_rc);
 		gf_dev->device_available = 0;
 		if (gf_dev->irq_requested) {
 			free_irq(gf_dev->irq, gf_dev);
@@ -1175,8 +1048,6 @@ static int gf_probe(struct platform_device *pdev)
 error_wakelock:
 	pr_debug("create fp wakelock failed.\n");
 
-
-
 #ifdef AP_CONTROL_CLK
 gfspi_probe_clk_enable_failed:
 	gfspi_ioctl_clk_uninit(gf_dev);
@@ -1283,9 +1154,6 @@ static struct platform_driver gf_driver = {
 		.name = GF_DEV_NAME,
 		.owner = THIS_MODULE,
 		.of_match_table = gx_match_table,
-#ifdef CONFIG_PM_SLEEP
-		.pm = &gf_pm_ops,
-#endif
 	},
 	.probe = gf_probe,
 	.remove = gf_remove,
@@ -1350,7 +1218,6 @@ static void __exit gf_exit(void)
 }
 
 module_exit(gf_exit);
-
 
 MODULE_DESCRIPTION("fingerprint sensor device driver");
 MODULE_LICENSE("GPL v2");

@@ -4629,7 +4629,10 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 
 exit:
 	mi_dsi_update_micfg_flags(panel, PANEL_LP1);
-	if (panel->mi_cfg.panel_id == 0x4B394400360200
+	if (panel->mi_cfg.panel_id == 0x4A3200380800) {
+		if (!panel->mi_cfg.bl_preserve_layer_enabled)
+			panel->mi_cfg.bl_enable = false;
+	} else if (panel->mi_cfg.panel_id == 0x4B394400360200
             || panel->mi_cfg.panel_id == 0x4B394400420d00 || panel->mi_cfg.panel_id == 0x4D323000360200)
 		panel->mi_cfg.bl_enable = false;
 	panel->mi_cfg.bl_wait_frame = false;

@@ -168,7 +168,7 @@ int create_rb(void)
 	int32_t head;
 	grb = kzalloc(sizeof(struct rb), GFP_KERNEL);
 	if (grb == NULL) {
-		goto err;;
+		goto err;
 	}
 	grb->gbuffer = kzalloc(BUFFER_SIZE, GFP_KERNEL);
 	if (grb->gbuffer == NULL) {
@@ -184,11 +184,12 @@ int create_rb(void)
 
 	return 0;
 err:
-	if (grb)
-		kfree(grb);
-	if (grb->gbuffer)
+	if (grb) {
 		kfree(grb->gbuffer);
-	return  -EPERM;
+		kfree(grb);
+		grb = NULL;
+	}
+	return -ENOMEM;
 }
 
 void rb_init(void)

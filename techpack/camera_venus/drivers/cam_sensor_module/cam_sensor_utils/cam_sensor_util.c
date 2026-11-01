@@ -1311,6 +1311,16 @@ static int32_t cam_sensor_validate(void *ptr, size_t remain_buf)
 			remain_buf, validate_size);
 		return -EINVAL;
 	}
+	if (cmm_hdr->cmd_type == CAMERA_SENSOR_CMD_TYPE_PWR_UP ||
+		cmm_hdr->cmd_type == CAMERA_SENSOR_CMD_TYPE_PWR_DOWN) {
+		struct cam_cmd_power *power = ptr;
+
+		/* The fixed structure contains the first array element. */
+		if (power->count > 1 && power->count - 1 >
+			(remain_buf - sizeof(*power)) /
+			sizeof(power->power_settings[0]))
+			return -EINVAL;
+	}
 	return 0;
 }
 
@@ -1318,28 +1328,41 @@ int32_t cam_sensor_update_power_settings(void *cmd_buf,
 	uint32_t cmd_length, struct cam_sensor_power_ctrl_t *power_info,
 	size_t cmd_buf_len)
 {
-	int32_t rc = 0, tot_size = 0, last_cmd_type = 0;
+	struct cam_sensor_power_ctrl_t next, *original = power_info;
+	uint32_t tot_size = 0;
+	int32_t rc = 0, last_cmd_type = 0;
 	int32_t i = 0, pwr_up = 0, pwr_down = 0;
 	struct cam_sensor_power_setting *pwr_settings;
 	void *ptr = cmd_buf, *scr;
 	struct cam_cmd_power *pwr_cmd = (struct cam_cmd_power *)cmd_buf;
 	struct common_header *cmm_hdr = (struct common_header *)cmd_buf;
 
-	if (!pwr_cmd || !cmd_length || cmd_buf_len < (size_t)cmd_length ||
-		cam_sensor_validate(cmd_buf, cmd_buf_len)) {
+	if (!power_info || !pwr_cmd || !cmd_length ||
+		cmd_buf_len < (size_t)cmd_length ||
+		cam_sensor_validate(cmd_buf, cmd_length)) {
 		CAM_ERR(CAM_SENSOR, "Invalid Args: pwr_cmd %pK, cmd_length: %d",
 			pwr_cmd, cmd_length);
 		return -EINVAL;
 	}
 
-	power_info->power_setting_size = 0;
+	if (power_info->power_setting_size > MAX_POWER_CONFIG ||
+		power_info->power_down_setting_size > MAX_POWER_CONFIG ||
+		(power_info->power_setting_size && !power_info->power_setting) ||
+		(power_info->power_down_setting_size &&
+		 !power_info->power_down_setting))
+		return -EINVAL;
+
+	/* Accumulate descriptors transactionally; errors keep the old state. */
+	next = *power_info;
+	power_info = &next;
+	pwr_up = next.power_setting_size;
+	pwr_down = next.power_down_setting_size;
 	power_info->power_setting =
 		kzalloc(sizeof(struct cam_sensor_power_setting) *
 			MAX_POWER_CONFIG, GFP_KERNEL);
 	if (!power_info->power_setting)
 		return -ENOMEM;
 
-	power_info->power_down_setting_size = 0;
 	power_info->power_down_setting =
 		kzalloc(sizeof(struct cam_sensor_power_setting) *
 			MAX_POWER_CONFIG, GFP_KERNEL);
@@ -1349,6 +1372,13 @@ int32_t cam_sensor_update_power_settings(void *cmd_buf,
 		power_info->power_setting_size = 0;
 		return -ENOMEM;
 	}
+
+	if (pwr_up)
+		memcpy(next.power_setting, original->power_setting,
+			pwr_up * sizeof(*next.power_setting));
+	if (pwr_down)
+		memcpy(next.power_down_setting, original->power_down_setting,
+			pwr_down * sizeof(*next.power_down_setting));
 
 	while (tot_size < cmd_length) {
 		if (cam_sensor_validate(ptr, (cmd_length - tot_size))) {
@@ -1450,7 +1480,8 @@ int32_t cam_sensor_update_power_settings(void *cmd_buf,
 				sizeof(struct cam_cmd_unconditional_wait);
 			if (tot_size > cmd_length) {
 				CAM_ERR(CAM_SENSOR, "Command Buffer is wrong");
-				return -EINVAL;
+				rc = -EINVAL;
+				goto free_power_settings;
 			}
 			scr = (void *) (wait_cmd);
 			ptr = (void *)
@@ -1531,6 +1562,12 @@ int32_t cam_sensor_update_power_settings(void *cmd_buf,
 		}
 	}
 
+	kfree(original->power_setting);
+	kfree(original->power_down_setting);
+	original->power_setting = next.power_setting;
+	original->power_down_setting = next.power_down_setting;
+	original->power_setting_size = next.power_setting_size;
+	original->power_down_setting_size = next.power_down_setting_size;
 	return rc;
 free_power_settings:
 	kfree(power_info->power_down_setting);

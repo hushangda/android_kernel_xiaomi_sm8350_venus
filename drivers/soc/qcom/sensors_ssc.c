@@ -20,6 +20,7 @@
 #include <linux/delay.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
+#include <linux/mutex.h>
 
 #include <soc/qcom/subsystem_restart.h>
 
@@ -53,6 +54,7 @@ static ssize_t slpi_ssr_store(struct kobject *kobj,
 
 struct slpi_loader_private {
 	void *pil_h;
+	bool boot_requested;
 	struct kobject *boot_slpi_obj;
 	struct attribute_group *attr_group;
 };
@@ -71,140 +73,116 @@ static struct attribute *attrs[] = {
 
 static struct platform_device *slpi_private;
 static struct work_struct slpi_ldr_work;
+/* Serializes handle ownership and boot/SSR requests, including a running load. */
+static DEFINE_MUTEX(slpi_loader_lock);
+static bool slpi_claimed;
 
-static void slpi_load_fw(struct work_struct *slpi_ldr_work)
+static void slpi_load_fw(struct work_struct *work)
 {
-	struct platform_device *pdev = slpi_private;
-	struct slpi_loader_private *priv = NULL;
+	struct platform_device *pdev;
+	struct slpi_loader_private *priv;
+	const char *firmware_name;
+	void *pil_h;
 	int ret;
-	const char *firmware_name = NULL;
 
-	if (!pdev) {
-		pr_err("%s: Platform device null\n", __func__);
-		goto fail;
-	}
-
-	if (!pdev->dev.of_node) {
-		dev_err(&pdev->dev,
-			"%s: Device tree information missing\n", __func__);
-		goto fail;
-	}
+	mutex_lock(&slpi_loader_lock);
+	pdev = slpi_private;
+	if (!pdev)
+		goto out;
+	priv = platform_get_drvdata(pdev);
+	if (!priv->boot_requested || priv->pil_h)
+		goto out;
 
 	ret = of_property_read_string(pdev->dev.of_node,
 		"qcom,firmware-name", &firmware_name);
 	if (ret < 0) {
-		pr_err("can't get fw name.\n");
-		goto fail;
+		dev_err(&pdev->dev, "can't get fw name\n");
+		goto out;
 	}
 
-	priv = platform_get_drvdata(pdev);
-	if (!priv) {
-		dev_err(&pdev->dev,
-		" %s: Private data get failed\n", __func__);
-		goto fail;
+	pil_h = subsystem_get_with_fwname("slpi", firmware_name);
+	if (IS_ERR_OR_NULL(pil_h)) {
+		dev_err(&pdev->dev, "SLPI image loading failed: %ld\n",
+			pil_h ? PTR_ERR(pil_h) : -ENODEV);
+		goto out;
 	}
-
-	priv->pil_h = subsystem_get_with_fwname("slpi", firmware_name);
-	if (IS_ERR(priv->pil_h)) {
-		dev_err(&pdev->dev, "%s: pil get failed,\n",
-			__func__);
-		goto fail;
-	}
-
-	dev_dbg(&pdev->dev, "%s: SLPI image is loaded\n", __func__);
-	return;
-
-fail:
-	pr_err("%s: SLPI image loading failed\n", __func__);
+	priv->pil_h = pil_h;
+	dev_dbg(&pdev->dev, "SLPI image is loaded\n");
+out:
+	mutex_unlock(&slpi_loader_lock);
 }
 
-static void slpi_loader_do(struct platform_device *pdev)
-{
-	dev_dbg(&pdev->dev, "%s: scheduling work to load SLPI fw\n", __func__);
-	schedule_work(&slpi_ldr_work);
-}
-
+/* Caller holds slpi_loader_lock. */
 static void slpi_loader_unload(struct platform_device *pdev)
 {
-	struct slpi_loader_private *priv = NULL;
+	struct slpi_loader_private *priv = platform_get_drvdata(pdev);
 
-	priv = platform_get_drvdata(pdev);
-
-	if (!priv)
-		return;
-
-	if (priv->pil_h) {
-		dev_dbg(&pdev->dev, "%s: calling subsystem put\n", __func__);
+	priv->boot_requested = false;
+	if (!IS_ERR_OR_NULL(priv->pil_h))
 		subsystem_put(priv->pil_h);
-		priv->pil_h = NULL;
-	}
+	priv->pil_h = NULL;
 }
 
 static ssize_t slpi_ssr_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf,
-	size_t count)
+	struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	int ssr_cmd = 0;
-	struct subsys_device *sns_dev = NULL;
-	struct platform_device *pdev = slpi_private;
-	struct slpi_loader_private *priv = NULL;
+	struct platform_device *pdev;
+	struct slpi_loader_private *priv;
+	int ssr_cmd, ret = -ENODEV;
 
-	pr_debug("%s: going to call slpi_ssr\n", __func__);
-
-	if (kstrtoint(buf, 10, &ssr_cmd) < 0)
+	if (kstrtoint(buf, 10, &ssr_cmd) < 0 || ssr_cmd != SSR_RESET_CMD)
 		return -EINVAL;
 
-	if (ssr_cmd != SSR_RESET_CMD)
-		return -EINVAL;
-
+	mutex_lock(&slpi_loader_lock);
+	pdev = slpi_private;
+	if (!pdev)
+		goto out;
 	priv = platform_get_drvdata(pdev);
-	if (!priv)
-		return -EINVAL;
+	if (IS_ERR_OR_NULL(priv->pil_h))
+		goto out;
 
-	sns_dev = (struct subsys_device *)priv->pil_h;
-	if (!sns_dev)
-		return -EINVAL;
-
-	dev_err(&pdev->dev, "Something went wrong with SLPI, restarting\n");
-
-	/* subsystem_restart_dev has worker queue to handle */
-	if (subsystem_restart_dev(sns_dev) != 0) {
-		dev_err(&pdev->dev, "subsystem_restart_dev failed\n");
-		return -EINVAL;
-	}
-
-	dev_dbg(&pdev->dev, "SLPI restarted\n");
-	return count;
+	/* Keep the owned handle valid until restart has acquired its references. */
+	ret = subsystem_restart_dev(priv->pil_h);
+out:
+	mutex_unlock(&slpi_loader_lock);
+	return ret ? ret : count;
 }
 
 static ssize_t slpi_boot_store(struct kobject *kobj,
-	struct kobj_attribute *attr,
-	const char *buf,
-	size_t count)
+	struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	int boot = 0;
+	struct platform_device *pdev;
+	struct slpi_loader_private *priv;
+	int boot, ret = 0;
 
-	if (sscanf(buf, "%du", &boot) != 1)
+	if (kstrtoint(buf, 10, &boot) < 0 ||
+	    (boot != IMAGE_LOAD_CMD && boot != IMAGE_UNLOAD_CMD))
 		return -EINVAL;
 
-	if (boot == IMAGE_LOAD_CMD) {
-		pr_debug("%s: going to call slpi_loader_do\n", __func__);
-		slpi_loader_do(slpi_private);
-	} else if (boot == IMAGE_UNLOAD_CMD) {
-		pr_debug("%s: going to call slpi_unloader\n", __func__);
-		slpi_loader_unload(slpi_private);
+	mutex_lock(&slpi_loader_lock);
+	pdev = slpi_private;
+	if (!pdev) {
+		ret = -ENODEV;
+		goto out;
 	}
-	return count;
+	priv = platform_get_drvdata(pdev);
+	if (boot == IMAGE_LOAD_CMD) {
+		priv->boot_requested = true;
+		if (!priv->pil_h)
+			schedule_work(&slpi_ldr_work);
+	} else {
+		/* A pending worker observes false; a running load finishes first. */
+		slpi_loader_unload(pdev);
+	}
+out:
+	mutex_unlock(&slpi_loader_lock);
+	return ret ? ret : count;
 }
 
 static int slpi_loader_init_sysfs(struct platform_device *pdev)
 {
 	int ret = -EINVAL;
 	struct slpi_loader_private *priv = NULL;
-
-	slpi_private = NULL;
-
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv) {
 		ret = -ENOMEM;
@@ -235,21 +213,33 @@ static int slpi_loader_init_sysfs(struct platform_device *pdev)
 		goto error_return;
 	}
 
+	INIT_WORK(&slpi_ldr_work, slpi_load_fw);
+	mutex_lock(&slpi_loader_lock);
+	slpi_private = pdev;
+	mutex_unlock(&slpi_loader_lock);
+
 	ret = sysfs_create_group(priv->boot_slpi_obj, priv->attr_group);
 	if (ret) {
 		dev_err(&pdev->dev, "%s: sysfs create group failed %d\n",
 							__func__, ret);
+		/* A partially published group may already have accepted boot=1. */
+		mutex_lock(&slpi_loader_lock);
+		slpi_private = NULL;
+		slpi_loader_unload(pdev);
+		mutex_unlock(&slpi_loader_lock);
+		cancel_work_sync(&slpi_ldr_work);
 		goto error_return;
 	}
-
-	slpi_private = pdev;
 
 	return 0;
 
 error_return:
+	mutex_lock(&slpi_loader_lock);
+	slpi_private = NULL;
+	mutex_unlock(&slpi_loader_lock);
 
 	if (priv->boot_slpi_obj) {
-		kobject_del(priv->boot_slpi_obj);
+		kobject_put(priv->boot_slpi_obj);
 		priv->boot_slpi_obj = NULL;
 	}
 
@@ -258,24 +248,17 @@ error_return:
 
 static int slpi_loader_remove(struct platform_device *pdev)
 {
-	struct slpi_loader_private *priv = NULL;
+	struct slpi_loader_private *priv = platform_get_drvdata(pdev);
 
-	priv = platform_get_drvdata(pdev);
-
-	if (!priv)
-		return 0;
-
-	if (priv->pil_h) {
-		subsystem_put(priv->pil_h);
-		priv->pil_h = NULL;
-	}
-
-	if (priv->boot_slpi_obj) {
-		sysfs_remove_group(priv->boot_slpi_obj, priv->attr_group);
-		kobject_del(priv->boot_slpi_obj);
-		priv->boot_slpi_obj = NULL;
-	}
-
+	/* Drain sysfs callers before withdrawing the device and queued work. */
+	sysfs_remove_group(priv->boot_slpi_obj, priv->attr_group);
+	mutex_lock(&slpi_loader_lock);
+	slpi_private = NULL;
+	slpi_loader_unload(pdev);
+	mutex_unlock(&slpi_loader_lock);
+	cancel_work_sync(&slpi_ldr_work);
+	kobject_put(priv->boot_slpi_obj);
+	priv->boot_slpi_obj = NULL;
 	return 0;
 }
 
@@ -347,15 +330,19 @@ const struct file_operations sensors_ssc_fops = {
 
 static int sensors_ssc_probe(struct platform_device *pdev)
 {
-	int ret = slpi_loader_init_sysfs(pdev);
+	int ret;
 
-	if (ret != 0) {
-		dev_err(&pdev->dev, "%s: Error in initing sysfs\n", __func__);
-		return ret;
+	mutex_lock(&slpi_loader_lock);
+	if (slpi_claimed) {
+		mutex_unlock(&slpi_loader_lock);
+		return -EBUSY;
 	}
+	slpi_claimed = true;
+	mutex_unlock(&slpi_loader_lock);
 
 	sns_ctl.dev_class = class_create(THIS_MODULE, CLASS_NAME);
-	if (sns_ctl.dev_class == NULL) {
+	if (IS_ERR(sns_ctl.dev_class)) {
+		ret = PTR_ERR(sns_ctl.dev_class);
 		pr_err("%s: class_create fail.\n", __func__);
 		goto res_err;
 	}
@@ -370,16 +357,18 @@ static int sensors_ssc_probe(struct platform_device *pdev)
 				     sns_ctl.dev_num,
 				     &sns_ctl, DRV_NAME);
 	if (IS_ERR(sns_ctl.dev)) {
+		ret = PTR_ERR(sns_ctl.dev);
 		pr_err("%s: device_create fail.\n", __func__);
 		goto device_create_err;
 	}
 
 	sns_ctl.cdev = cdev_alloc();
 	if (sns_ctl.cdev == NULL) {
+		ret = -ENOMEM;
 		pr_err("%s: cdev_alloc fail.\n", __func__);
 		goto cdev_alloc_err;
 	}
-	cdev_init(sns_ctl.cdev, &sensors_ssc_fops);
+	sns_ctl.cdev->ops = &sensors_ssc_fops;
 	sns_ctl.cdev->owner = THIS_MODULE;
 
 	ret = cdev_add(sns_ctl.cdev, sns_ctl.dev_num, 1);
@@ -388,12 +377,17 @@ static int sensors_ssc_probe(struct platform_device *pdev)
 		goto cdev_add_err;
 	}
 
-	INIT_WORK(&slpi_ldr_work, slpi_load_fw);
+	ret = slpi_loader_init_sysfs(pdev);
+	if (ret)
+		goto sysfs_err;
 
 	return 0;
 
+sysfs_err:
+	cdev_del(sns_ctl.cdev);
+	goto cdev_alloc_err;
 cdev_add_err:
-	kfree(sns_ctl.cdev);
+	kobject_put(&sns_ctl.cdev->kobj);
 cdev_alloc_err:
 	device_destroy(sns_ctl.dev_class, sns_ctl.dev_num);
 device_create_err:
@@ -401,18 +395,23 @@ device_create_err:
 alloc_chrdev_region_err:
 	class_destroy(sns_ctl.dev_class);
 res_err:
-	return -ENODEV;
+	mutex_lock(&slpi_loader_lock);
+	slpi_claimed = false;
+	mutex_unlock(&slpi_loader_lock);
+	return ret;
 }
 
 static int sensors_ssc_remove(struct platform_device *pdev)
 {
 	slpi_loader_remove(pdev);
 	cdev_del(sns_ctl.cdev);
-	kfree(sns_ctl.cdev);
 	sns_ctl.cdev = NULL;
 	device_destroy(sns_ctl.dev_class, sns_ctl.dev_num);
 	unregister_chrdev_region(sns_ctl.dev_num, 1);
 	class_destroy(sns_ctl.dev_class);
+	mutex_lock(&slpi_loader_lock);
+	slpi_claimed = false;
+	mutex_unlock(&slpi_loader_lock);
 
 	return 0;
 }

@@ -802,7 +802,7 @@ rpmh_regulator_send_aggregate_requests(struct rpmh_vreg *vreg)
 			rpmh_regulator_req(vreg, &req_active,
 				&aggr_vreg->aggr_req_active, sent_mask, state);
 			for (i = 0; i < j; i++)
-				cmd[j].wait = false;
+				cmd[i].wait = false;
 		}
 
 		state = RPMH_ACTIVE_ONLY_STATE;

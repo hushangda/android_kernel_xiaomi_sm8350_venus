@@ -318,6 +318,11 @@ struct tp_frame {
  * - series_of_switches  to store the enabling status of a particular feature from the host \n
  */
 struct fts_ts_info {
+	bool removing;
+	bool irq_registered;
+	bool power_supply_registered;
+	bool touch_feature_registered;
+	bool sysfs_created;
 	struct device *dev;
 #ifdef I2C_INTERFACE
 	struct i2c_client *client;
@@ -423,7 +428,6 @@ struct fts_ts_info {
 	short strength_buf[PAGE_SIZE];
 	struct tp_frame thp_frame;
 	int aod_status;
-	bool aod_status_from_display;
 	bool tp_pm_suspend;
 	struct completion pm_resume_completion;
 	bool gamemode_enable;

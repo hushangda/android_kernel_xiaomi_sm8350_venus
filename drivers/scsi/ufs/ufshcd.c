@@ -4600,7 +4600,7 @@ static inline void ufshcd_hba_stop(struct ufs_hba *hba, bool can_sleep)
  */
 static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
 {
-	int retry;
+	int retry, ret;
 
 	if (!ufshcd_is_hba_active(hba))
 		/* change controller state to "reset state" */
@@ -4609,7 +4609,9 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
 	/* UniPro link is disabled at this point */
 	ufshcd_set_link_off(hba);
 
-	ufshcd_vops_hce_enable_notify(hba, PRE_CHANGE);
+	ret = ufshcd_vops_hce_enable_notify(hba, PRE_CHANGE);
+	if (ret)
+		return ret;
 
 	/* start controller initialization sequence */
 	ufshcd_hba_start(hba);
@@ -4634,7 +4636,8 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
 		} else {
 			dev_err(hba->dev,
 				"Controller enable failed\n");
-			return -EIO;
+			ret = -EIO;
+			goto out_disable;
 		}
 		usleep_range(1000, 1100);
 	}
@@ -4642,9 +4645,16 @@ static int ufshcd_hba_execute_hce(struct ufs_hba *hba)
 	/* enable UIC related interrupts */
 	ufshcd_enable_intr(hba, UFSHCD_UIC_MASK);
 
-	ufshcd_vops_hce_enable_notify(hba, POST_CHANGE);
+	ret = ufshcd_vops_hce_enable_notify(hba, POST_CHANGE);
+	if (ret)
+		goto out_disable;
 
 	return 0;
+
+out_disable:
+	ufshcd_disable_intr(hba, UFSHCD_UIC_MASK);
+	ufshcd_hba_stop(hba, true);
+	return ret;
 }
 
 int ufshcd_hba_enable(struct ufs_hba *hba)
@@ -4653,18 +4663,21 @@ int ufshcd_hba_enable(struct ufs_hba *hba)
 
 	if (hba->quirks & UFSHCI_QUIRK_BROKEN_HCE) {
 		ufshcd_set_link_off(hba);
-		ufshcd_vops_hce_enable_notify(hba, PRE_CHANGE);
+		ret = ufshcd_vops_hce_enable_notify(hba, PRE_CHANGE);
+		if (ret)
+			return ret;
 
 		/* enable UIC related interrupts */
 		ufshcd_enable_intr(hba, UFSHCD_UIC_MASK);
 		ret = ufshcd_dme_reset(hba);
-		if (!ret) {
+		if (!ret)
 			ret = ufshcd_dme_enable(hba);
-			if (!ret)
-				ufshcd_vops_hce_enable_notify(hba, POST_CHANGE);
-			if (ret)
-				dev_err(hba->dev,
-					"Host controller enable failed with non-hce\n");
+		if (!ret)
+			ret = ufshcd_vops_hce_enable_notify(hba, POST_CHANGE);
+		if (ret) {
+			ufshcd_disable_intr(hba, UFSHCD_UIC_MASK);
+			dev_err(hba->dev,
+				"Host controller enable failed with non-hce\n");
 		}
 	} else {
 		ret = ufshcd_hba_execute_hce(hba);
@@ -4727,7 +4740,7 @@ EXPORT_SYMBOL_GPL(ufshcd_update_reg_hist);
  */
 static int ufshcd_link_startup(struct ufs_hba *hba)
 {
-	int ret;
+	int ret, err;
 	int retries = DME_LINKSTARTUP_RETRIES;
 	bool link_startup_again = false;
 
@@ -4763,7 +4776,9 @@ link_startup:
 		 */
 		if (ret) {
 			mi_memory_record_error(hba, "link_startup_fail\n");
-			if (ufshcd_hba_enable(hba)) {
+			err = ufshcd_hba_enable(hba);
+			if (err) {
+				ret = err;
 				ufshcd_update_reg_hist(&hba->ufs_stats.link_startup_err,
 						       (u32)ret);
 				goto out;
@@ -7083,8 +7098,23 @@ static int ufshcd_reset_and_restore(struct ufs_hba *hba)
 	 */
 	scsi_report_bus_reset(hba->host, 0);
 	if (err) {
+		/* HCE errors can bypass the state update in ufshcd_probe_hba(). */
+		hba->ufshcd_state = UFSHCD_STATE_ERROR;
 		hba->saved_err |= saved_err;
 		hba->saved_uic_err |= saved_uic_err;
+	} else {
+		/* A successful retry must also clear a previous probe failure. */
+		if (hba->ufshcd_state == UFSHCD_STATE_RESET ||
+		    hba->ufshcd_state == UFSHCD_STATE_ERROR)
+			hba->ufshcd_state = UFSHCD_STATE_OPERATIONAL;
+
+		/*
+		 * Preserve errors raised during recovery, including those whose
+		 * EH request was suppressed while a failed probe left ERROR set.
+		 */
+		if (hba->saved_err || hba->saved_uic_err || hba->force_reset ||
+		    ufshcd_is_link_broken(hba))
+			ufshcd_schedule_eh_work(hba);
 	}
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
 
@@ -7114,7 +7144,7 @@ static int ufshcd_eh_host_reset_handler(struct scsi_cmnd *cmd)
 	flush_work(&hba->eh_work);
 
 	spin_lock_irqsave(hba->host->host_lock, flags);
-	if (hba->ufshcd_state == UFSHCD_STATE_ERROR)
+	if (hba->ufshcd_state != UFSHCD_STATE_OPERATIONAL)
 		err = FAILED;
 	spin_unlock_irqrestore(hba->host->host_lock, flags);
 
@@ -7938,7 +7968,6 @@ reinit:
 	if (hba->dev_info.wspecversion < 0x300 &&
 		hba->limit_phy_submode && reinit_needed) {
 		unsigned long flags;
-		int err;
 
 		ufshcd_vops_device_reset(hba);
 
@@ -7948,8 +7977,8 @@ reinit:
 		spin_unlock_irqrestore(hba->host->host_lock, flags);
 
 		hba->limit_phy_submode = 0;
-		err = ufshcd_hba_enable(hba);
-		if (err)
+		ret = ufshcd_hba_enable(hba);
+		if (ret)
 			goto out;
 		reinit_needed = false;
 

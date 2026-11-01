@@ -28,11 +28,11 @@ static int qcom_hwspinlock_trylock(struct hwspinlock *lock)
 
 	ret = regmap_field_write(field, QCOM_MUTEX_APPS_PROC_ID);
 	if (ret)
-		return ret;
+		return 0;
 
 	ret = regmap_field_read(field, &lock_owner);
 	if (ret)
-		return ret;
+		return 0;
 
 	return lock_owner == QCOM_MUTEX_APPS_PROC_ID;
 }
@@ -120,6 +120,8 @@ static int qcom_hwspinlock_probe(struct platform_device *pdev)
 
 		bank->lock[i].priv = devm_regmap_field_alloc(&pdev->dev,
 							     regmap, field);
+		if (IS_ERR(bank->lock[i].priv))
+			return PTR_ERR(bank->lock[i].priv);
 	}
 
 	pm_runtime_enable(&pdev->dev);

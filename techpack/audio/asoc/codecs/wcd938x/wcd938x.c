@@ -4260,9 +4260,11 @@ static int wcd938x_bind(struct device *dev)
 
 	wcd938x->regmap = devm_regmap_init_swr(wcd938x->tx_swr_dev,
 					       &wcd938x_regmap_config);
-	if (!wcd938x->regmap) {
-		dev_err(dev, "%s: Regmap init failed\n",
-				__func__);
+	if (IS_ERR(wcd938x->regmap)) {
+		ret = PTR_ERR(wcd938x->regmap);
+		dev_err(dev, "%s: Regmap init failed: %d\n",
+				__func__, ret);
+		wcd938x->regmap = NULL;
 		goto err;
 	}
 

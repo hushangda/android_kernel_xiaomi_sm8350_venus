@@ -3292,7 +3292,7 @@ static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
 	iova = arm_smmu_mask_iova(smmu_domain, iova);
 	ret = arm_smmu_domain_power_on(domain, smmu_domain->smmu);
 	if (ret)
-		return ret;
+		return 0;
 
 	arm_smmu_secure_domain_lock(smmu_domain);
 
@@ -3381,7 +3381,7 @@ static size_t arm_smmu_map_sg(struct iommu_domain *domain, unsigned long iova,
 	if (!IS_ENABLED(CONFIG_ARM_SMMU_SKIP_MAP_POWER_ON)) {
 		ret = arm_smmu_domain_power_on(domain, smmu_domain->smmu);
 		if (ret)
-			return ret;
+			return 0;
 	}
 
 	arm_smmu_secure_domain_lock(smmu_domain);

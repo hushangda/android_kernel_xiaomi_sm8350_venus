@@ -1918,24 +1918,28 @@ int f2fs_start_ckpt_thread(struct f2fs_sb_info *sbi)
 {
 	dev_t dev = sbi->sb->s_bdev->bd_dev;
 	struct ckpt_req_control *cprc = &sbi->cprc_info;
+	struct task_struct *ckpt_task;
+	int err = 0;
 
+	mutex_lock(&sbi->critical_task_lock);
 	if (cprc->f2fs_issue_ckpt)
-		return 0;
+		goto out;
 
-	cprc->f2fs_issue_ckpt = kthread_run(issue_checkpoint_thread, sbi,
+	ckpt_task = kthread_run(issue_checkpoint_thread, sbi,
 			"f2fs_ckpt-%u:%u", MAJOR(dev), MINOR(dev));
-	if (IS_ERR(cprc->f2fs_issue_ckpt)) {
-		int err = PTR_ERR(cprc->f2fs_issue_ckpt);
-
-		cprc->f2fs_issue_ckpt = NULL;
-		return err;
+	if (IS_ERR(ckpt_task)) {
+		err = PTR_ERR(ckpt_task);
+		goto out;
 	}
+	cprc->f2fs_issue_ckpt = ckpt_task;
 
 	set_task_ioprio(cprc->f2fs_issue_ckpt, cprc->ckpt_thread_ioprio);
 	set_user_nice(cprc->f2fs_issue_ckpt,
 			PRIO_TO_NICE(sbi->critical_task_priority));
 
-	return 0;
+out:
+	mutex_unlock(&sbi->critical_task_lock);
+	return err;
 }
 
 void f2fs_stop_ckpt_thread(struct f2fs_sb_info *sbi)
@@ -1943,14 +1947,18 @@ void f2fs_stop_ckpt_thread(struct f2fs_sb_info *sbi)
 	struct ckpt_req_control *cprc = &sbi->cprc_info;
 	struct task_struct *ckpt_task;
 
+	mutex_lock(&sbi->critical_task_lock);
 	if (!cprc->f2fs_issue_ckpt)
-		return;
+		goto out;
 
 	ckpt_task = cprc->f2fs_issue_ckpt;
 	cprc->f2fs_issue_ckpt = NULL;
+	/* The checkpoint thread never takes critical_task_lock. */
 	kthread_stop(ckpt_task);
 
 	f2fs_flush_ckpt_thread(sbi);
+out:
+	mutex_unlock(&sbi->critical_task_lock);
 }
 
 void f2fs_flush_ckpt_thread(struct f2fs_sb_info *sbi)

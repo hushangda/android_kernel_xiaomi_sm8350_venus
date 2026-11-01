@@ -491,8 +491,14 @@ int mi_sde_connector_fod_hbm_fence(struct drm_connector *connector)
 
 	mi_cfg = &dsi_display->panel->mi_cfg;
 
-	if (mi_cfg->panel_id == 0x4B394400360200 || mi_cfg->panel_id == 0x4B394400420d00 || mi_cfg->panel_id == 0x4D323000360200) {
-		if (!(c_conn->mi_layer_state.mi_layer_type & MI_DIMLAYER_AOD)) {
+	/* Stock layer bit 0x10 keeps the existing backlight across LP1. */
+	mi_cfg->bl_preserve_layer_enabled =
+		!!(c_conn->mi_layer_state.mi_layer_type & MI_DIMLAYER_BL_PRESERVE);
+
+	if (mi_cfg->panel_id == 0x4A3200380800 || mi_cfg->panel_id == 0x4B394400360200 || mi_cfg->panel_id == 0x4B394400420d00 || mi_cfg->panel_id == 0x4D323000360200) {
+		if (!(c_conn->mi_layer_state.mi_layer_type & MI_DIMLAYER_AOD) &&
+			(mi_cfg->panel_id != 0x4A3200380800 ||
+			 !mi_cfg->bl_preserve_layer_enabled)) {
 			if (c_conn->lp_mode == SDE_MODE_DPMS_ON)
 				mi_cfg->bl_enable = true;
 			if (!mi_cfg->bl_wait_frame && c_conn->lp_mode == SDE_MODE_DPMS_ON) {
@@ -518,7 +524,8 @@ int mi_sde_connector_fod_hbm_fence(struct drm_connector *connector)
 	}
 
 	if (c_conn->mi_layer_state.mi_layer_type & MI_DIMLAYER_FOD_ANIM) {
-		if (!mi_cfg->fod_anim_layer_enabled && !mi_cfg->fod_hbm_layer_enabled && c_conn->allow_bl_update) {
+		if (!mi_cfg->fod_anim_layer_enabled && !mi_cfg->fod_hbm_layer_enabled && c_conn->allow_bl_update &&
+			(mi_cfg->panel_id != 0x4A3200380800 || mi_cfg->doze_brightness)) {
 			mi_cfg->fod_anim_layer_enabled = true;
 			if (is_aod_and_panel_initialized(dsi_display->panel))
 				mi_sde_connector_panel_ctl(connector, MI_FOD_AOD_TO_NORMAL, false);

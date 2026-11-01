@@ -25,6 +25,7 @@
 #include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/spinlock.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -478,38 +479,62 @@ static unsigned int linkpower_close_tcp_listeners(u32 uid, u32 pid,
 	return count;
 }
 
+static int linkpower_sock_ptr_cmp(const void *a, const void *b)
+{
+	unsigned long left = (unsigned long)*(struct sock * const *)a;
+	unsigned long right = (unsigned long)*(struct sock * const *)b;
+
+	return (left > right) - (left < right);
+}
+
 static unsigned int linkpower_close_udp(u32 uid, u32 pid,
 					unsigned int count)
 {
-	unsigned int bucket;
+	struct sock **targets;
+	unsigned int bucket, i, nr = 0, limit;
 
-	for (bucket = 0; bucket <= udp_table.mask &&
-	     count < LINKPOWER_CLOSE_LIMIT; bucket++) {
-		struct udp_hslot *head = &udp_table.hash[bucket];
-
-		for (;;) {
-			struct sock *target = NULL;
-			struct sock *sk;
-
-			spin_lock_bh(&head->lock);
-			sk_for_each(sk, &head->head) {
-				if (!linkpower_socket_match(sk, uid, pid))
-					continue;
-				if (refcount_inc_not_zero(&sk->sk_refcnt))
-					target = sk;
-				break;
-			}
-			spin_unlock_bh(&head->lock);
-			if (!target)
-				break;
-			if (!udp_abort(target, ECONNABORTED))
-				count++;
-			sock_put(target);
-			if (count >= LINKPOWER_CLOSE_LIMIT)
-				break;
-			cond_resched();
-		}
+	if (count >= LINKPOWER_CLOSE_LIMIT)
+		return count;
+	limit = LINKPOWER_CLOSE_LIMIT - count;
+	targets = kvcalloc(limit, sizeof(*targets), GFP_KERNEL);
+	if (!targets) {
+		pr_warn_ratelimited("cannot allocate UDP close snapshot\n");
+		return count;
 	}
+
+	/* udp_abort() may leave a bound socket hashed. Visit each bucket once
+	 * and retain references before dropping its lock, rather than relying
+	 * on abort to remove the first entry from that bucket.
+	 */
+	for (bucket = 0; bucket <= udp_table.mask && nr < limit; bucket++) {
+		struct udp_hslot *head = &udp_table.hash[bucket];
+		struct sock *sk;
+
+		spin_lock_bh(&head->lock);
+		sk_for_each(sk, &head->head) {
+			if (!linkpower_socket_match(sk, uid, pid))
+				continue;
+			if (refcount_inc_not_zero(&sk->sk_refcnt))
+				targets[nr++] = sk;
+			if (nr == limit)
+				break;
+		}
+		spin_unlock_bh(&head->lock);
+		cond_resched();
+	}
+
+	/* A concurrent rebind can move an entry between buckets while taking
+	 * the snapshot. Count/abort it only once, but drop every reference.
+	 */
+	sort(targets, nr, sizeof(*targets), linkpower_sock_ptr_cmp, NULL);
+	for (i = 0; i < nr; i++) {
+		if ((!i || targets[i] != targets[i - 1]) &&
+		    !udp_abort(targets[i], ECONNABORTED))
+			count++;
+		sock_put(targets[i]);
+		cond_resched();
+	}
+	kvfree(targets);
 	return count;
 }
 

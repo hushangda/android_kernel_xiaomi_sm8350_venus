@@ -13,6 +13,7 @@
 #include <linux/of.h>
 #include <linux/soc/qcom/qmi.h>
 #include <linux/net.h>
+#include <linux/spinlock.h>
 
 #include "thermal_mitigation_device_service_v01.h"
 
@@ -28,6 +29,8 @@ struct qmi_cooling_device {
 	struct list_head		qmi_node;
 	struct thermal_cooling_device	*cdev;
 	unsigned int			mtgn_state;
+	unsigned int			applied_state;
+	bool				state_dirty;
 	unsigned int			max_level;
 	struct qmi_tmd_instance		*tmd;
 };
@@ -36,6 +39,13 @@ struct qmi_tmd_instance {
 	struct device			*dev;
 	struct qmi_handle		handle;
 	struct mutex			mutex;
+	/* Receive callbacks must not wait for the transaction mutex. */
+	spinlock_t			state_lock;
+	struct sockaddr_qrtr		server_addr;
+	u32				service_generation;
+	bool				service_online;
+	bool				shutting_down;
+	bool				handle_initialized;
 	uint32_t			inst_id;
 	struct list_head		tmd_cdev_list;
 	struct work_struct		svc_arrive_work;
@@ -105,7 +115,7 @@ static int qmi_get_max_state(struct thermal_cooling_device *cdev,
 	if (!qmi_cdev)
 		return -EINVAL;
 
-	*state = qmi_cdev->max_level;
+	*state = READ_ONCE(qmi_cdev->max_level);
 
 	return 0;
 }
@@ -118,13 +128,13 @@ static int qmi_get_cur_state(struct thermal_cooling_device *cdev,
 	if (!qmi_cdev)
 		return -EINVAL;
 
-	*state = qmi_cdev->mtgn_state;
+	*state = READ_ONCE(qmi_cdev->applied_state);
 
 	return 0;
 }
 
 static int qmi_tmd_send_state_request(struct qmi_cooling_device *qmi_cdev,
-				uint8_t state)
+				uint8_t state, struct sockaddr_qrtr *server)
 {
 	int ret = 0;
 	struct tmd_set_mitigation_level_req_msg_v01 req;
@@ -139,8 +149,6 @@ static int qmi_tmd_send_state_request(struct qmi_cooling_device *qmi_cdev,
 		QMI_TMD_MITIGATION_DEV_ID_LENGTH_MAX_V01);
 	req.mitigation_level = state;
 
-	mutex_lock(&tmd->mutex);
-
 	ret = qmi_txn_init(&tmd->handle, &txn,
 		tmd_set_mitigation_level_resp_msg_v01_ei, &tmd_resp);
 	if (ret < 0) {
@@ -149,7 +157,7 @@ static int qmi_tmd_send_state_request(struct qmi_cooling_device *qmi_cdev,
 		goto qmi_send_exit;
 	}
 
-	ret = qmi_send_request(&tmd->handle, NULL, &txn,
+	ret = qmi_send_request(&tmd->handle, server, &txn,
 			QMI_TMD_SET_MITIGATION_LEVEL_REQ_V01,
 			TMD_SET_MITIGATION_LEVEL_REQ_MSG_V01_MAX_MSG_LEN,
 			tmd_set_mitigation_level_req_msg_v01_ei, &req);
@@ -167,7 +175,7 @@ static int qmi_tmd_send_state_request(struct qmi_cooling_device *qmi_cdev,
 		goto qmi_send_exit;
 	}
 	if (tmd_resp.resp.result != QMI_RESULT_SUCCESS_V01) {
-		ret = tmd_resp.resp.result;
+		ret = -EREMOTEIO;
 		pr_err("qmi set state:%d NOT success for %s ret:%d\n",
 			state, qmi_cdev->cdev_name, ret);
 		goto qmi_send_exit;
@@ -176,7 +184,52 @@ static int qmi_tmd_send_state_request(struct qmi_cooling_device *qmi_cdev,
 	pr_debug("Requested qmi state:%d for %s\n", state, qmi_cdev->cdev_name);
 
 qmi_send_exit:
-	mutex_unlock(&tmd->mutex);
+	return ret;
+}
+
+/* The caller serializes transactions and requested-state changes with mutex. */
+static int qmi_tmd_apply_state(struct qmi_cooling_device *qmi_cdev)
+{
+	struct qmi_tmd_instance *tmd = qmi_cdev->tmd;
+	struct sockaddr_qrtr server;
+	unsigned int state;
+	u32 generation;
+	int ret;
+
+	spin_lock(&tmd->state_lock);
+	if (tmd->shutting_down) {
+		spin_unlock(&tmd->state_lock);
+		return -ENODEV;
+	}
+	if (!tmd->service_online || !qmi_cdev->connection_active) {
+		/* Retry a failed device-list query on the next thermal request. */
+		if (tmd->service_online)
+			queue_work(system_highpri_wq, &tmd->svc_arrive_work);
+		spin_unlock(&tmd->state_lock);
+		return 0;
+	}
+	if (!qmi_cdev->state_dirty) {
+		spin_unlock(&tmd->state_lock);
+		return 0;
+	}
+	state = qmi_cdev->mtgn_state;
+	generation = tmd->service_generation;
+	server = tmd->server_addr;
+	spin_unlock(&tmd->state_lock);
+
+	ret = qmi_tmd_send_state_request(qmi_cdev, (uint8_t)state, &server);
+
+	spin_lock(&tmd->state_lock);
+	if (generation != tmd->service_generation || !tmd->service_online ||
+	    !qmi_cdev->connection_active || tmd->shutting_down) {
+		/* A reply from the old service cannot confirm the new service. */
+		if (!ret)
+			ret = -ENETRESET;
+	} else if (!ret) {
+		qmi_cdev->applied_state = state;
+		qmi_cdev->state_dirty = false;
+	}
+	spin_unlock(&tmd->state_lock);
 	return ret;
 }
 
@@ -184,30 +237,29 @@ static int qmi_set_cur_state(struct thermal_cooling_device *cdev,
 				 unsigned long state)
 {
 	struct qmi_cooling_device *qmi_cdev = cdev->devdata;
-	int ret = 0;
+	struct qmi_tmd_instance *tmd;
+	int ret;
 
 	if (!qmi_cdev)
 		return -EINVAL;
 
-	if (state > qmi_cdev->max_level)
+	tmd = qmi_cdev->tmd;
+	mutex_lock(&tmd->mutex);
+	spin_lock(&tmd->state_lock);
+	if (state > qmi_cdev->max_level) {
+		spin_unlock(&tmd->state_lock);
+		mutex_unlock(&tmd->mutex);
 		return -EINVAL;
-
-	if (qmi_cdev->mtgn_state == state)
-		return 0;
-
-	/* save it and return if server exit */
-	if (!qmi_cdev->connection_active) {
-		qmi_cdev->mtgn_state = state;
-		pr_debug("Pending request:%ld for %s\n", state,
-				qmi_cdev->cdev_name);
-		return 0;
 	}
-
-	/* It is best effort to save state even if QMI fail */
-	ret = qmi_tmd_send_state_request(qmi_cdev, (uint8_t)state);
-
+	if (qmi_cdev->mtgn_state != state ||
+	    qmi_cdev->applied_state != state)
+		qmi_cdev->state_dirty = true;
 	qmi_cdev->mtgn_state = state;
+	spin_unlock(&tmd->state_lock);
 
+	/* Failed sends remain dirty, including a repeat of the same target. */
+	ret = qmi_tmd_apply_state(qmi_cdev);
+	mutex_unlock(&tmd->mutex);
 	return ret;
 }
 
@@ -225,9 +277,12 @@ static int qmi_register_cooling_device(struct qmi_cooling_device *qmi_cdev)
 					qmi_cdev,
 					&qmi_device_ops);
 	if (IS_ERR(qmi_cdev->cdev)) {
+		int ret = PTR_ERR(qmi_cdev->cdev);
+
 		pr_err("Cooling register failed for %s, ret:%ld\n",
 			qmi_cdev->cdev_name, PTR_ERR(qmi_cdev->cdev));
-		return PTR_ERR(qmi_cdev->cdev);
+		qmi_cdev->cdev = NULL;
+		return ret;
 	}
 	pr_debug("Cooling register success for %s\n", qmi_cdev->cdev_name);
 
@@ -240,6 +295,8 @@ static int verify_devices_and_register(struct qmi_tmd_instance *tmd)
 	struct tmd_get_mitigation_device_list_resp_msg_v01 *tmd_resp;
 	int ret = 0, i;
 	struct qmi_txn txn;
+	struct sockaddr_qrtr server;
+	u32 generation;
 
 	memset(&req, 0, sizeof(req));
 	/* size of tmd_resp is very high, use heap memory rather than stack */
@@ -248,6 +305,15 @@ static int verify_devices_and_register(struct qmi_tmd_instance *tmd)
 		return -ENOMEM;
 
 	mutex_lock(&tmd->mutex);
+	spin_lock(&tmd->state_lock);
+	if (!tmd->service_online || tmd->shutting_down) {
+		spin_unlock(&tmd->state_lock);
+		ret = -ENOTCONN;
+		goto reg_exit;
+	}
+	server = tmd->server_addr;
+	generation = tmd->service_generation;
+	spin_unlock(&tmd->state_lock);
 	ret = qmi_txn_init(&tmd->handle, &txn,
 		tmd_get_mitigation_device_list_resp_msg_v01_ei, tmd_resp);
 	if (ret < 0) {
@@ -256,7 +322,7 @@ static int verify_devices_and_register(struct qmi_tmd_instance *tmd)
 		goto reg_exit;
 	}
 
-	ret = qmi_send_request(&tmd->handle, NULL, &txn,
+	ret = qmi_send_request(&tmd->handle, &server, &txn,
 			QMI_TMD_GET_MITIGATION_DEVICE_LIST_REQ_V01,
 			TMD_GET_MITIGATION_DEVICE_LIST_REQ_MSG_V01_MAX_MSG_LEN,
 			tmd_get_mitigation_device_list_req_msg_v01_ei,
@@ -273,7 +339,7 @@ static int verify_devices_and_register(struct qmi_tmd_instance *tmd)
 		goto reg_exit;
 	}
 	if (tmd_resp->resp.result != QMI_RESULT_SUCCESS_V01) {
-		ret = tmd_resp->resp.result;
+		ret = -EREMOTEIO;
 		pr_err("Get device list NOT success for inst_id:0x%x ret:%d\n",
 			tmd->inst_id, ret);
 		goto reg_exit;
@@ -293,20 +359,34 @@ static int verify_devices_and_register(struct qmi_tmd_instance *tmd)
 				QMI_TMD_MITIGATION_DEV_ID_LENGTH_MAX_V01)))
 				continue;
 
+			mutex_lock(&tmd->mutex);
+			spin_lock(&tmd->state_lock);
+			if (!tmd->service_online || tmd->shutting_down ||
+			    generation != tmd->service_generation) {
+				spin_unlock(&tmd->state_lock);
+				mutex_unlock(&tmd->mutex);
+				ret = -ENETRESET;
+				goto free_resp;
+			}
 			qmi_cdev->connection_active = true;
 			qmi_cdev->max_level = device->max_mitigation_level;
+			qmi_cdev->mtgn_state = min(qmi_cdev->mtgn_state,
+						 qmi_cdev->max_level);
+			qmi_cdev->state_dirty = true;
+			spin_unlock(&tmd->state_lock);
 			/*
 			 * It is better to set current state
 			 * initially or during restart
 			 */
-			qmi_tmd_send_state_request(qmi_cdev,
-							qmi_cdev->mtgn_state);
+			ret = qmi_tmd_apply_state(qmi_cdev);
+			mutex_unlock(&tmd->mutex);
 			if (!qmi_cdev->cdev)
 				ret = qmi_register_cooling_device(qmi_cdev);
 			break;
 		}
 	}
 
+free_resp:
 	kfree(tmd_resp);
 	return ret;
 
@@ -322,8 +402,31 @@ static void qmi_tmd_svc_arrive(struct work_struct *work)
 	struct qmi_tmd_instance *tmd = container_of(work,
 						struct qmi_tmd_instance,
 						svc_arrive_work);
+	struct qmi_cooling_device *qmi_cdev;
 
 	verify_devices_and_register(tmd);
+
+	/* The thermal path takes cdev->lock before tmd->mutex. */
+	list_for_each_entry(qmi_cdev, &tmd->tmd_cdev_list, qmi_node) {
+		if (!qmi_cdev->cdev)
+			continue;
+		mutex_lock(&qmi_cdev->cdev->lock);
+		qmi_cdev->cdev->updated = false;
+		mutex_unlock(&qmi_cdev->cdev->lock);
+	}
+}
+
+/* state_lock is held; callbacks only invalidate state, never wait for replies. */
+static void qmi_tmd_invalidate(struct qmi_tmd_instance *tmd)
+{
+	struct qmi_cooling_device *qmi_cdev;
+
+	tmd->service_online = false;
+	tmd->service_generation++;
+	list_for_each_entry(qmi_cdev, &tmd->tmd_cdev_list, qmi_node) {
+		qmi_cdev->connection_active = false;
+		qmi_cdev->state_dirty = true;
+	}
 }
 
 static void thermal_qmi_net_reset(struct qmi_handle *qmi)
@@ -331,14 +434,10 @@ static void thermal_qmi_net_reset(struct qmi_handle *qmi)
 	struct qmi_tmd_instance *tmd = container_of(qmi,
 						struct qmi_tmd_instance,
 						handle);
-	struct qmi_cooling_device *qmi_cdev = NULL;
 
-	list_for_each_entry(qmi_cdev, &tmd->tmd_cdev_list,
-					qmi_node) {
-		if (qmi_cdev->connection_active)
-			qmi_tmd_send_state_request(qmi_cdev,
-							qmi_cdev->mtgn_state);
-	}
+	spin_lock(&tmd->state_lock);
+	qmi_tmd_invalidate(tmd);
+	spin_unlock(&tmd->state_lock);
 }
 
 static void thermal_qmi_del_server(struct qmi_handle *qmi,
@@ -347,10 +446,12 @@ static void thermal_qmi_del_server(struct qmi_handle *qmi,
 	struct qmi_tmd_instance *tmd = container_of(qmi,
 						struct qmi_tmd_instance,
 						handle);
-	struct qmi_cooling_device *qmi_cdev = NULL;
 
-	list_for_each_entry(qmi_cdev, &tmd->tmd_cdev_list, qmi_node)
-		qmi_cdev->connection_active = false;
+	spin_lock(&tmd->state_lock);
+	if (tmd->server_addr.sq_node == service->node &&
+	    tmd->server_addr.sq_port == service->port)
+		qmi_tmd_invalidate(tmd);
+	spin_unlock(&tmd->state_lock);
 }
 
 static int thermal_qmi_new_server(struct qmi_handle *qmi,
@@ -359,13 +460,17 @@ static int thermal_qmi_new_server(struct qmi_handle *qmi,
 	struct qmi_tmd_instance *tmd = container_of(qmi,
 						struct qmi_tmd_instance,
 						handle);
-	struct sockaddr_qrtr sq = {AF_QIPCRTR, service->node, service->port};
 
-	mutex_lock(&tmd->mutex);
-	kernel_connect(qmi->sock, (struct sockaddr *)&sq, sizeof(sq), 0);
-	mutex_unlock(&tmd->mutex);
-	queue_work(system_highpri_wq, &tmd->svc_arrive_work);
-
+	spin_lock(&tmd->state_lock);
+	if (!tmd->shutting_down) {
+		qmi_tmd_invalidate(tmd);
+		tmd->server_addr.sq_family = AF_QIPCRTR;
+		tmd->server_addr.sq_node = service->node;
+		tmd->server_addr.sq_port = service->port;
+		tmd->service_online = true;
+		queue_work(system_highpri_wq, &tmd->svc_arrive_work);
+	}
+	spin_unlock(&tmd->state_lock);
 	return 0;
 }
 
@@ -377,25 +482,33 @@ static struct qmi_ops thermal_qmi_event_ops = {
 
 static void qmi_tmd_cleanup(void)
 {
-	int idx = 0;
+	int idx;
 	struct qmi_tmd_instance *tmd = tmd_instances;
 	struct qmi_cooling_device *qmi_cdev, *c_next;
 
-	for (; idx < tmd_inst_cnt; idx++) {
+	for (idx = 0; idx < tmd_inst_cnt; idx++) {
+		spin_lock(&tmd[idx].state_lock);
+		tmd[idx].shutting_down = true;
+		qmi_tmd_invalidate(&tmd[idx]);
+		spin_unlock(&tmd[idx].state_lock);
+		cancel_work_sync(&tmd[idx].svc_arrive_work);
+
+		/* Drain the sender without blocking QMI's receive callbacks. */
 		mutex_lock(&tmd[idx].mutex);
+		mutex_unlock(&tmd[idx].mutex);
+		if (tmd[idx].handle_initialized) {
+			qmi_handle_release(&tmd[idx].handle);
+			tmd[idx].handle_initialized = false;
+		}
 		list_for_each_entry_safe(qmi_cdev, c_next,
 				&tmd[idx].tmd_cdev_list, qmi_node) {
-			qmi_cdev->connection_active = false;
-			if (qmi_cdev->cdev)
-				thermal_cooling_device_unregister(
-					qmi_cdev->cdev);
-
+			if (!IS_ERR_OR_NULL(qmi_cdev->cdev))
+				thermal_cooling_device_unregister(qmi_cdev->cdev);
 			list_del(&qmi_cdev->qmi_node);
 		}
-		qmi_handle_release(&tmd[idx].handle);
-
-		mutex_unlock(&tmd[idx].mutex);
 	}
+	tmd_instances = NULL;
+	tmd_inst_cnt = 0;
 }
 
 static int of_get_qmi_tmd_platform_data(struct device *dev)
@@ -432,6 +545,7 @@ static int of_get_qmi_tmd_platform_data(struct device *dev)
 
 		tmd[idx].dev = dev;
 		mutex_init(&tmd[idx].mutex);
+		spin_lock_init(&tmd[idx].state_lock);
 		INIT_LIST_HEAD(&tmd[idx].tmd_cdev_list);
 		INIT_WORK(&tmd[idx].svc_arrive_work, qmi_tmd_svc_arrive);
 
@@ -475,6 +589,7 @@ static int of_get_qmi_tmd_platform_data(struct device *dev)
 			qmi_cdev->tmd = &tmd[idx];
 			qmi_cdev->np = cdev_np;
 			qmi_cdev->mtgn_state = 0;
+			qmi_cdev->state_dirty = true;
 			list_add(&qmi_cdev->qmi_node, &tmd[idx].tmd_cdev_list);
 		}
 		idx++;
@@ -521,6 +636,7 @@ static int qmi_device_probe(struct platform_device *pdev)
 					tmd->inst_id, ret);
 			goto probe_err;
 		}
+		tmd->handle_initialized = true;
 		ret = qmi_add_lookup(&tmd->handle, TMD_SERVICE_ID_V01,
 					TMD_SERVICE_VERS_V01,
 					tmd->inst_id);

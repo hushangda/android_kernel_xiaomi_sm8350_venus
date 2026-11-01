@@ -130,6 +130,10 @@ static int hwui_mon_checksum(void)
 
 	while (1) {
 		count = kernel_read(f, buf, CHECKSUM_BUF_SIZE, &f->f_pos);
+		if (count < 0) {
+			ret = count;
+			goto free_shash;
+		}
 		if (!count)
 			break;
 
@@ -179,7 +183,8 @@ static void hwui_mon_init(void)
 	struct inode *hwui_inode;
 	int ret;
 
-	if (hwui_mon_checksum())
+	ret = hwui_mon_checksum();
+	if (ret)
 		goto error;
 
 	ret = kern_path(HWUI_PATH, 0, &hwui_path);
@@ -196,9 +201,12 @@ static void hwui_mon_init(void)
 	ret = uprobe_register(hwui_inode,
 	    hwui_info[hwui_index].inject2_offset, &hwui_inject2_consumer);
 	if (ret)
-		goto clean;
+		goto unregister_first;
 
 	return;
+unregister_first:
+	uprobe_unregister(hwui_inode,
+	    hwui_info[hwui_index].inject1_offset, &hwui_inject1_consumer);
 clean:
 	path_put(&hwui_path);
 error:
@@ -211,6 +219,8 @@ void hwui_mon_handle_exec(struct filename *filename)
 
 	// Fast path.
 	if (likely(!atomic_read(&need_initialize)))
+		return;
+	if (IS_ERR_OR_NULL(filename))
 		return;
 
 	// Initialize it when zygote starts to make sure filesystems are

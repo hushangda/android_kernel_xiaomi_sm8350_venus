@@ -92,11 +92,12 @@ enum EV_PRIORITY {
 
 #define GPI_DMA_DRV_NAME "gpi_dma"
 #define DEFAULT_KLOG_LVL (LOG_LVL_CRITICAL)
+/* Hardware command timeout is independent of debug logging. */
+#define CMD_TIMEOUT_MS (1000)
 #if IS_ENABLED(CONFIG_MSM_GPI_DMA_DEBUG)
 #define DEFAULT_IPC_LOG_LVL (LOG_LVL_VERBOSE)
 #define IPC_LOG_PAGES (40)
 #define GPI_DBG_LOG_SIZE (SZ_1K) /* size must be power of 2 */
-#define CMD_TIMEOUT_MS (1000)
 #define GPII_REG(gpii, ch, fmt, ...) do { \
 	if (gpii->klog_lvl >= LOG_LVL_REG_ACCESS) \
 		pr_info("%s:%u:%s: " fmt, gpii->label, \
@@ -120,7 +121,6 @@ enum EV_PRIORITY {
 #define IPC_LOG_PAGES (2)
 #define GPI_DBG_LOG_SIZE (0) /* size must be power of 2 */
 #define DEFAULT_IPC_LOG_LVL (LOG_LVL_ERROR)
-#define CMD_TIMEOUT_MS (250)
 /* verbose and register logging are disabled if !debug */
 #define GPII_REG(gpii, ch, fmt, ...)
 #define GPII_VERB(gpii, ch, fmt, ...)

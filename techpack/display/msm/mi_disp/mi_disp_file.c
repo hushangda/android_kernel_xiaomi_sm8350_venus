@@ -186,15 +186,16 @@ static void mi_disp_set_feature_work_handler(struct kthread_work *work)
 
 	mi_dsi_display_set_disp_param(dd_ptr->display, ctl);
 
+	kfree(ctl->tx_ptr);
 	kfree(cur_work);
 }
 
 static int mi_disp_set_feature_queue_work(struct disp_display *dd_ptr,
-			void *data, u32 size)
+			struct disp_feature_ctl *ctl)
 {
 	struct disp_work *cur_work;
 
-	cur_work = kzalloc(sizeof(struct disp_work) + size, GFP_ATOMIC);
+	cur_work = kzalloc(sizeof(*cur_work) + sizeof(*ctl), GFP_KERNEL);
 	if (!cur_work)
 		return -ENOMEM;
 
@@ -202,9 +203,15 @@ static int mi_disp_set_feature_queue_work(struct disp_display *dd_ptr,
 	cur_work->dd_ptr = dd_ptr;
 	cur_work->wq = &dd_ptr->pending_wq;
 	cur_work->data = (u8 *)cur_work + sizeof(struct disp_work);
-	memcpy(cur_work->data, data, size);
+	memcpy(cur_work->data, ctl, sizeof(*ctl));
 
-	kthread_queue_work(&dd_ptr->d_thread.worker, &cur_work->work);
+	if (!kthread_queue_work(&dd_ptr->d_thread.worker, &cur_work->work)) {
+		kfree(cur_work);
+		return -EBUSY;
+	}
+
+	/* The queued work owns the payload, including when the client closes. */
+	ctl->tx_ptr = NULL;
 
 	return 0;
 }
@@ -235,6 +242,12 @@ static int mi_disp_ioctl_set_feature(struct disp_feature_client *client, void *d
 				get_disp_feature_id_name(ctl.feature_id), ctl.feature_val);
 
 			if (is_support_disp_feature_id(ctl.feature_id)) {
+				/* There is no asynchronous channel for a feature reply. */
+				if (req->base.flag == MI_DISP_FLAG_NONBLOCK && req->rx_len) {
+					ret = -EINVAL;
+					goto exit;
+				}
+
 				if (req->tx_len) {
 					ctl.tx_len = req->tx_len;
 					ctl.tx_ptr = kzalloc(ctl.tx_len, GFP_KERNEL);
@@ -258,7 +271,7 @@ static int mi_disp_ioctl_set_feature(struct disp_feature_client *client, void *d
 				}
 
 				if (req->base.flag == MI_DISP_FLAG_NONBLOCK) {
-					ret = mi_disp_set_feature_queue_work(dd_ptr, &ctl, sizeof(ctl));
+					ret = mi_disp_set_feature_queue_work(dd_ptr, &ctl);
 				} else {
 					ret = mi_dsi_display_set_disp_param(dd_ptr->display, &ctl);
 				}

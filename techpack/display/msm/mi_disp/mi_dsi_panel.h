@@ -169,6 +169,8 @@ struct mi_dsi_panel_cfg {
 	u32 doze_brightness;
 	bool bl_wait_frame;
 	bool bl_enable;
+	/* Reconstructed stock layer bit 0x10 state, consumed on LP1 entry. */
+	bool bl_preserve_layer_enabled;
 	/* Some panel nolp command is different according to current doze brightness set,
 	 * But sometimes doze brightness change to DOZE_TO_NORMAL before nolp. So this
 	 * doze_brightness_backup will save doze_brightness and only change to DOZE_TO_NORMAL by nolp.

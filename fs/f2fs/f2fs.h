@@ -1853,6 +1853,8 @@ struct f2fs_sb_info {
 	u64 committed_atomic_block;
 	u64 revoked_atomic_block;
 
+	/* Serializes GC/CP thread lifecycle and their priority updates. */
+	struct mutex critical_task_lock;
 	/* Priority for critical tasks, e.g. f2fs_ckpt and f2fs_gc. */
 	long critical_task_priority;
 

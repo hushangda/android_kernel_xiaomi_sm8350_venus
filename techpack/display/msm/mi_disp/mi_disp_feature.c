@@ -49,54 +49,41 @@ struct disp_feature *mi_get_disp_feature(void)
 	return g_disp_feature;
 }
 
+static int mi_disp_feature_thread_destroy(struct disp_feature *df, int disp_id);
+
 static int mi_disp_feature_thread_create(struct disp_feature *df, int disp_id)
 {
-	int ret = 0;
-	struct disp_thread *dt_ptr = NULL;
-	struct sched_param param = { 0 };
+	struct disp_thread *threads[2];
+	const char *names[] = { "disp_feature:%d", "disp_fod:%d" };
+	struct sched_param param = { .sched_priority = 16 };
+	int i, ret;
 
-	if (!df) {
-		DISP_ERROR("invalid params\n");
+	if (!df || !is_support_disp_id(disp_id))
 		return -EINVAL;
-	}
 
-	param.sched_priority = 16;
-	if (is_support_disp_id(disp_id)) {
-		dt_ptr = &df->d_display[disp_id].d_thread;
-		dt_ptr->dd_ptr = &df->d_display[disp_id];
-		kthread_init_worker(&dt_ptr->worker);
-		dt_ptr->thread = kthread_run(kthread_worker_fn,
-				&dt_ptr->worker, "disp_feature:%d", disp_id);
+	threads[0] = &df->d_display[disp_id].d_thread;
+	threads[1] = &df->d_display[disp_id].fod_thread;
+	for (i = 0; i < ARRAY_SIZE(threads); i++) {
+		struct disp_thread *dt = threads[i];
 
-		ret = sched_setscheduler(dt_ptr->thread, SCHED_FIFO, &param);
-		if (ret)
-			DISP_WARN("display thread priority update failed: %d\n", ret);
-
-		if (IS_ERR(dt_ptr->thread)) {
-			DISP_ERROR("failed to create disp_feature kthread\n");
-			dt_ptr->thread = NULL;
+		dt->dd_ptr = &df->d_display[disp_id];
+		kthread_init_worker(&dt->worker);
+		dt->thread = kthread_run(kthread_worker_fn, &dt->worker,
+					 names[i], disp_id);
+		if (IS_ERR(dt->thread)) {
+			ret = PTR_ERR(dt->thread);
+			dt->thread = NULL;
+			goto err_threads;
 		}
-		DISP_INFO("create disp_feature:%d kthread success\n", disp_id);
-
-		dt_ptr = &df->d_display[disp_id].fod_thread;
-		dt_ptr->dd_ptr = &df->d_display[disp_id];
-		kthread_init_worker(&dt_ptr->worker);
-		dt_ptr->thread = kthread_run(kthread_worker_fn,
-				&dt_ptr->worker, "disp_fod:%d", disp_id);
-
-		ret = sched_setscheduler(dt_ptr->thread, SCHED_FIFO, &param);
+		ret = sched_setscheduler(dt->thread, SCHED_FIFO, &param);
 		if (ret)
-			DISP_WARN("display thread priority update failed: %d\n", ret);
-
-		if (IS_ERR(dt_ptr->thread)) {
-			DISP_ERROR("failed to create disp_feature kthread\n");
-			dt_ptr->thread = NULL;
-		}
-		DISP_INFO("create disp_fod:%d kthread success\n", disp_id);
-	} else {
-		DISP_ERROR("Unknown display id, failed to create disp_feature kthread\n");
+			goto err_threads;
 	}
+	return 0;
 
+err_threads:
+	DISP_ERROR("failed to initialize display threads: %d\n", ret);
+	mi_disp_feature_thread_destroy(df, disp_id);
 	return ret;
 }
 

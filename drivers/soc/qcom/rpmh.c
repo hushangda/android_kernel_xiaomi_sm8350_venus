@@ -295,7 +295,11 @@ int rpmh_write_async(const struct device *dev, enum rpmh_state state,
 		return ret;
 	}
 
-	return __rpmh_write(dev, state, rpm_msg);
+	ret = __rpmh_write(dev, state, rpm_msg);
+	/* Rejected requests have no completion owner. */
+	if (ret)
+		kfree(rpm_msg);
+	return ret;
 }
 EXPORT_SYMBOL(rpmh_write_async);
 
@@ -340,7 +344,7 @@ int rpmh_write(const struct device *dev, enum rpmh_state state,
 		return -ETIMEDOUT;
 	}
 
-	return 0;
+	return rpm_msg.err;
 }
 EXPORT_SYMBOL(rpmh_write);
 
@@ -487,6 +491,9 @@ int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
 			rpmh_rsc_debug(ctrlr_to_drv(ctrlr), &compls[i]);
 			BUG_ON(1);
 		}
+		/* Drain every accepted request before freeing the batch. */
+		if (!ret && rpm_msgs[i].err)
+			ret = rpm_msgs[i].err;
 	}
 
 exit:

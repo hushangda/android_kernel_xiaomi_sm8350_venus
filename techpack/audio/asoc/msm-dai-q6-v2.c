@@ -435,16 +435,11 @@ static const struct soc_enum mi2s_config_enum[] = {
 
 static const char *const cdc_dma_format[] = {
 	"UNPACKED",
-	"UNPACKED_NON_LINEAR",
-	"PACKED_LINEAR_60958",
-	"PACKED_NON_LINEAR_60958",
-	"NULL",
-	"NULL",
-        "PACKED_16B",
+	"PACKED_16B",
 };
 
 static const struct soc_enum cdc_dma_config_enum[] = {
-	SOC_ENUM_SINGLE_EXT(7, cdc_dma_format),
+	SOC_ENUM_SINGLE_EXT(ARRAY_SIZE(cdc_dma_format), cdc_dma_format),
 };
 
 static const char *const sb_format[] = {
@@ -15477,7 +15472,10 @@ static int msm_dai_q6_cdc_dma_format_put(struct snd_kcontrol *kcontrol,
 				      struct snd_ctl_elem_value *ucontrol)
 {
 	struct msm_dai_q6_cdc_dma_dai_data *dai_data = kcontrol->private_data;
-	int value = ucontrol->value.integer.value[0];
+	unsigned int value = ucontrol->value.enumerated.item[0];
+
+	if (value >= ARRAY_SIZE(cdc_dma_format))
+		return -EINVAL;
 
 	dai_data->port_config.cdc_dma.data_format = value;
 	pr_debug("%s: format = %d\n", __func__, value);
@@ -15489,7 +15487,7 @@ static int msm_dai_q6_cdc_dma_format_get(struct snd_kcontrol *kcontrol,
 {
 	struct msm_dai_q6_cdc_dma_dai_data *dai_data = kcontrol->private_data;
 
-	ucontrol->value.integer.value[0] =
+	ucontrol->value.enumerated.item[0] =
 		dai_data->port_config.cdc_dma.data_format;
 	return 0;
 }
@@ -15710,12 +15708,15 @@ static int msm_dai_q6_cdc_dma_prepare(struct snd_pcm_substream *substream,
 {
 	struct msm_dai_q6_cdc_dma_dai_data *dai_data =
 						dev_get_drvdata(dai->dev);
+	union afe_port_config port_config;
 	int rc = 0;
 
 	if (!test_bit(STATUS_PORT_STARTED, dai_data->status_mask)) {
+		/* Keep the mixer index separate from the AFE wire format. */
+		port_config = dai_data->port_config;
 		if ((dai->id == AFE_PORT_ID_WSA_CODEC_DMA_TX_0) &&
-			(dai_data->port_config.cdc_dma.data_format == 1))
-			dai_data->port_config.cdc_dma.data_format =
+			(port_config.cdc_dma.data_format == 1))
+			port_config.cdc_dma.data_format =
 				AFE_LINEAR_PCM_DATA_PACKED_16BIT;
 
 		if (dai_data->cdc_dma_data_align) {
@@ -15725,7 +15726,7 @@ static int msm_dai_q6_cdc_dma_prepare(struct snd_pcm_substream *substream,
 				pr_debug("%s: afe send data alignment failed %d\n",
 					__func__, rc);
 		}
-		rc = afe_port_start(dai->id, &dai_data->port_config,
+		rc = afe_port_start(dai->id, &port_config,
 						dai_data->rate);
 		if (rc < 0)
 			dev_err(dai->dev, "fail to open AFE port 0x%x\n",
