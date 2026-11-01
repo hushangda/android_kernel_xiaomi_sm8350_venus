@@ -891,6 +891,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (entity_is_task(curr)) {
 		struct task_struct *curtask = task_of(curr);
 
+		xr_qos_vip_account(rq_of(cfs_rq), curtask, delta_exec);
 		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
 		cgroup_account_cputime(curtask, delta_exec);
 		account_group_exec_runtime(curtask, delta_exec);
@@ -5542,6 +5543,8 @@ static inline void update_overutilized_status(struct rq *rq) { }
  * increased. Here we update the fair scheduling stats and
  * then put the task into the rbtree:
  */
+#include "xr_qos_fair.h"
+
 static void
 enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -5549,6 +5552,8 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_entity *se = &p->se;
 	int idle_h_nr_running = task_has_idle_policy(p);
 	int task_new = !(flags & ENQUEUE_WAKEUP);
+
+	xr_vip_enqueue(rq, p);
 
 	/*
 	 * The code below (indirectly) updates schedutil which looks at
@@ -5662,6 +5667,8 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_entity *se = &p->se;
 	int task_sleep = flags & DEQUEUE_SLEEP;
 	int idle_h_nr_running = task_has_idle_policy(p);
+
+	xr_vip_dequeue(p);
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
@@ -7820,6 +7827,13 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	if (unlikely(throttled_hierarchy(cfs_rq_of(pse))))
 		return;
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (p->xr_qos_vip > curr->xr_qos_vip && xr_vip_budget(rq)) {
+		resched_curr(rq);
+		return;
+	}
+#endif
+
 	if (sched_feat(NEXT_BUDDY) && scale && !(wake_flags & WF_FORK)) {
 		set_next_buddy(pse);
 		next_buddy_marked = 1;
@@ -7896,6 +7910,11 @@ again:
 		goto idle;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
+	/* A VIP may belong to a different hierarchy; use the complete path. */
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (!list_empty(&rq->xr_vip_tasks))
+		goto simple;
+#endif
 	if (!prev || prev->sched_class != &fair_sched_class)
 		goto simple;
 
@@ -7975,6 +7994,18 @@ simple:
 #endif
 	if (prev)
 		put_prev_task(rq, prev);
+
+#ifdef CONFIG_XIAOMI_XR_QOS
+	p = xr_vip_pick(rq);
+	if (p) {
+		se = &p->se;
+		for_each_sched_entity(se)
+			set_next_entity(cfs_rq_of(se), se);
+		goto done;
+	}
+	if (!cfs_rq->nr_running)
+		goto idle;
+#endif
 
 	do {
 		se = pick_next_entity(cfs_rq, NULL);

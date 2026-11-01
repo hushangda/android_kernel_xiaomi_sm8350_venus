@@ -2082,8 +2082,8 @@ static int32_t adm_callback(struct apr_client_data *data, void *priv)
 			 */
 			payload_size = data->payload_size;
 			pp_event_package = kzalloc(payload_size
-					+ sizeof(struct msm_adsp_event_data)
-					, GFP_ATOMIC);
+					+ sizeof(*pp_event_package)
+					+ sizeof(usr_data), GFP_ATOMIC);
 
 			if (!pp_event_package)
 				return -ENOMEM;

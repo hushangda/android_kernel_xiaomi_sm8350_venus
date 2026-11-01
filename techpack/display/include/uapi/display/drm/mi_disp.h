@@ -72,6 +72,9 @@ enum disp_feature_id {
 	DISP_FEATURE_DBI = 20,
 	DISP_FEATURE_DDIC_ROUND_CORNER = 21,
 	DISP_FEATURE_HBM_BACKLIGHT = 22,
+	DISP_FEATURE_FULLSCREEN_AOD = 35,
+	DISP_FEATURE_LAYER_HAS_AOD = 39,
+	DISP_FEATURE_EARLY_SCREEN_STATUS = 40,
 	DISP_FEATURE_MAX,
 };
 
@@ -127,6 +130,17 @@ struct disp_feature_req {
 	__u64 tx_ptr;
 	__u32 rx_len;
 	__u64 rx_ptr;
+};
+
+/* Count-info wire layout matches the 48-byte SET_FEATURE request. */
+struct disp_count_req {
+	struct disp_base base;
+	__u32 count_type;
+	__s32 count_value;
+	__u32 tx_len;
+	__aligned_u64 tx_ptr;
+	__u32 rx_len;
+	__aligned_u64 rx_ptr;
 };
 
 /**
@@ -186,6 +200,7 @@ enum disp_event_type {
     MI_DISP_EVENT_51_BRIGHTNESS = 6,
     MI_DISP_EVENT_HBM = 7,
     MI_DISP_EVENT_DC = 8,
+    MI_DISP_EVENT_FULLSCREEN_AOD = 15,
     MI_DISP_EVENT_MAX,
 };
 
@@ -281,7 +296,8 @@ static inline const char *get_doze_brightness_name(__u32 doze_brightness)
 
 static inline int is_support_disp_event_type(__u32 event_type)
 {
-	if (MI_DISP_EVENT_POWER <= event_type && event_type < MI_DISP_EVENT_MAX)
+	if (MI_DISP_EVENT_POWER <= event_type && (event_type <= MI_DISP_EVENT_DC ||
+		event_type == MI_DISP_EVENT_FULLSCREEN_AOD))
 		return 1;
 	else
 		return 0;
@@ -290,6 +306,8 @@ static inline int is_support_disp_event_type(__u32 event_type)
 static inline const char *get_disp_event_type_name(__u32 event_type)
 {
 	switch (event_type) {
+	case MI_DISP_EVENT_FULLSCREEN_AOD:
+		return "Fullscreen_AOD";
 	case MI_DISP_EVENT_POWER:
 		return "Power";
 	case MI_DISP_EVENT_BACKLIGHT:
@@ -315,7 +333,10 @@ static inline const char *get_disp_event_type_name(__u32 event_type)
 
 static inline int is_support_disp_feature_id(int feature_id)
 {
-	if (DISP_FEATURE_DIMMING <= feature_id && feature_id < DISP_FEATURE_MAX)
+	if (DISP_FEATURE_DIMMING <= feature_id && (feature_id <= DISP_FEATURE_HBM_BACKLIGHT ||
+		feature_id == DISP_FEATURE_FULLSCREEN_AOD ||
+		feature_id == DISP_FEATURE_LAYER_HAS_AOD ||
+		feature_id == DISP_FEATURE_EARLY_SCREEN_STATUS))
 		return 1;
 	else
 		return 0;
@@ -378,6 +399,12 @@ static inline const char *get_fingerprint_status_name(int status)
 static inline const char *get_disp_feature_id_name(int feature_id)
 {
 	switch (feature_id) {
+	case DISP_FEATURE_LAYER_HAS_AOD:
+		return "layer_has_aod";
+	case DISP_FEATURE_EARLY_SCREEN_STATUS:
+		return "early_screen_status";
+	case DISP_FEATURE_FULLSCREEN_AOD:
+		return "fullscreen_aod";
 	case DISP_FEATURE_DIMMING:
 		return "dimming";
 	case DISP_FEATURE_HBM:
@@ -482,7 +509,8 @@ static inline const char *getDozeBrightnessName(__u32 doze_brightness)
 
 static inline int isSupportDispEventType(__u32 event_type)
 {
-	if (MI_DISP_EVENT_POWER <= event_type && event_type < MI_DISP_EVENT_MAX)
+	if (MI_DISP_EVENT_POWER <= event_type && (event_type <= MI_DISP_EVENT_DC ||
+		event_type == MI_DISP_EVENT_FULLSCREEN_AOD))
 		return 1;
 	else
 		return 0;
@@ -491,6 +519,8 @@ static inline int isSupportDispEventType(__u32 event_type)
 static inline const char *getDispEventTypeName(__u32 event_type)
 {
 	switch (event_type) {
+	case MI_DISP_EVENT_FULLSCREEN_AOD:
+		return "Fullscreen_AOD";
 	case MI_DISP_EVENT_POWER:
 		return "Power";
 	case MI_DISP_EVENT_BACKLIGHT:
@@ -516,7 +546,10 @@ static inline const char *getDispEventTypeName(__u32 event_type)
 
 static inline int isSupportDispFeatureId(int feature_id)
 {
-	if (DISP_FEATURE_DIMMING <= feature_id && feature_id < DISP_FEATURE_MAX)
+	if (DISP_FEATURE_DIMMING <= feature_id && (feature_id <= DISP_FEATURE_HBM_BACKLIGHT ||
+		feature_id == DISP_FEATURE_FULLSCREEN_AOD ||
+		feature_id == DISP_FEATURE_LAYER_HAS_AOD ||
+		feature_id == DISP_FEATURE_EARLY_SCREEN_STATUS))
 		return 1;
 	else
 		return 0;
@@ -579,6 +612,12 @@ static inline const char *getFingerprintStatusName(int status)
 static inline const char *getDispFeatureIdName(int feature_id)
 {
 	switch (feature_id) {
+	case DISP_FEATURE_LAYER_HAS_AOD:
+		return "layer_has_aod";
+	case DISP_FEATURE_EARLY_SCREEN_STATUS:
+		return "early_screen_status";
+	case DISP_FEATURE_FULLSCREEN_AOD:
+		return "fullscreen_aod";
 	case DISP_FEATURE_DIMMING:
 		return "dimming";
 	case DISP_FEATURE_HBM:
@@ -653,6 +692,7 @@ static inline const char *getDispFeatureIdName(int feature_id)
 #define MI_DISP_IOCTL_READ_DSI_CMD        _IOWR('D', 0x0A, struct disp_dsi_cmd_req)
 #define MI_DISP_IOCTL_GET_BRIGHTNESS       _IOR('D', 0x0B, struct disp_brightness_req)
 #define MI_DISP_IOCTL_GET_FEATURE         _IOWR('D', 0x0C, struct disp_feature_req)
+#define MI_DISP_IOCTL_SET_COUNT_INFO      _IOWR('D', 0x0D, struct disp_count_req)
 #define MI_DISP_IOCTL_SET_LOCAL_HBM        _IOW('D', 0x0E, struct disp_local_hbm_req)
 
 #if defined(__cplusplus)

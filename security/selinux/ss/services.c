@@ -3782,29 +3782,52 @@ int security_read_policy(struct selinux_state *state,
 			 void **data, size_t *len)
 {
 	struct policydb *policydb = &state->ss->policydb;
-	int rc;
-	struct policy_file fp;
+	struct policy_file fp, measure;
+	void *buffer;
+	size_t capacity;
+	int rc, attempt;
 
+	*data = NULL;
+	*len = 0;
 	if (!state->initialized)
 		return -EINVAL;
 
-	*len = security_policydb_len(state);
+	/*
+	 * The original loaded length is not a serialization capacity after
+	 * dynamic policy updates or read-time attribute expansion. Measure the
+	 * actual representation rather than guessing extra bytes. Allocation
+	 * must sleep outside policy_rwlock, so recheck under the same lock as
+	 * the write and retry a concurrent growth a bounded number of times.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		measure = (struct policy_file) { };
+		read_lock(&state->ss->policy_rwlock);
+		rc = policydb_write(policydb, &measure);
+		read_unlock(&state->ss->policy_rwlock);
+		if (rc)
+			return rc;
+		capacity = measure.len;
+		buffer = vmalloc_user(capacity);
+		if (!buffer)
+			return -ENOMEM;
 
-	*data = vmalloc_user(*len);
-	if (!*data)
-		return -ENOMEM;
-
-	fp.data = *data;
-	fp.len = *len;
-
-	read_lock(&state->ss->policy_rwlock);
-	rc = policydb_write(policydb, &fp);
-	read_unlock(&state->ss->policy_rwlock);
-
-	if (rc)
-		return rc;
-
-	*len = (unsigned long)fp.data - (unsigned long)*data;
-	return 0;
-
+		measure = (struct policy_file) { };
+		fp.data = buffer;
+		fp.len = capacity;
+		read_lock(&state->ss->policy_rwlock);
+		rc = policydb_write(policydb, &measure);
+		if (!rc)
+			rc = measure.len > capacity ? -EAGAIN :
+				policydb_write(policydb, &fp);
+		read_unlock(&state->ss->policy_rwlock);
+		if (!rc) {
+			*data = buffer;
+			*len = capacity - fp.len;
+			return 0;
+		}
+		vfree(buffer);
+		if (rc != -EAGAIN)
+			return rc;
+	}
+	return -EAGAIN;
 }

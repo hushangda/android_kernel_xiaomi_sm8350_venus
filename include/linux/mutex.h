@@ -19,6 +19,7 @@
 #include <asm/processor.h>
 #include <linux/osq_lock.h>
 #include <linux/debug_locks.h>
+#include <linux/xr_qos.h>
 
 struct ww_acquire_ctx;
 
@@ -73,6 +74,9 @@ struct mutex_waiter {
 	struct list_head	list;
 	struct task_struct	*task;
 	struct ww_acquire_ctx	*ww_ctx;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct xr_qos_link	xr_qos;
+#endif
 #ifdef CONFIG_DEBUG_MUTEXES
 	void			*magic;
 #endif

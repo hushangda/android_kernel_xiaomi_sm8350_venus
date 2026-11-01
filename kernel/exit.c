@@ -6,6 +6,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/xr_qos.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
@@ -841,6 +842,7 @@ void do_exit(long code)
 	}
 
 	exit_signals(tsk);  /* sets PF_EXITING */
+	xr_qos_exit(tsk);
 
 	/* sync mm's RSS info before statistics gathering */
 	if (tsk->mm)

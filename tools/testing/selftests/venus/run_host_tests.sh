@@ -24,10 +24,6 @@ for variant in packing core_ctl touch touch_factory battery; do
       sed -n '/^#define MIUI_POWER_ENHANCE_CLUSTER_PACKING/,/^extern unsigned int miui_power_enhance;/p' \
         "$source_dir/include/linux/sched/sysctl.h"
     fi
-    if [[ "$test" == battery ]]; then
-      sed -n '/^#define VENUS_BATTERY_MODEL_NAME/,/^#define VENUS_UI_SOC_FALLBACK_STEP_MS/p' \
-        "$source_dir/drivers/power/supply/qti_battery_charger_venus.c"
-    fi
     sed -n '1,$p' "$test_dir/${test}_test.c"
     case "$test" in
       packing)
@@ -47,17 +43,8 @@ for variant in packing core_ctl touch touch_factory battery; do
       battery)
         battery_source="$source_dir/drivers/power/supply/qti_battery_charger_venus.c"
         for signature in \
-          'static bool battery_chg_capacity_uah_valid' \
-          'static u32 battery_chg_refresh_pack_capacity_uah' \
-          'static int battery_chg_read_fg_remaining_uah' \
-          'static u32 battery_chg_effective_full_uah' \
-          'static u32 battery_chg_ui_soc_step_ms' \
-          'static void battery_chg_reset_ui_soc' \
-          'static void battery_chg_restart_ui_soc' \
-          'static int battery_chg_read_ui_status' \
-          'static int battery_chg_get_ui_capacity' \
-          'static void battery_chg_ui_soc_work' \
-          'static int battery_psy_get_prop'; do
+          'static int battery_psy_get_prop' \
+          'static ssize_t charge_counter_show'; do
           extract_function "$signature" "$battery_source"
         done
         ;;

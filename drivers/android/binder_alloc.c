@@ -691,6 +691,9 @@ static void binder_free_buf_locked(struct binder_alloc *alloc,
 {
 	size_t size, buffer_size;
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&buffer->xr_qos);
+#endif
 	buffer_size = binder_alloc_buffer_size(alloc, buffer);
 
 	size = ALIGN(buffer->data_size, sizeof(void *)) +

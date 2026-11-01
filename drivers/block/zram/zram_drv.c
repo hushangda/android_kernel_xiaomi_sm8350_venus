@@ -33,8 +33,11 @@
 #include <linux/sysfs.h>
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
+#include <linux/memcontrol.h>
+#include <linux/mi_memcg.h>
 
 #include "zram_drv.h"
+#include "backend_zstd.h"
 
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
@@ -52,8 +55,23 @@ static unsigned int num_devices = 1;
 static size_t huge_class_size;
 
 static void zram_free_page(struct zram *zram, size_t index);
+/* A pinned backing block cannot be recycled while readback is in flight. */
+struct zram_wb_token {
+	unsigned long block;
+};
 static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
 				u32 index, int offset, struct bio *bio);
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+static int zram_group_bio(struct zram *zram, struct page *page,
+			 unsigned long block, bool write);
+static int zram_group_read_async(struct zram *zram, struct bio_vec *bvec,
+				unsigned long block, struct bio *parent, bool sync);
+static int zram_group_reserve_quota(struct zram *zram);
+static void zram_group_release_quota(struct zram *zram, int reserved);
+#endif
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+static void zram_extm_reset(struct zram *zram);
+#endif
 
 
 static int zram_slot_trylock(struct zram *zram, u32 index)
@@ -155,6 +173,39 @@ static inline bool zram_allocated(struct zram *zram, u32 index)
 			zram_test_flag(zram, index, ZRAM_SAME) ||
 			zram_test_flag(zram, index, ZRAM_WB);
 }
+
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+/* All helpers require the slot lock, or exclusive device reset ownership. */
+static void zram_memcg_clear(struct zram *zram, u32 index)
+{
+	struct mem_cgroup *memcg = zram->table[index].memcg;
+	bool wb = zram_test_flag(zram, index, ZRAM_WB);
+
+	if (!memcg)
+		return;
+	zram->table[index].memcg = NULL;
+	mi_memcg_zram_remove(memcg, wb ? PAGE_SIZE :
+			     zram_get_obj_size(zram, index), wb);
+	css_put(&memcg->css);
+}
+
+/* Transfer the owned CSS reference across a physical object replacement. */
+static struct mem_cgroup *zram_memcg_preserve(struct zram *zram, u32 index)
+{
+	struct mem_cgroup *memcg = zram->table[index].memcg;
+
+	zram->table[index].memcg = NULL;
+	return memcg;
+}
+
+static void zram_memcg_restore(struct zram *zram, u32 index,
+			      struct mem_cgroup *memcg, u32 old_bytes,
+			      u32 new_bytes, bool old_wb, bool new_wb)
+{
+	zram->table[index].memcg = memcg;
+	mi_memcg_zram_replace(memcg, old_bytes, new_bytes, old_wb, new_wb);
+}
+#endif
 
 #if PAGE_SIZE != 4096
 static inline bool is_partial_io(struct bio_vec *bvec)
@@ -438,7 +489,13 @@ static void reset_bdev(struct zram *zram)
 	bdev = zram->bdev;
 	if (zram->old_block_size)
 		set_blocksize(bdev, zram->old_block_size);
-	blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+	if (zram->extm) {
+		zram_extm_reset(zram);
+		blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
+	} else
+#endif
+		blkdev_put(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
 	/* hope filp_close flush all of IO */
 	filp_close(zram->backing_dev, NULL);
 	zram->backing_dev = NULL;
@@ -448,6 +505,10 @@ static void reset_bdev(struct zram *zram)
 				BDI_CAP_SYNCHRONOUS_IO;
 	kvfree(zram->bitmap);
 	zram->bitmap = NULL;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	kvfree(zram->backing_refs);
+	zram->backing_refs = NULL;
+#endif
 }
 
 static ssize_t backing_dev_show(struct device *dev,
@@ -491,6 +552,9 @@ static ssize_t backing_dev_store(struct device *dev,
 	unsigned int bitmap_sz, old_block_size = 0;
 	unsigned long nr_pages, *bitmap = NULL;
 	struct block_device *bdev = NULL;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	atomic_t *backing_refs = NULL;
+#endif
 	int err;
 	struct zram *zram = dev_to_zram(dev);
 
@@ -547,6 +611,13 @@ static ssize_t backing_dev_store(struct device *dev,
 		err = -ENOMEM;
 		goto out;
 	}
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	backing_refs = kvcalloc(nr_pages, sizeof(*backing_refs), GFP_KERNEL);
+	if (!backing_refs) {
+		err = -ENOMEM;
+		goto out;
+	}
+#endif
 
 	old_block_size = block_size(bdev);
 	err = set_blocksize(bdev, PAGE_SIZE);
@@ -560,6 +631,9 @@ static ssize_t backing_dev_store(struct device *dev,
 	zram->backing_dev = backing_dev;
 	zram->bitmap = bitmap;
 	zram->nr_pages = nr_pages;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	zram->backing_refs = backing_refs;
+#endif
 	/*
 	 * With writeback feature, zram does asynchronous IO so it's no longer
 	 * synchronous device so let's remove synchronous io flag. Othewise,
@@ -581,6 +655,9 @@ static ssize_t backing_dev_store(struct device *dev,
 out:
 	if (bitmap)
 		kvfree(bitmap);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	kvfree(backing_refs);
+#endif
 
 	if (bdev)
 		blkdev_put(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
@@ -607,6 +684,9 @@ retry:
 	if (test_and_set_bit(blk_idx, zram->bitmap))
 		goto retry;
 
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	atomic_set(&zram->backing_refs[blk_idx], 1);
+#endif
 	atomic64_inc(&zram->stats.bd_count);
 	return blk_idx;
 }
@@ -615,10 +695,18 @@ static void free_block_bdev(struct zram *zram, unsigned long blk_idx)
 {
 	int was_set;
 
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	if (!atomic_dec_and_test(&zram->backing_refs[blk_idx]))
+		return;
+#endif
 	was_set = test_and_clear_bit(blk_idx, zram->bitmap);
 	WARN_ON_ONCE(!was_set);
 	atomic64_dec(&zram->stats.bd_count);
 }
+
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+#include "zram_extm.c"
+#endif
 
 static void zram_page_end_io(struct bio *bio)
 {
@@ -702,11 +790,17 @@ static ssize_t writeback_store(struct device *dev,
 
 	for (index = 0; index < nr_pages; index++) {
 		struct bio_vec bvec;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+		struct mem_cgroup *memcg;
+		u32 old_bytes;
+		int reserved;
+#endif
 
 		bvec.bv_page = page;
 		bvec.bv_len = PAGE_SIZE;
 		bvec.bv_offset = 0;
 
+#ifndef CONFIG_XIAOMI_MEMCG_RECLAIM
 		spin_lock(&zram->wb_limit_lock);
 		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
 			spin_unlock(&zram->wb_limit_lock);
@@ -714,6 +808,7 @@ static ssize_t writeback_store(struct device *dev,
 			break;
 		}
 		spin_unlock(&zram->wb_limit_lock);
+#endif
 
 		if (!blk_idx) {
 			blk_idx = alloc_block_bdev(zram);
@@ -754,6 +849,22 @@ static ssize_t writeback_store(struct device *dev,
 			continue;
 		}
 
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+		reserved = zram_group_reserve_quota(zram);
+		if (reserved < 0) {
+			zram_slot_lock(zram, index);
+			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+			zram_clear_flag(zram, index, ZRAM_IDLE);
+			zram_slot_unlock(zram, index);
+			ret = reserved;
+			break;
+		}
+#endif
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+		if (zram->extm) {
+			err = zram_group_bio(zram, bvec.bv_page, blk_idx, true);
+		} else {
+#endif
 		bio_init(&bio, &bio_vec, 1);
 		bio_set_dev(&bio, zram->bdev);
 		bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
@@ -766,7 +877,13 @@ static ssize_t writeback_store(struct device *dev,
 		 * but it would be not bad as starter.
 		 */
 		err = submit_bio_wait(&bio);
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+		}
+#endif
 		if (err) {
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+			zram_group_release_quota(zram, reserved);
+#endif
 			zram_slot_lock(zram, index);
 			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
 			zram_clear_flag(zram, index, ZRAM_IDLE);
@@ -797,16 +914,27 @@ static ssize_t writeback_store(struct device *dev,
 			goto next;
 		}
 
+		/* Same logical page and owner: only its storage tier changes. */
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+		old_bytes = zram_get_obj_size(zram, index);
+		memcg = zram_memcg_preserve(zram, index);
+#endif
 		zram_free_page(zram, index);
 		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
 		zram_set_flag(zram, index, ZRAM_WB);
 		zram_set_element(zram, index, blk_idx);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+		zram_memcg_restore(zram, index, memcg, old_bytes,
+				   PAGE_SIZE, false, true);
+#endif
 		blk_idx = 0;
 		atomic64_inc(&zram->stats.pages_stored);
+#ifndef CONFIG_XIAOMI_MEMCG_RECLAIM
 		spin_lock(&zram->wb_limit_lock);
 		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
 			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
 		spin_unlock(&zram->wb_limit_lock);
+#endif
 next:
 		zram_slot_unlock(zram, index);
 	}
@@ -870,7 +998,7 @@ static int read_from_bdev_sync(struct zram *zram, struct bio_vec *bvec,
 }
 #endif
 
-static int read_from_bdev(struct zram *zram, struct bio_vec *bvec,
+static int __maybe_unused read_from_bdev(struct zram *zram, struct bio_vec *bvec,
 			unsigned long entry, struct bio *parent, bool sync)
 {
 	atomic64_inc(&zram->stats.bd_reads);
@@ -881,7 +1009,7 @@ static int read_from_bdev(struct zram *zram, struct bio_vec *bvec,
 }
 #else
 static inline void reset_bdev(struct zram *zram) {};
-static int read_from_bdev(struct zram *zram, struct bio_vec *bvec,
+static int __maybe_unused read_from_bdev(struct zram *zram, struct bio_vec *bvec,
 			unsigned long entry, struct bio *parent, bool sync)
 {
 	return -EIO;
@@ -1022,6 +1150,7 @@ static void comp_algorithm_set(struct zram *zram, u32 prio, const char *alg)
 	if (zram->comp_algs[prio] != default_compressor)
 		kfree(zram->comp_algs[prio]);
 	zram->comp_algs[prio] = alg;
+	zram->comp_levels[prio] = 0;
 }
 
 static ssize_t __comp_algorithm_show(struct zram *zram, u32 prio, char *buf)
@@ -1086,6 +1215,79 @@ static ssize_t comp_algorithm_store(struct device *dev,
 
 	ret = __comp_algorithm_store(zram, ZRAM_PRIMARY_COMP, buf);
 	return ret ? ret : len;
+}
+
+/* Caller holds init_lock; return the first configured matching slot. */
+static int comp_algorithm_lookup(struct zram *zram, const char *algo, u32 first)
+{
+	u32 prio;
+
+	for (prio = first; prio < ZRAM_MAX_COMPS; prio++)
+		if (zram->comp_algs[prio] &&
+		    !strcmp(zram->comp_algs[prio], algo))
+			return prio;
+	return -EINVAL;
+}
+
+static ssize_t algorithm_params_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	char *input, *args, *param, *val, *algo = NULL;
+	u32 prio = ZRAM_PRIMARY_COMP;
+	bool have_prio = false, have_level = false;
+	int level = 0;
+	ssize_t ret = -EINVAL;
+
+	input = kstrndup(buf, len, GFP_KERNEL);
+	if (!input)
+		return -ENOMEM;
+	args = skip_spaces(input);
+	while (*args) {
+		args = next_arg(args, &param, &val);
+		if (!val || !*val)
+			goto out_free;
+		if (!strcmp(param, "algo") && !algo) {
+			algo = val;
+		} else if (!strcmp(param, "priority") && !have_prio) {
+			if (kstrtouint(val, 10, &prio))
+				goto out_free;
+			have_prio = true;
+		} else if (!strcmp(param, "level") && !have_level) {
+			if (kstrtoint(val, 10, &level))
+				goto out_free;
+			have_level = true;
+		} else {
+			goto out_free;
+		}
+	}
+	if (!have_level || !zcomp_zstd_level_valid(level))
+		goto out_free;
+
+	down_write(&zram->init_lock);
+	if (init_done(zram)) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	if (algo && !have_prio) {
+		ret = comp_algorithm_lookup(zram, algo, ZRAM_PRIMARY_COMP);
+		if (ret < 0)
+			goto out_unlock;
+		prio = ret;
+	}
+	ret = -EINVAL;
+	if (prio >= ZRAM_MAX_COMPS || !zram->comp_algs[prio] ||
+	    strcmp(zram->comp_algs[prio], "zstd") ||
+	    (algo && strcmp(zram->comp_algs[prio], algo)))
+		goto out_unlock;
+
+	zram->comp_levels[prio] = level;
+	ret = len;
+out_unlock:
+	up_write(&zram->init_lock);
+out_free:
+	kfree(input);
+	return ret;
 }
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
@@ -1299,6 +1501,9 @@ static void zram_free_page(struct zram *zram, size_t index)
 {
 	unsigned long handle;
 
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	zram_memcg_clear(zram, index);
+#endif
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
 	zram->table[index].ac_time = 0;
 #endif
@@ -1396,17 +1601,28 @@ static int __zram_bvec_read(struct zram *zram, struct page *page, u32 index,
 	int ret;
 
 	zram_slot_lock(zram, index);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	/* Internal recompress/writeback reads use uncharged scratch pages. */
+	if (PageSwapCache(compound_head(page)))
+		mi_memcg_zram_fault(zram->table[index].memcg);
+#endif
 	if (zram_test_flag(zram, index, ZRAM_WB)) {
 		struct bio_vec bvec;
+		unsigned long block = zram_get_element(zram, index);
 
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+		atomic_inc(&zram->backing_refs[block]);
+#endif
 		zram_slot_unlock(zram, index);
 
 		bvec.bv_page = page;
 		bvec.bv_len = PAGE_SIZE;
 		bvec.bv_offset = 0;
-		return read_from_bdev(zram, &bvec,
-				zram_get_element(zram, index),
-				bio, partial_io);
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+		return zram_group_read_async(zram, &bvec, block, bio, partial_io);
+#else
+		return read_from_bdev(zram, &bvec, block, bio, partial_io);
+#endif
 	}
 
 	ret = zram_read_from_zspool(zram, page, index);
@@ -1453,7 +1669,8 @@ out:
 }
 
 static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
-				u32 index, struct bio *bio)
+				u32 index, struct bio *bio, struct page *source_page,
+				const struct zram_wb_token *token)
 {
 	int ret = 0;
 	unsigned long alloced_pages;
@@ -1464,6 +1681,9 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	struct page *page = bvec->bv_page;
 	unsigned long element = 0;
 	enum zram_pageflags flags = 0;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	struct mem_cgroup *owner = NULL;
+#endif
 
 	mem = kmap_atomic(page);
 	if (page_same_filled(mem, &element)) {
@@ -1550,6 +1770,25 @@ out:
 	 * before overwriting unused sectors.
 	 */
 	zram_slot_lock(zram, index);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	if (token) {
+		if (!zram_test_flag(zram, index, ZRAM_WB) ||
+		    !zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
+		    !zram_test_flag(zram, index, ZRAM_IDLE) ||
+		    zram_get_element(zram, index) != token->block) {
+			zram_slot_unlock(zram, index);
+			/* Prepared object never became visible; undo its accounting. */
+			if (flags == ZRAM_SAME)
+				atomic64_dec(&zram->stats.same_pages);
+			else {
+				atomic64_sub(comp_len, &zram->stats.compr_data_size);
+				zs_free(zram->mem_pool, handle);
+			}
+			return -EAGAIN;
+		}
+		owner = zram_memcg_preserve(zram, index);
+	}
+#endif
 	zram_free_page(zram, index);
 
 	if (comp_len == PAGE_SIZE) {
@@ -1564,6 +1803,16 @@ out:
 		zram_set_handle(zram, index, handle);
 		zram_set_obj_size(zram, index, comp_len);
 	}
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	/* Attribute partial IO to the original page, never the scratch buffer. */
+	if (token) {
+		zram_memcg_restore(zram, index, owner, PAGE_SIZE, comp_len, true, false);
+		/* Caller clears UNDER_WB after releasing its IO block reference. */
+	} else if (zram->group_enabled) {
+		zram->table[index].memcg = mi_memcg_get_swap_page(source_page);
+		mi_memcg_zram_add(zram->table[index].memcg, comp_len, false);
+	}
+#endif
 	zram_slot_unlock(zram, index);
 
 	/* Update stats */
@@ -1605,17 +1854,22 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 		vec.bv_offset = 0;
 	}
 
-	ret = __zram_bvec_write(zram, &vec, index, bio);
+	ret = __zram_bvec_write(zram, &vec, index, bio, bvec->bv_page, NULL);
 out:
 	if (is_partial_io(bvec))
 		__free_page(page);
 	return ret;
 }
 
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+#include "zram_group_io.c"
+#endif
+
 #ifdef CONFIG_ZRAM_MULTI_COMP
 /* The caller holds the slot lock. */
 static int zram_recompress(struct zram *zram, u32 index, struct page *page,
-			   u32 threshold, u32 prio, u32 prio_max)
+			   u64 *num_recomp_pages, u32 threshold,
+			   u32 prio, u32 prio_max)
 {
 	struct zcomp_strm *zstrm = NULL;
 	unsigned long handle_new;
@@ -1625,12 +1879,21 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 	bool no_algorithm_made_progress = true;
 	void *src, *dst;
 	int ret;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	struct mem_cgroup *memcg;
+#endif
 
 	if (!zram_get_handle(zram, index))
 		return -EINVAL;
 
 	comp_len_old = zram_get_obj_size(zram, index);
 	if (comp_len_old < threshold)
+		return 0;
+
+	prio = max(prio, zram_get_priority(zram, index) + 1);
+	while (prio < prio_max && !zram->comps[prio])
+		prio++;
+	if (prio >= prio_max || !*num_recomp_pages)
 		return 0;
 
 	ret = zram_read_from_zspool(zram, page, index);
@@ -1644,6 +1907,9 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 		    prio <= zram_get_priority(zram, index))
 			continue;
 
+		/* Charge one page even if compression fails or saves no memory. */
+		if (!num_recomps)
+			(*num_recomp_pages)--;
 		num_recomps++;
 		zstrm = zcomp_stream_get(zram->comps[prio]);
 		src = kmap_atomic(page);
@@ -1687,10 +1953,17 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 	zcomp_stream_put(zram->comps[prio]);
 	zs_unmap_object(zram->mem_pool, handle_new);
 
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	memcg = zram_memcg_preserve(zram, index);
+#endif
 	zram_free_page(zram, index);
 	zram_set_handle(zram, index, handle_new);
 	zram_set_obj_size(zram, index, comp_len_new);
 	zram_set_priority(zram, index, prio);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	zram_memcg_restore(zram, index, memcg, comp_len_old,
+			   comp_len_new, false, false);
+#endif
 	atomic64_add(comp_len_new, &zram->stats.compr_data_size);
 	atomic64_inc(&zram->stats.pages_stored);
 	return 0;
@@ -1706,18 +1979,26 @@ static ssize_t recompress_store(struct device *dev,
 	struct zram *zram = dev_to_zram(dev);
 	unsigned long nr_pages;
 	char *args, *param, *val, *algo = NULL;
+	char *input;
+	u64 num_recomp_pages = ULLONG_MAX;
 	u32 mode = 0, threshold = 0;
+	bool have_type = false, have_threshold = false;
+	bool have_prio = false, have_max_pages = false;
 	unsigned long index;
 	struct page *page;
-	ssize_t ret;
+	ssize_t ret = -EINVAL;
 
-	args = skip_spaces(buf);
+	input = kstrndup(buf, len, GFP_KERNEL);
+	if (!input)
+		return -ENOMEM;
+	args = skip_spaces(input);
 	while (*args) {
 		args = next_arg(args, &param, &val);
 		if (!val || !*val)
-			return -EINVAL;
+			goto out_free;
 
-		if (!strcmp(param, "type")) {
+		if (!strcmp(param, "type") && !have_type) {
+			have_type = true;
 			if (!strcmp(val, "idle"))
 				mode = RECOMPRESS_IDLE;
 			else if (!strcmp(val, "huge"))
@@ -1725,20 +2006,30 @@ static ssize_t recompress_store(struct device *dev,
 			else if (!strcmp(val, "huge_idle"))
 				mode = RECOMPRESS_IDLE | RECOMPRESS_HUGE;
 			else
-				return -EINVAL;
-		} else if (!strcmp(param, "threshold")) {
-			ret = kstrtouint(val, 10, &threshold);
-			if (ret)
-				return ret;
-		} else if (!strcmp(param, "algo")) {
+				goto out_free;
+		} else if (!strcmp(param, "threshold") && !have_threshold) {
+			if (kstrtouint(val, 10, &threshold))
+				goto out_free;
+			have_threshold = true;
+		} else if (!strcmp(param, "algo") && !algo) {
 			algo = val;
+		} else if (!strcmp(param, "priority") && !have_prio) {
+			if (kstrtouint(val, 10, &prio))
+				goto out_free;
+			if (prio == ZRAM_PRIMARY_COMP)
+				prio = ZRAM_SECONDARY_COMP;
+			have_prio = true;
+		} else if (!strcmp(param, "max_pages") && !have_max_pages) {
+			if (kstrtoull(val, 10, &num_recomp_pages))
+				goto out_free;
+			have_max_pages = true;
 		} else {
-			return -EINVAL;
+			goto out_free;
 		}
 	}
 
 	if (threshold >= huge_class_size)
-		return -EINVAL;
+		goto out_free;
 
 	down_read(&zram->init_lock);
 	if (!init_done(zram)) {
@@ -1750,21 +2041,23 @@ static ssize_t recompress_store(struct device *dev,
 		goto out_unlock;
 	}
 
-	if (algo) {
-		bool found = false;
-
-		for (; prio < ZRAM_MAX_COMPS; prio++) {
-			if (zram->comp_algs[prio] &&
-			    !strcmp(zram->comp_algs[prio], algo)) {
-				prio_max = prio + 1;
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
+	if (algo && !have_prio) {
+		ret = comp_algorithm_lookup(zram, algo, ZRAM_SECONDARY_COMP);
+		if (ret < 0)
+			goto out_unlock;
+		prio = ret;
+	}
+	if (algo || have_prio) {
+		if (prio >= ZRAM_MAX_COMPS || !zram->comps[prio] ||
+		    (algo && strcmp(zram->comp_algs[prio], algo))) {
 			ret = -EINVAL;
 			goto out_unlock;
 		}
+		prio_max = prio + 1;
+	}
+	if (!num_recomp_pages) {
+		ret = len;
+		goto out_unlock;
 	}
 
 	page = alloc_page(GFP_KERNEL);
@@ -1778,6 +2071,8 @@ static ssize_t recompress_store(struct device *dev,
 	for (index = 0; index < nr_pages; index++) {
 		int err = 0;
 
+		if (!num_recomp_pages)
+			break;
 		zram_slot_lock(zram, index);
 		if (!zram_allocated(zram, index) ||
 		    (mode & RECOMPRESS_IDLE &&
@@ -1790,7 +2085,8 @@ static ssize_t recompress_store(struct device *dev,
 		    zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
 			goto next;
 
-		err = zram_recompress(zram, index, page, threshold,
+		err = zram_recompress(zram, index, page,
+				      &num_recomp_pages, threshold,
 				      prio, prio_max);
 next:
 		zram_slot_unlock(zram, index);
@@ -1803,6 +2099,8 @@ next:
 	__free_page(page);
 out_unlock:
 	up_read(&zram->init_lock);
+out_free:
+	kfree(input);
 	return ret;
 }
 #endif
@@ -2024,6 +2322,10 @@ static void zram_reset_device(struct zram *zram)
 {
 	u32 prio;
 
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+	/* No new block IO is admitted by the caller; drain queued fault reads. */
+	flush_workqueue(zram->group_read_wq);
+#endif
 	down_write(&zram->init_lock);
 
 	zram->limit_pages = 0;
@@ -2032,8 +2334,15 @@ static void zram_reset_device(struct zram *zram)
 	part_stat_set_all(&zram->disk->part0, 0);
 
 	/* I/O on all CPUs is drained by the caller, so metadata can go now. */
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	if (zram->disksize && zram->group_enabled)
+		mi_memcg_backend_put();
+#endif
 	zram_meta_free(zram, zram->disksize);
 	zram->disksize = 0;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	zram->group_enabled = false;
+#endif
 
 	for (prio = 0; prio < ZRAM_MAX_COMPS; prio++) {
 		struct zcomp *comp = zram->comps[prio];
@@ -2050,6 +2359,7 @@ static void zram_reset_device(struct zram *zram)
 		if (zram->comp_algs[prio] != default_compressor)
 			kfree(zram->comp_algs[prio]);
 		zram->comp_algs[prio] = NULL;
+		zram->comp_levels[prio] = 0;
 	}
 
 	memset(&zram->stats, 0, sizeof(zram->stats));
@@ -2088,7 +2398,8 @@ static ssize_t disksize_store(struct device *dev,
 		if (!zram->comp_algs[prio])
 			continue;
 
-		comp = zcomp_create(zram->comp_algs[prio]);
+		comp = zcomp_create(zram->comp_algs[prio],
+				    zram->comp_levels[prio]);
 		if (IS_ERR(comp)) {
 			pr_err("Cannot initialise %s compressing backend\n",
 			       zram->comp_algs[prio]);
@@ -2101,6 +2412,10 @@ static ssize_t disksize_store(struct device *dev,
 	}
 
 	zram->disksize = disksize;
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	if (zram->group_enabled)
+		mi_memcg_backend_get();
+#endif
 	set_capacity(zram->disk, zram->disksize >> SECTOR_SHIFT);
 
 	revalidate_disk(zram->disk);
@@ -2190,6 +2505,40 @@ static const struct block_device_operations zram_devops = {
 	.owner = THIS_MODULE
 };
 
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+static ssize_t zgroup_enable_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct zram *zram = dev_to_zram(dev);
+	bool enabled;
+
+	down_read(&zram->init_lock);
+	enabled = zram->group_enabled;
+	up_read(&zram->init_lock);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", enabled);
+}
+
+static ssize_t zgroup_enable_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t len)
+{
+	struct zram *zram = dev_to_zram(dev);
+	unsigned int enabled;
+	int ret;
+
+	ret = kstrtouint(buf, 10, &enabled);
+	if (ret || enabled > 1)
+		return ret ? ret : -EINVAL;
+	down_write(&zram->init_lock);
+	if (init_done(zram))
+		ret = -EBUSY;
+	else
+		zram->group_enabled = enabled;
+	up_write(&zram->init_lock);
+	return ret ? ret : len;
+}
+static DEVICE_ATTR_RW(zgroup_enable);
+#endif
+
 static DEVICE_ATTR_WO(compact);
 static DEVICE_ATTR_RW(disksize);
 static DEVICE_ATTR_RO(initstate);
@@ -2199,6 +2548,7 @@ static DEVICE_ATTR_WO(mem_used_max);
 static DEVICE_ATTR_WO(idle);
 static DEVICE_ATTR_RW(max_comp_streams);
 static DEVICE_ATTR_RW(comp_algorithm);
+static DEVICE_ATTR_WO(algorithm_params);
 #ifdef CONFIG_ZRAM_MULTI_COMP
 static DEVICE_ATTR_RW(recomp_algorithm);
 static DEVICE_ATTR_WO(recompress);
@@ -2211,6 +2561,9 @@ static DEVICE_ATTR_RW(writeback_limit_enable);
 #endif
 
 static struct attribute *zram_disk_attrs[] = {
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	&dev_attr_zgroup_enable.attr,
+#endif
 	&dev_attr_disksize.attr,
 	&dev_attr_initstate.attr,
 	&dev_attr_reset.attr,
@@ -2220,6 +2573,7 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_idle.attr,
 	&dev_attr_max_comp_streams.attr,
 	&dev_attr_comp_algorithm.attr,
+	&dev_attr_algorithm_params.attr,
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	&dev_attr_recomp_algorithm.attr,
 	&dev_attr_recompress.attr,
@@ -2270,6 +2624,14 @@ static int zram_add(void)
 	init_rwsem(&zram->init_lock);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	spin_lock_init(&zram->wb_limit_lock);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	zram->group_read_wq = alloc_workqueue("zram-read%d",
+				WQ_UNBOUND | WQ_MEM_RECLAIM, 0, device_id);
+	if (!zram->group_read_wq) {
+		ret = -ENOMEM;
+		goto out_free_idr;
+	}
+#endif
 #endif
 	queue = blk_alloc_queue(GFP_KERNEL);
 	if (!queue) {
@@ -2340,6 +2702,10 @@ static int zram_add(void)
 out_free_queue:
 	blk_cleanup_queue(queue);
 out_free_idr:
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+	if (zram->group_read_wq)
+		destroy_workqueue(zram->group_read_wq);
+#endif
 	idr_remove(&zram_index_idr, device_id);
 out_free_dev:
 	kfree(zram);
@@ -2376,6 +2742,9 @@ static int zram_remove(struct zram *zram)
 	del_gendisk(zram->disk);
 	blk_cleanup_queue(zram->disk->queue);
 	put_disk(zram->disk);
+#if defined(CONFIG_XIAOMI_MEMCG_RECLAIM) && defined(CONFIG_ZRAM_WRITEBACK)
+	destroy_workqueue(zram->group_read_wq);
+#endif
 	kfree(zram);
 	return 0;
 }
@@ -2457,6 +2826,9 @@ static int zram_remove_cb(int id, void *ptr, void *data)
 
 static void destroy_devices(void)
 {
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+	misc_deregister(&zram_extm_misc);
+#endif
 	class_unregister(&zram_control_class);
 	idr_for_each(&zram_index_idr, &zram_remove_cb, NULL);
 	zram_debugfs_destroy();
@@ -2490,6 +2862,17 @@ static int __init zram_init(void)
 		return -EBUSY;
 	}
 
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+	ret = misc_register(&zram_extm_misc);
+	if (ret) {
+		/* destroy_devices assumes the misc registration succeeded. */
+		class_unregister(&zram_control_class);
+		zram_debugfs_destroy();
+		unregister_blkdev(zram_major, "zram");
+		cpuhp_remove_multi_state(CPUHP_ZCOMP_PREPARE);
+		return ret;
+	}
+#endif
 	while (num_devices != 0) {
 		mutex_lock(&zram_index_mutex);
 		ret = zram_add();

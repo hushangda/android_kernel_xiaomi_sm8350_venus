@@ -7666,6 +7666,7 @@ int dsi_display_set_mode(struct dsi_display *display,
 	}
 
 	memcpy(display->panel->cur_mode, &adj_mode, sizeof(adj_mode));
+	mi_panel_count_fps(&display->panel->mi_count, timing.refresh_rate);
 error:
 	mutex_unlock(&display->display_lock);
 	return rc;
@@ -8508,6 +8509,7 @@ int dsi_display_enable(struct dsi_display *display)
 
 		display->panel->panel_initialized = true;
 		display->panel->power_mode = SDE_MODE_DPMS_ON;
+		mi_panel_count_active(&display->panel->mi_count, true);
 		DSI_INFO("cont splash enabled, display enable not required\n");
 		dsi_display_panel_id_notification(display);
 

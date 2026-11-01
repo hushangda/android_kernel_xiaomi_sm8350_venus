@@ -1,0 +1,3 @@
+# Other read/write/create permissions already exist in the Venus vendor policy.
+# flock prevents two copies of this producer from publishing concurrently.
+allow mi_thermald thermal_data_file:file lock;

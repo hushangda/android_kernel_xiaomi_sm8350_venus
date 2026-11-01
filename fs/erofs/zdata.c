@@ -7,6 +7,10 @@
 #include "zdata.h"
 #include "compress.h"
 #include <linux/prefetch.h>
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+#include <linux/cpu.h>
+#include <linux/cpuhotplug.h>
+#endif
 
 #include <trace/events/erofs.h>
 
@@ -126,8 +130,74 @@ typedef tagptr1_t compressed_page_t;
 
 static struct workqueue_struct *z_erofs_workqueue __read_mostly;
 
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+static DEFINE_PER_CPU(struct kthread_worker __rcu *, z_erofs_pcpu_workers);
+static int z_erofs_cpuhp_state = CPUHP_INVALID;
+
+static int z_erofs_cpu_online(unsigned int cpu)
+{
+	struct kthread_worker *worker;
+
+	worker = kthread_create_worker_on_cpu(cpu, 0, "erofs_worker/%u", cpu);
+	if (IS_ERR(worker)) {
+		/* A missing worker must not prevent this CPU from coming online. */
+		pr_warn("CPU%u worker unavailable (%ld), using workqueue\n",
+			cpu, PTR_ERR(worker));
+		return 0;
+	}
+	if (IS_ENABLED(CONFIG_EROFS_FS_PCPU_KTHREAD_HIPRI))
+		sched_set_fifo_low(worker->task);
+	rcu_assign_pointer(per_cpu(z_erofs_pcpu_workers, cpu), worker);
+	return 0;
+}
+
+static int z_erofs_cpu_offline(unsigned int cpu)
+{
+	struct kthread_worker *worker;
+
+	/* CPU hotplug serializes publication and removal for each CPU. */
+	worker = rcu_dereference_protected(
+			per_cpu(z_erofs_pcpu_workers, cpu), 1);
+	rcu_assign_pointer(per_cpu(z_erofs_pcpu_workers, cpu), NULL);
+	if (worker) {
+		/* Finish any enqueue which observed this worker before draining it. */
+		synchronize_rcu();
+		kthread_destroy_worker(worker);
+	}
+	return 0;
+}
+
+static void z_erofs_init_pcpu_workers(void)
+{
+	int state;
+
+	/* Initialize online CPUs under the hotplug lock, with rollback on error. */
+	state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "fs/erofs:online",
+				 z_erofs_cpu_online, z_erofs_cpu_offline);
+	if (state < 0) {
+		pr_warn("per-CPU worker setup failed (%d), using workqueue\n",
+			state);
+		return;
+	}
+	z_erofs_cpuhp_state = state;
+}
+
+static void z_erofs_destroy_pcpu_workers(void)
+{
+	if (z_erofs_cpuhp_state == CPUHP_INVALID)
+		return;
+	/* Invokes teardown for every online CPU and excludes hotplug callbacks. */
+	cpuhp_remove_state(z_erofs_cpuhp_state);
+	z_erofs_cpuhp_state = CPUHP_INVALID;
+}
+#else
+static inline void z_erofs_init_pcpu_workers(void) {}
+static inline void z_erofs_destroy_pcpu_workers(void) {}
+#endif
+
 void z_erofs_exit_zip_subsystem(void)
 {
+	z_erofs_destroy_pcpu_workers();
 	destroy_workqueue(z_erofs_workqueue);
 	z_erofs_destroy_pcluster_pool();
 }
@@ -136,10 +206,7 @@ static inline int z_erofs_init_workqueue(void)
 {
 	const unsigned int onlinecpus = num_possible_cpus();
 
-	/*
-	 * no need to spawn too many threads, limiting threads could minimum
-	 * scheduling overhead, perhaps per-CPU threads should be better?
-	 */
+	/* Bound concurrency for the fallback when per-CPU workers are enabled. */
 	z_erofs_workqueue = alloc_workqueue("erofs_unzipd",
 					    WQ_UNBOUND | WQ_HIGHPRI,
 					    onlinecpus + onlinecpus / 4);
@@ -153,9 +220,12 @@ int __init z_erofs_init_zip_subsystem(void)
 	if (err)
 		return err;
 	err = z_erofs_init_workqueue();
-	if (err)
+	if (err) {
 		z_erofs_destroy_pcluster_pool();
-	return err;
+		return err;
+	}
+	z_erofs_init_pcpu_workers();
+	return 0;
 }
 
 enum z_erofs_collectmode {
@@ -872,7 +942,34 @@ err_out:
 	goto out;
 }
 
+static void z_erofs_decompressqueue_bg(struct z_erofs_decompressqueue *bgq);
 static void z_erofs_decompressqueue_work(struct work_struct *work);
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+static void z_erofs_decompressqueue_kthread_work(struct kthread_work *work);
+#endif
+
+static void z_erofs_queue_decompress_work(struct z_erofs_decompressqueue *io)
+{
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+	struct kthread_worker *worker;
+	unsigned int cpu = get_cpu();
+
+	rcu_read_lock();
+	worker = rcu_dereference(per_cpu(z_erofs_pcpu_workers, cpu));
+	if (worker) {
+		kthread_init_work(&io->u.kthread_work,
+				  z_erofs_decompressqueue_kthread_work);
+		kthread_queue_work(worker, &io->u.kthread_work);
+	}
+	rcu_read_unlock();
+	put_cpu();
+	if (worker)
+		return;
+#endif
+	INIT_WORK(&io->u.work, z_erofs_decompressqueue_work);
+	queue_work(z_erofs_workqueue, &io->u.work);
+}
+
 static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 				       bool sync, int bios)
 {
@@ -891,13 +988,13 @@ static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
 
 	if (atomic_add_return(bios, &io->pending_bios))
 		return;
-	/* Use workqueue and sync decompression for atomic contexts only */
+	/* Use workers and sync decompression for atomic contexts only. */
 	if (in_atomic() || irqs_disabled()) {
-		queue_work(z_erofs_workqueue, &io->u.work);
+		z_erofs_queue_decompress_work(io);
 		sbi->readahead_sync_decompress = true;
 		return;
 	}
-	z_erofs_decompressqueue_work(&io->u.work);
+	z_erofs_decompressqueue_bg(io);
 }
 
 static bool z_erofs_page_is_invalidated(struct page *page)
@@ -1168,10 +1265,8 @@ static void z_erofs_decompress_queue(const struct z_erofs_decompressqueue *io,
 	}
 }
 
-static void z_erofs_decompressqueue_work(struct work_struct *work)
+static void z_erofs_decompressqueue_bg(struct z_erofs_decompressqueue *bgq)
 {
-	struct z_erofs_decompressqueue *bgq =
-		container_of(work, struct z_erofs_decompressqueue, u.work);
 	LIST_HEAD(pagepool);
 
 	DBG_BUGON(bgq->head == Z_EROFS_PCLUSTER_TAIL_CLOSED);
@@ -1180,6 +1275,20 @@ static void z_erofs_decompressqueue_work(struct work_struct *work)
 	erofs_release_pages(&pagepool);
 	kvfree(bgq);
 }
+
+static void z_erofs_decompressqueue_work(struct work_struct *work)
+{
+	z_erofs_decompressqueue_bg(container_of(work,
+				  struct z_erofs_decompressqueue, u.work));
+}
+
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+static void z_erofs_decompressqueue_kthread_work(struct kthread_work *work)
+{
+	z_erofs_decompressqueue_bg(container_of(work,
+				  struct z_erofs_decompressqueue, u.kthread_work));
+}
+#endif
 
 static struct page *pickup_page_for_submission(struct z_erofs_pcluster *pcl,
 					       unsigned int nr,
@@ -1315,7 +1424,6 @@ jobqueue_init(struct super_block *sb,
 			*fg = true;
 			goto fg_out;
 		}
-		INIT_WORK(&q->u.work, z_erofs_decompressqueue_work);
 	} else {
 fg_out:
 		q = fgq;

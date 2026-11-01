@@ -13,6 +13,7 @@
 # define pr_fmt(fmt) "fuse: " fmt
 #endif
 
+#include <linux/xr_qos.h>
 #include <linux/fuse.h>
 #include <linux/fs.h>
 #include <linux/mount.h>
@@ -380,6 +381,11 @@ struct fuse_req {
 	/** virtio-fs's physically contiguous buffer for in and out args */
 	void *argbuf;
 #endif
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct task_struct *xr_qos_source;
+	struct xr_qos_link xr_qos_link;
+#endif
+
 };
 
 struct fuse_iqueue;

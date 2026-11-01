@@ -20,6 +20,23 @@
 #include <linux/osq_lock.h>
 #endif
 #include <linux/android_vendor.h>
+#ifdef CONFIG_XIAOMI_XR_QOS
+#include <linux/xr_qos.h>
+
+/* Separate metadata; rw_semaphore and percpu_rw_semaphore keep their ABI. */
+#define XR_RWSEM_READERS 64
+struct xr_rwsem_state {
+	bool mmap;
+	bool static_state;
+	struct {
+		struct task_struct *task;
+		unsigned int depth;
+	} readers[XR_RWSEM_READERS];
+	/* The exclusive percpu writer can wait for its outer fast readers. */
+	struct task_struct *drain_task;
+	struct xr_qos_link drain_link;
+};
+#endif
 
 /*
  * For an uncontended rwsem, count and owner are the only fields a task
@@ -52,8 +69,35 @@ struct rw_semaphore {
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 	struct lockdep_map	dep_map;
 #endif
+	/* Keep the original reserved-field declaration in module symbol types. */
+#ifdef __GENKSYMS__
 	ANDROID_VENDOR_DATA(1);
+#else
+	union {
+		ANDROID_VENDOR_DATA(1);
+#ifdef CONFIG_XIAOMI_XR_QOS
+		/* Native metadata uses the reserved word without changing lock ABI. */
+		struct xr_rwsem_state *xr_qos;
+#endif
+	};
+#endif
 };
+
+#ifdef CONFIG_XIAOMI_XR_QOS
+void rwsem_xr_qos_init(struct rw_semaphore *sem, bool mmap);
+void rwsem_xr_qos_destroy(struct rw_semaphore *sem);
+void rwsem_xr_qos_forget_reader(struct rw_semaphore *sem);
+void rwsem_xr_qos_percpu_read_acquired(struct rw_semaphore *sem);
+void rwsem_xr_qos_percpu_wait(struct rw_semaphore *sem, bool start);
+void rwsem_xr_qos_owner_changed(struct rw_semaphore *sem);
+#else
+static inline void rwsem_xr_qos_init(struct rw_semaphore *sem, bool mmap) { }
+static inline void rwsem_xr_qos_destroy(struct rw_semaphore *sem) { }
+static inline void rwsem_xr_qos_forget_reader(struct rw_semaphore *sem) { }
+static inline void rwsem_xr_qos_percpu_read_acquired(struct rw_semaphore *sem) { }
+static inline void rwsem_xr_qos_percpu_wait(struct rw_semaphore *sem, bool start) { }
+static inline void rwsem_xr_qos_owner_changed(struct rw_semaphore *sem) { }
+#endif
 
 /*
  * Setting all bits of the owner field except bit 0 will indicate
@@ -94,14 +138,23 @@ static inline int rwsem_is_locked(struct rw_semaphore *sem)
 #define __RWSEM_OPT_INIT(lockname)
 #endif
 
-#define __RWSEM_INITIALIZER(name)				\
+#ifdef CONFIG_XIAOMI_XR_QOS
+#define __RWSEM_XR_INIT(state) , .xr_qos = (state)
+#else
+#define __RWSEM_XR_INIT(state)
+#endif
+
+#define __RWSEM_INITIALIZER_XR(name, state)			\
 	{ __RWSEM_INIT_COUNT(name),				\
 	  .owner = ATOMIC_LONG_INIT(0),				\
 	  .wait_list = LIST_HEAD_INIT((name).wait_list),	\
 	  .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(name.wait_lock)	\
 	  __RWSEM_OPT_INIT(name)				\
 	  __DEBUG_RWSEM_INITIALIZER(name)			\
-	  __RWSEM_DEP_MAP_INIT(name) }
+	  __RWSEM_DEP_MAP_INIT(name)				\
+	  __RWSEM_XR_INIT(state) }
+
+#define __RWSEM_INITIALIZER(name) __RWSEM_INITIALIZER_XR(name, NULL)
 
 #define DECLARE_RWSEM(name) \
 	struct rw_semaphore name = __RWSEM_INITIALIZER(name)
@@ -195,13 +248,17 @@ do {								\
  * [ This API should be avoided as much as possible - the
  *   proper abstraction for this case is completions. ]
  */
-extern void down_read_non_owner(struct rw_semaphore *sem);
-extern void up_read_non_owner(struct rw_semaphore *sem);
 #else
 # define down_read_nested(sem, subclass)		down_read(sem)
 # define down_write_nest_lock(sem, nest_lock)	down_write(sem)
 # define down_write_nested(sem, subclass)	down_write(sem)
 # define down_write_killable_nested(sem, subclass)	down_write_killable(sem)
+#endif
+
+#if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_XIAOMI_XR_QOS)
+extern void down_read_non_owner(struct rw_semaphore *sem);
+extern void up_read_non_owner(struct rw_semaphore *sem);
+#else
 # define down_read_non_owner(sem)		down_read(sem)
 # define up_read_non_owner(sem)			up_read(sem)
 #endif

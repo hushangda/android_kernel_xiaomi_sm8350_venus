@@ -875,6 +875,27 @@ config LRU_GEN_STATS
 
 endmenu
 
+config XIAOMI_MEMCG_RECLAIM
+	bool "Xiaomi per-memcg compressed-memory reclaim backend"
+	depends on MEMCG && MEMCG_SWAP && ZRAM
+	default n
+	help
+	  Track real ZRAM slot ownership and implement scoped proactive memcg
+	  reclaim for Xiaomi unified memory policy. Each tracked slot pins its
+	  owner's cgroup until release. This adds one pointer per ZRAM slot.
+	  Keep disabled until the matching policy ABI and platform integration
+	  have been validated. It does not enable UFS writeback or smart cache.
+
+config XIAOMI_SMART_CACHE
+	bool "Xiaomi level-based file cache protection"
+	depends on XIAOMI_MEMCG_RECLAIM && MMU && SYSFS
+	default n
+	help
+	  Implement SmartCache fd-level tags, real page-cache memcg charging and
+	  charge migration, with bounded priority-based reclaim protection.
+	  Creates /sys/kernel/smart_cache and memory.mctrl.level/max controls.
+	  Protection stays off until userspace explicitly enables it.
+
 config PROCESS_RECLAIM
 	bool "Enable process reclaim"
 	depends on PROC_FS

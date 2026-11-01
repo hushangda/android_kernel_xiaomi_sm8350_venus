@@ -311,6 +311,56 @@ static ssize_t cell_id_show(struct device *device,
 }
 
 
+static ssize_t disp_count_show(struct device *device,
+		struct device_attribute *attr, char *buf)
+{
+	struct disp_display *dd = to_disp_display(device);
+	struct dsi_display *display = dd->display;
+
+	if (dd->intf_type != MI_INTF_DSI || !display || !display->panel)
+		return -EINVAL;
+	return mi_panel_count_show(&display->panel->mi_count, buf);
+}
+
+static ssize_t disp_count_store(struct device *device,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct disp_display *dd = to_disp_display(device);
+	struct dsi_display *display = dd->display;
+	int ret;
+
+	if (dd->intf_type != MI_INTF_DSI || !display || !display->panel)
+		return -EINVAL;
+	ret = mi_panel_count_store(&display->panel->mi_count, buf, size);
+	return ret ? ret : size;
+}
+
+static ssize_t disp_count_info_show(struct device *device,
+		struct device_attribute *attr, char *buf)
+{
+	struct disp_display *dd = to_disp_display(device);
+	struct dsi_display *display = dd->display;
+
+	if (dd->intf_type != MI_INTF_DSI || !display || !display->panel)
+		return -ENODEV;
+	return mi_panel_stats_show(&display->panel->mi_stats, buf);
+}
+
+static ssize_t fullscreen_aod_status_show(struct device *device,
+		struct device_attribute *attr, char *buf)
+{
+	struct disp_display *dd = to_disp_display(device);
+	struct dsi_display *display = dd->display;
+
+	if (dd->intf_type != MI_INTF_DSI || !display || !display->panel)
+		return -ENODEV;
+	return scnprintf(buf, PAGE_SIZE, "%d\n", READ_ONCE(
+		display->panel->mi_cfg.feature_val[DISP_FEATURE_FULLSCREEN_AOD]));
+}
+
+static DEVICE_ATTR_RO(disp_count_info);
+static DEVICE_ATTR_RO(fullscreen_aod_status);
+static DEVICE_ATTR(disp_count, 0664, disp_count_show, disp_count_store);
 static DEVICE_ATTR_RW(disp_param);
 static DEVICE_ATTR_RW(mipi_rw);
 static DEVICE_ATTR_RO(panel_info);
@@ -323,6 +373,9 @@ static DEVICE_ATTR_RO(cell_id);
 static DEVICE_ATTR_RO(max_brightness_clone);
 
 static struct attribute *disp_feature_attrs[] = {
+	&dev_attr_disp_count.attr,
+	&dev_attr_disp_count_info.attr,
+	&dev_attr_fullscreen_aod_status.attr,
 	&dev_attr_disp_param.attr,
 	&dev_attr_mipi_rw.attr,
 	&dev_attr_panel_info.attr,

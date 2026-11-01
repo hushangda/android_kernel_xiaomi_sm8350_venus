@@ -43,6 +43,7 @@
 #include <linux/kthread.h>
 #include <linux/freezer.h>
 #include <linux/memcontrol.h>
+#include <linux/mi_smart_cache.h>
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
 #include <linux/oom.h>
@@ -107,6 +108,11 @@ struct scan_control {
 
 	/* Can pages be swapped as part of reclaim? */
 	unsigned int may_swap:1;
+
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	/* Nonzero only for an explicit, scoped proactive reclaim request. */
+	unsigned int xiaomi_lru_mask;
+#endif
 
 	/*
 	 * Cgroup memory below memory.low is protected as long as we
@@ -173,6 +179,34 @@ struct scan_control {
 	 */
 	struct vm_area_struct *target_vma;
 };
+
+static inline unsigned int xiaomi_reclaim_mask(struct scan_control *sc)
+{
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	return sc->xiaomi_lru_mask;
+#else
+	return 0;
+#endif
+}
+
+static inline bool xiaomi_reclaim_lru_allowed(struct scan_control *sc,
+					     enum lru_list lru)
+{
+	unsigned int mask = xiaomi_reclaim_mask(sc);
+
+	return !mask || (mask & BIT(lru));
+}
+
+static inline bool xiaomi_reclaim_file(struct scan_control *sc)
+{
+	return xiaomi_reclaim_mask(sc) & BIT(LRU_INACTIVE_FILE);
+}
+
+static inline bool xiaomi_reclaim_active(struct scan_control *sc)
+{
+	return xiaomi_reclaim_mask(sc) &
+		(BIT(LRU_ACTIVE_ANON) | BIT(LRU_ACTIVE_FILE));
+}
 
 /*
  * Number of active kswapd threads
@@ -1172,6 +1206,11 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		if (unlikely(!page_evictable(page)))
 			goto activate_locked;
 
+		/* Both classic LRU and MGLRU reach this file-page decision. */
+		if (!ignore_references && !sc->target_mem_cgroup &&
+		    mi_smart_cache_protect(page, sc->priority))
+			goto keep_locked;
+
 		if (!sc->may_unmap && page_mapped(page))
 			goto keep_locked;
 
@@ -2021,7 +2060,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 
 		/* We are about to die and free our memory. Return now. */
 		if (fatal_signal_pending(current))
-			return SWAP_CLUSTER_MAX;
+			return xiaomi_reclaim_mask(sc) ? 0 : SWAP_CLUSTER_MAX;
 
 		/* wait a bit for the reclaimer. */
 		msleep(100);
@@ -2521,12 +2560,23 @@ out:
 		scan_balance = SCAN_ANON;
 	}
 #endif
+	/* Explicit page-class requests do not use pressure-based balancing. */
+	if (xiaomi_reclaim_mask(sc))
+		scan_balance = xiaomi_reclaim_file(sc) ? SCAN_FILE : SCAN_ANON;
 
 	for_each_evictable_lru(lru) {
 		int file = is_file_lru(lru);
 		unsigned long lruvec_size;
 		unsigned long low, min;
 		unsigned long scan;
+
+		if (xiaomi_reclaim_mask(sc) &&
+		    (!xiaomi_reclaim_lru_allowed(sc, lru) ||
+		     (!file && (!sc->may_swap ||
+				mem_cgroup_get_nr_swap_pages(memcg) <= 0)))) {
+			nr[lru] = 0;
+			continue;
+		}
 
 		lruvec_size = lruvec_lru_size(lruvec, lru, sc->reclaim_idx);
 		mem_cgroup_protection(sc->target_mem_cgroup, memcg,
@@ -2686,8 +2736,14 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 
+	if (xiaomi_reclaim_mask(sc) && xiaomi_reclaim_file(sc))
+		return 0;
+
 	if (mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
 		return 0;
+
+	if (xiaomi_reclaim_mask(sc))
+		return 200;
 
 	return mem_cgroup_swappiness(memcg);
 }
@@ -3980,6 +4036,9 @@ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsig
 	for (type = !can_swap; type < ANON_AND_FILE; type++) {
 		unsigned long seq;
 
+		if (xiaomi_reclaim_mask(sc) && type != xiaomi_reclaim_file(sc))
+			continue;
+
 		for (seq = min_seq[type]; seq <= max_seq; seq++) {
 			unsigned long size = 0;
 
@@ -4463,6 +4522,16 @@ static int isolate_pages(struct lruvec *lruvec, struct scan_control *sc, int swa
 	int tier = -1;
 	DEFINE_MIN_SEQ(lruvec);
 
+	/* Never fall back to another page class for a proactive request. */
+	if (xiaomi_reclaim_mask(sc)) {
+		type = xiaomi_reclaim_file(sc);
+		*type_scanned = type;
+		if (!type && !swappiness)
+			return 0;
+		tier = get_tier_idx(lruvec, type);
+		return scan_pages(lruvec, sc, type, tier, list);
+	}
+
 	/*
 	 * Try to make the obvious choice first. When anon and file are both
 	 * available from the same generation, interpret swappiness 1 as file
@@ -4611,6 +4680,11 @@ static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *
 		return 0;
 
 	*need_aging = should_run_aging(lruvec, max_seq, min_seq, sc, can_swap, &nr_to_scan);
+	/* Inactive-only requests must not age active generations into scope. */
+	if (xiaomi_reclaim_mask(sc) && !xiaomi_reclaim_active(sc)) {
+		*need_aging = false;
+		return min_seq[!can_swap] + MIN_NR_GENS <= max_seq ? nr_to_scan : 0;
+	}
 	if (!*need_aging)
 		return nr_to_scan;
 
@@ -4634,6 +4708,11 @@ static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,
 	int i;
 	DEFINE_MAX_SEQ(lruvec);
 
+	/* Proactive callers need actual reclaimed pages, never OOM-avoidance credit. */
+	if (xiaomi_reclaim_mask(sc) &&
+	    (fatal_signal_pending(current) || sc->nr_reclaimed >= sc->nr_to_reclaim))
+		return true;
+
 	if (!current_is_kswapd()) {
 		/* age each memcg at most once to ensure fairness */
 		if (max_seq - seq > 1)
@@ -4645,7 +4724,8 @@ static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,
 
 		/* give this thread a chance to exit and free its memory */
 		if (fatal_signal_pending(current)) {
-			sc->nr_reclaimed += MIN_LRU_BATCH;
+			if (!xiaomi_reclaim_mask(sc))
+				sc->nr_reclaimed += MIN_LRU_BATCH;
 			return true;
 		}
 
@@ -4676,7 +4756,8 @@ static bool should_abort_scan(struct lruvec *lruvec, unsigned long seq,
 			return false;
 	}
 
-	sc->nr_reclaimed += MIN_LRU_BATCH;
+	if (!xiaomi_reclaim_mask(sc))
+		sc->nr_reclaimed += MIN_LRU_BATCH;
 
 	return true;
 }
@@ -4707,6 +4788,9 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 			swappiness = 1;
 		else
 			swappiness = 0;
+
+		if (xiaomi_reclaim_mask(sc) && !xiaomi_reclaim_file(sc) && !swappiness)
+			goto done;
 
 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, &need_aging);
 		if (!nr_to_scan)
@@ -5457,7 +5541,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 
 	blk_start_plug(&plug);
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
-					nr[LRU_INACTIVE_FILE]) {
+	       nr[LRU_INACTIVE_FILE] ||
+	       (xiaomi_reclaim_mask(sc) && nr[LRU_ACTIVE_ANON])) {
 		unsigned long nr_anon, nr_file, percentage;
 		unsigned long nr_scanned;
 
@@ -5472,6 +5557,9 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		}
 
 		cond_resched();
+
+		if (xiaomi_reclaim_mask(sc) && fatal_signal_pending(current))
+			break;
 
 		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
 			continue;
@@ -5532,7 +5620,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	 * Even if we did not try to evict anon pages at all, we want to
 	 * rebalance the anon lru active/inactive ratio.
 	 */
-	if (total_swap_pages && inactive_is_low(lruvec, LRU_INACTIVE_ANON))
+	if (xiaomi_reclaim_lru_allowed(sc, LRU_ACTIVE_ANON) &&
+	    total_swap_pages && inactive_is_low(lruvec, LRU_INACTIVE_ANON))
 		shrink_active_list(SWAP_CLUSTER_MAX, lruvec,
 				   sc, LRU_ACTIVE_ANON);
 }
@@ -6294,6 +6383,85 @@ unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 
 	return nr_reclaimed;
 }
+
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+/*
+ * Proactive reclaim is not an allocation failure. Keep its requested page
+ * class local to this scan_control, honor descendant protections, and do not
+ * invoke slab reclaim, vmpressure, OOM escalation or synthetic progress.
+ * The caller owns a css reference for the entire operation.
+ */
+unsigned long xiaomi_reclaim_memcg(struct mem_cgroup *memcg,
+		unsigned long nr_pages, enum xiaomi_reclaim_type type)
+{
+	struct mem_cgroup *iter = NULL;
+	unsigned int noreclaim_flag;
+	unsigned int mask;
+	int nid;
+	struct scan_control sc = {
+		.nr_to_reclaim = nr_pages,
+		.gfp_mask = (current_gfp_context(GFP_KERNEL) & GFP_RECLAIM_MASK) |
+				(GFP_HIGHUSER_MOVABLE & ~GFP_RECLAIM_MASK),
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.target_mem_cgroup = memcg,
+		.priority = DEF_PRIORITY,
+		.may_writepage = 1,
+		.may_unmap = 1,
+	};
+
+	if (!memcg || !nr_pages || (unsigned int)type > XIAOMI_RECLAIM_FILE ||
+	    !mem_cgroup_online(memcg) || current->reclaim_state ||
+	    fatal_signal_pending(current))
+		return 0;
+
+	mask = BIT(type >= XIAOMI_RECLAIM_INACTIVE_FILE ?
+		   LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
+	if (type == XIAOMI_RECLAIM_ANON || type == XIAOMI_RECLAIM_FILE)
+		mask |= mask << 1;
+	sc.xiaomi_lru_mask = mask;
+	sc.may_swap = !xiaomi_reclaim_file(&sc);
+	sc.force_deactivate = xiaomi_reclaim_active(&sc);
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+	noreclaim_flag = memalloc_noreclaim_save();
+	lru_add_drain();
+
+	do {
+		while ((iter = mem_cgroup_iter(memcg, iter, NULL))) {
+			cond_resched();
+			if (fatal_signal_pending(current) ||
+			    !mem_cgroup_online(memcg) || sc.nr_reclaimed >= nr_pages)
+				goto done;
+			mem_cgroup_calculate_protection(memcg, iter);
+			if (mem_cgroup_below_min(memcg, iter) ||
+			    mem_cgroup_below_low(memcg, iter))
+				continue;
+
+			for_each_node_state(nid, N_MEMORY) {
+				pg_data_t *pgdat = NODE_DATA(nid);
+				struct lruvec *lruvec = mem_cgroup_lruvec(iter, pgdat);
+
+				if (fatal_signal_pending(current) ||
+				    !mem_cgroup_online(memcg) ||
+				    sc.nr_reclaimed >= nr_pages)
+					goto done;
+				prepare_scan_count(pgdat, &sc);
+				shrink_lruvec(lruvec, &sc);
+				cond_resched();
+			}
+		}
+		cond_resched();
+	} while (--sc.priority >= 0 && sc.nr_reclaimed < nr_pages &&
+		 !fatal_signal_pending(current));
+done:
+	if (iter)
+		mem_cgroup_iter_break(memcg, iter);
+	memalloc_noreclaim_restore(noreclaim_flag);
+	set_task_reclaim_state(current, NULL);
+	return sc.nr_reclaimed;
+}
+EXPORT_SYMBOL_GPL(xiaomi_reclaim_memcg);
+#endif
 #endif
 
 static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)

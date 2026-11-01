@@ -13,6 +13,7 @@
 #include <linux/crypto.h>
 
 #include "zcomp.h"
+#include "backend_zstd.h"
 
 static const char * const backends[] = {
 #if IS_ENABLED(CONFIG_CRYPTO_LZO)
@@ -36,6 +37,9 @@ static const char * const backends[] = {
 
 static void zcomp_strm_free(struct zcomp_strm *zstrm)
 {
+#ifdef CONFIG_ZRAM_ZSTD_PARAMS
+	zcomp_zstd_destroy(zstrm->zstd);
+#endif
 	if (!IS_ERR_OR_NULL(zstrm->tfm))
 		crypto_free_comp(zstrm->tfm);
 	free_pages((unsigned long)zstrm->buffer, 1);
@@ -44,25 +48,43 @@ static void zcomp_strm_free(struct zcomp_strm *zstrm)
 
 /*
  * allocate new zcomp_strm structure with ->tfm initialized by
- * backend, return NULL on error
+ * backend, return ERR_PTR on error
  */
 static struct zcomp_strm *zcomp_strm_alloc(struct zcomp *comp)
 {
-	struct zcomp_strm *zstrm = kmalloc(sizeof(*zstrm), GFP_KERNEL);
-	if (!zstrm)
-		return NULL;
+	struct zcomp_strm *zstrm = kzalloc(sizeof(*zstrm), GFP_KERNEL);
+	int ret;
 
-	zstrm->tfm = crypto_alloc_comp(comp->name, 0, 0);
+	if (!zstrm)
+		return ERR_PTR(-ENOMEM);
+
+#ifdef CONFIG_ZRAM_ZSTD_PARAMS
+	if (comp->level) {
+		ret = zcomp_zstd_create(&zstrm->zstd, comp->level);
+		if (ret)
+			goto error;
+	} else
+#endif
+	{
+		zstrm->tfm = crypto_alloc_comp(comp->name, 0, 0);
+		if (IS_ERR(zstrm->tfm)) {
+			ret = PTR_ERR(zstrm->tfm);
+			goto error;
+		}
+	}
 	/*
 	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
 	 * case when compressed size is larger than the original one
 	 */
 	zstrm->buffer = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
-	if (IS_ERR_OR_NULL(zstrm->tfm) || !zstrm->buffer) {
-		zcomp_strm_free(zstrm);
-		zstrm = NULL;
+	if (!zstrm->buffer) {
+		ret = -ENOMEM;
+		goto error;
 	}
 	return zstrm;
+error:
+	zcomp_strm_free(zstrm);
+	return ERR_PTR(ret);
 }
 
 bool zcomp_available_algorithm(const char *comp)
@@ -126,6 +148,8 @@ void zcomp_stream_put(struct zcomp *comp)
 int zcomp_compress(struct zcomp_strm *zstrm,
 		const void *src, unsigned int *dst_len)
 {
+	int ret;
+
 	/*
 	 * Our dst memory (zstrm->buffer) is always `2 * PAGE_SIZE' sized
 	 * because sometimes we can endup having a bigger compressed data
@@ -142,19 +166,35 @@ int zcomp_compress(struct zcomp_strm *zstrm,
 	 */
 	*dst_len = PAGE_SIZE * 2;
 
-	return crypto_comp_compress(zstrm->tfm,
+#ifdef CONFIG_ZRAM_ZSTD_PARAMS
+	if (zstrm->zstd)
+		return zcomp_zstd_compress(zstrm->zstd, src, zstrm->buffer,
+					   dst_len);
+#endif
+	ret = crypto_comp_compress(zstrm->tfm,
 			src, PAGE_SIZE,
 			zstrm->buffer, dst_len);
+	if (!ret && (!*dst_len || *dst_len > PAGE_SIZE * 2))
+		ret = -EINVAL;
+	return ret;
 }
 
 int zcomp_decompress(struct zcomp_strm *zstrm,
 		const void *src, unsigned int src_len, void *dst)
 {
 	unsigned int dst_len = PAGE_SIZE;
+	int ret;
 
-	return crypto_comp_decompress(zstrm->tfm,
+#ifdef CONFIG_ZRAM_ZSTD_PARAMS
+	if (zstrm->zstd)
+		return zcomp_zstd_decompress(zstrm->zstd, src, src_len, dst);
+#endif
+	ret = crypto_comp_decompress(zstrm->tfm,
 			src, src_len,
 			dst, &dst_len);
+	if (!ret && dst_len != PAGE_SIZE)
+		ret = -EINVAL;
+	return ret;
 }
 
 int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
@@ -166,9 +206,9 @@ int zcomp_cpu_up_prepare(unsigned int cpu, struct hlist_node *node)
 		return 0;
 
 	zstrm = zcomp_strm_alloc(comp);
-	if (IS_ERR_OR_NULL(zstrm)) {
+	if (IS_ERR(zstrm)) {
 		pr_err("Can't allocate a compression stream\n");
-		return -ENOMEM;
+		return PTR_ERR(zstrm);
 	}
 	*per_cpu_ptr(comp->stream, cpu) = zstrm;
 	return 0;
@@ -219,12 +259,15 @@ void zcomp_destroy(struct zcomp *comp)
  * case of allocation error, or any other error potentially
  * returned by zcomp_init().
  */
-struct zcomp *zcomp_create(const char *compress)
+struct zcomp *zcomp_create(const char *compress, int level)
 {
 	struct zcomp *comp;
 	int error;
 
 	if (!zcomp_available_algorithm(compress))
+		return ERR_PTR(-EINVAL);
+	if (level && (strcmp(compress, "zstd") ||
+		      !zcomp_zstd_level_valid(level)))
 		return ERR_PTR(-EINVAL);
 
 	comp = kzalloc(sizeof(struct zcomp), GFP_KERNEL);
@@ -232,6 +275,7 @@ struct zcomp *zcomp_create(const char *compress)
 		return ERR_PTR(-ENOMEM);
 
 	comp->name = compress;
+	comp->level = level;
 	error = zcomp_init(comp);
 	if (error) {
 		kfree(comp);

@@ -152,6 +152,9 @@ msm_drm-$(CONFIG_DRM_MSM) += \
 	mi_disp/mi_disp_log.o \
 	mi_disp/mi_dsi_display.o \
 	mi_disp/mi_dsi_panel.o \
+	mi_disp/mi_dsi_panel_count.o \
+	mi_disp/mi_panel_stats.o \
+	mi_disp/mi_disp_timer.o \
 	mi_disp/mi_sde_connector.o \
 	mi_disp/mi_sde_crtc.o \
 	mi_disp/mi_sde_encoder.o \

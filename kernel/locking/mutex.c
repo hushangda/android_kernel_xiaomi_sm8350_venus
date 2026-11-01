@@ -29,6 +29,7 @@
 #include <linux/interrupt.h>
 #include <linux/debug_locks.h>
 #include <linux/osq_lock.h>
+#include <linux/rcupdate.h>
 
 #ifdef CONFIG_DEBUG_MUTEXES
 # include "mutex-debug.h"
@@ -202,6 +203,30 @@ static inline bool __mutex_waiter_is_first(struct mutex *lock, struct mutex_wait
 	return list_first_entry(&lock->wait_list, struct mutex_waiter, list) == waiter;
 }
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+/* wait_lock protects stack waiters; RCU protects the sampled owner task. */
+static void mutex_xr_qos_refresh(struct mutex *lock)
+{
+	struct mutex_waiter *waiter;
+	struct task_struct *owner;
+
+	lockdep_assert_held(&lock->wait_lock);
+	rcu_read_lock();
+	owner = __owner_task(atomic_long_read(&lock->owner));
+	list_for_each_entry(waiter, &lock->wait_list, list) {
+		if (owner && xr_qos_link_matches(&waiter->xr_qos, owner))
+			continue;
+		xr_qos_link_del(&waiter->xr_qos);
+		if (owner && owner != waiter->task)
+			xr_qos_link_add(&waiter->xr_qos, waiter->task, owner,
+					XR_QOS_MUTEX);
+	}
+	rcu_read_unlock();
+}
+#else
+static inline void mutex_xr_qos_refresh(struct mutex *lock) { }
+#endif
+
 /*
  * Add @waiter to a given location in the lock wait_list and set the
  * FLAG_WAITERS flag if it's the first waiter.
@@ -210,6 +235,9 @@ static void
 __mutex_add_waiter(struct mutex *lock, struct mutex_waiter *waiter,
 		   struct list_head *list)
 {
+#ifdef CONFIG_XIAOMI_XR_QOS
+	memset(&waiter->xr_qos, 0, sizeof(waiter->xr_qos));
+#endif
 	debug_mutex_add_waiter(lock, waiter, current);
 
 	list_add_tail(&waiter->list, list);
@@ -220,6 +248,9 @@ __mutex_add_waiter(struct mutex *lock, struct mutex_waiter *waiter,
 static void
 __mutex_remove_waiter(struct mutex *lock, struct mutex_waiter *waiter)
 {
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&waiter->xr_qos);
+#endif
 	list_del(&waiter->list);
 	if (likely(list_empty(&lock->wait_list)))
 		__mutex_clear_flag(lock, MUTEX_FLAGS);
@@ -1046,6 +1077,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 				goto err;
 		}
 
+		mutex_xr_qos_refresh(lock);
 		spin_unlock(&lock->wait_lock);
 		schedule_preempt_disabled();
 
@@ -1085,6 +1117,7 @@ acquired:
 	debug_mutex_free_waiter(&waiter);
 
 skip_wait:
+	mutex_xr_qos_refresh(lock);
 	/* got the lock - cleanup and rejoice! */
 	lock_acquired(&lock->dep_map, ip);
 
@@ -1286,6 +1319,7 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
 	if (owner & MUTEX_FLAG_HANDOFF)
 		__mutex_handoff(lock, next);
 
+	mutex_xr_qos_refresh(lock);
 	spin_unlock(&lock->wait_lock);
 
 	wake_up_q(&wake_q);

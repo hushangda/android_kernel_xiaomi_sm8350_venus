@@ -847,6 +847,7 @@ struct task_struct {
 	int				normal_prio;
 	unsigned int			rt_priority;
 
+
 	const struct sched_class	*sched_class;
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;
@@ -1480,7 +1481,23 @@ struct task_struct {
 	unsigned long			prev_lowest_stack;
 #endif
 
+/* Preserve the vendor reservation, task size and every following offset. */
+#if defined(CONFIG_XIAOMI_XR_QOS) && !defined(__GENKSYMS__)
+	union {
+		ANDROID_VENDOR_DATA_ARRAY(1, 3);
+		struct {
+			struct xr_qos_task *xr_qos;
+			int xr_qos_rt_prio;
+			unsigned int xr_qos_vip;
+			bool xr_qos_rt_only;
+			bool xr_qos_rtg_owned;
+			bool xr_qos_rtg_blocked;
+			u32 xr_qos_dropped;
+		};
+	};
+#else
 	ANDROID_VENDOR_DATA_ARRAY(1, 3);
+#endif
 
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);

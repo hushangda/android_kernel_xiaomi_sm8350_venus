@@ -445,6 +445,7 @@ int thermal_zone_unbind_cooling_device(struct thermal_zone_device *, int,
 void thermal_zone_device_update(struct thermal_zone_device *,
 				enum thermal_notify_event);
 #ifdef CONFIG_QTI_THERMAL
+int thermal_message_get_board_temp(int *temp);
 void thermal_zone_device_update_temp(struct thermal_zone_device *tz,
 				enum thermal_notify_event event, int temp);
 #else

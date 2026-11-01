@@ -10,12 +10,15 @@ struct zcomp_strm {
 	/* compression/decompression buffer */
 	void *buffer;
 	struct crypto_comp *tfm;
+	struct zcomp_zstd_ctx *zstd;
 };
 
 /* dynamic per-device compression frontend */
 struct zcomp {
 	struct zcomp_strm * __percpu *stream;
 	const char *name;
+	/* Zero retains the Crypto API's default parameters. */
+	int level;
 	struct hlist_node node;
 };
 
@@ -24,7 +27,7 @@ int zcomp_cpu_dead(unsigned int cpu, struct hlist_node *node);
 ssize_t zcomp_available_show(const char *comp, char *buf);
 bool zcomp_available_algorithm(const char *comp);
 
-struct zcomp *zcomp_create(const char *comp);
+struct zcomp *zcomp_create(const char *comp, int level);
 void zcomp_destroy(struct zcomp *comp);
 
 struct zcomp_strm *zcomp_stream_get(struct zcomp *comp);

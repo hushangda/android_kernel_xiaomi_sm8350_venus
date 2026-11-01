@@ -1,0 +1,25 @@
+What:		/sys/class/qcom-battery/charge_counter
+Date:		November 2026
+Contact:	Venus kernel maintainers
+Description:
+		Read-only remaining battery charge in microamp-hours, exposed for
+		Xiaomi MiCharge clients that use the qcom-battery class path.
+		It reads POWER_SUPPLY_PROP_CHARGE_COUNTER from the same battery
+		power_supply as /sys/class/power_supply/battery/charge_counter.
+		Backend failures are returned to the reader; the attribute does
+		not substitute capacity percentages or synthesized charge values.
+
+What:		/sys/class/qcom-battery/board_sensor_temp
+Date:		November 2026
+Contact:	Venus kernel maintainers
+Description:
+		Read-only board virtual temperature in millidegrees Celsius. Reads
+		the same mutex-protected sample published by the Venus userspace
+		thermal model to thermal_message/board_sensor_temp. An unpublished
+		sample or one older than 30 seconds returns ENODATA (including time
+		spent suspended); malformed or overflowing text returns the
+		integer parser's error. This is not an independent physical sensor
+		and does not compute or fabricate an initial temperature. The
+		userspace producer must be restored when absent from a ported ROM.
+		The thermal_message reader applies the same validity check. A new
+		valid write refreshes its timestamp; invalid text invalidates it.

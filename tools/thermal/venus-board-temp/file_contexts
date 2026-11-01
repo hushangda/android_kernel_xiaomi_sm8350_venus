@@ -1,0 +1,2 @@
+/vendor/bin/venus-board-temp          u:object_r:mi_thermald_exec:s0
+/vendor/etc/venus-board-temp\.conf    u:object_r:vendor_configs_file:s0

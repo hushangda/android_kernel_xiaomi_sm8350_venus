@@ -1159,7 +1159,18 @@ struct rq {
 #endif
 #endif
 
+#if defined(CONFIG_XIAOMI_XR_QOS) && !defined(__GENKSYMS__)
+	union {
+		ANDROID_VENDOR_DATA_ARRAY(1, 96);
+		struct {
+			struct list_head xr_vip_tasks;
+			u64 xr_vip_period;
+			u64 xr_vip_runtime;
+		};
+	};
+#else
 	ANDROID_VENDOR_DATA_ARRAY(1, 96);
+#endif
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -2545,6 +2556,13 @@ print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 #endif /* CONFIG_SCHED_DEBUG */
 
 extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+#ifdef CONFIG_XIAOMI_XR_QOS
+void xr_qos_vip_changed(struct rq *rq, struct task_struct *p, unsigned int vip);
+void xr_qos_vip_account(struct rq *rq, struct task_struct *p, u64 delta);
+#else
+static inline void xr_qos_vip_account(struct rq *rq, struct task_struct *p,
+				    u64 delta) { }
+#endif
 extern void init_rt_rq(struct rt_rq *rt_rq);
 extern void init_dl_rq(struct dl_rq *dl_rq);
 

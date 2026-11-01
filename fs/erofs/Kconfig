@@ -76,3 +76,26 @@ config EROFS_FS_ZIP
 
 	  If you don't want to enable compression feature, say N.
 
+config EROFS_FS_PCPU_KTHREAD
+	bool "EROFS per-CPU decompression kthread workers"
+	depends on EROFS_FS_ZIP
+	default n
+	help
+	  Use per-CPU kthread workers for asynchronous decompression submitted
+	  from atomic context. The existing workqueue remains available if a
+	  CPU's worker cannot be created or is being removed during CPU hotplug.
+	  Synchronous decompression and the on-disk format are unchanged.
+
+	  If unsure, say N.
+
+config EROFS_FS_PCPU_KTHREAD_HIPRI
+	bool "EROFS high priority per-CPU kthread workers"
+	depends on EROFS_FS_PCPU_KTHREAD
+	default n
+	help
+	  Run EROFS per-CPU decompression workers at SCHED_FIFO priority 1.
+	  This can reduce decompression latency but may delay normal tasks.
+	  Leave disabled unless latency and power have been measured.
+
+	  If unsure, say N.
+

@@ -38,6 +38,24 @@ Description:
 		available and selected compression algorithms, change
 		compression algorithm selection.
 
+What:		/sys/block/zram<id>/algorithm_params
+Date:		November 2026
+Contact:	Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+Description:
+		Write-only, set level=<n> for an already selected Zstd compressor
+		before disksize is set. CONFIG_ZRAM_ZSTD_PARAMS is required to
+		accept levels; other compressors and dictionaries are unsupported.
+		The accepted range is 1 through ZSTD_maxCLevel() (22 in this tree).
+		Optional priority=<n> chooses a slot (default 0, the primary).
+		Optional algo=zstd chooses the first matching configured slot.
+		If both selectors are present, they must match the same slot.
+		A level is required. Unknown and duplicate parameters are rejected.
+		Changing a compressor or resetting the device clears its level.
+		Changes after device initialization return -EBUSY.
+		Explicit levels allocate per-CPU workspaces sized for one page;
+		higher levels may increase workspace use and compression latency.
+		Omitting explicit levels preserves the Crypto API default path.
+
 What:		/sys/block/zram<id>/recomp_algorithm
 Date:		November 2022
 Contact:	Sergey Senozhatsky <senozhatsky@chromium.org>
@@ -53,7 +71,21 @@ Description:
 		The recompress file is write-only and triggers recompression
 		with the configured secondary compression algorithms. It accepts
 		type=idle, type=huge, type=huge_idle, threshold=<bytes>, and
-		algo=<name> selectors.
+		algo=<name>, priority=<n>, and max_pages=<n> selectors.
+		priority selects a configured secondary slot (1 through 3); 0
+		is treated as 1. algo selects the first matching secondary slot.
+		If both selectors are supplied, they must select the same slot.
+		Without a compressor selector, all configured secondary slots
+		are tried in priority order. Slots already compressed with that
+		or a higher priority are skipped.
+		max_pages bounds pages on which compression is attempted,
+		including failed attempts and attempts that save no memory.
+		Multiple algorithms tried on one page consume one unit. An
+		explicit zero performs no compression; omission is unrestricted.
+		Skipped pages do not consume the budget, so this does not bound
+		scan time or operation latency. Each invocation starts scanning
+		at the beginning, with no continuation cursor. Unknown or
+		duplicate keys and unconfigured priorities are rejected.
 
 What:		/sys/block/zram<id>/mem_used_max
 Date:		August 2014

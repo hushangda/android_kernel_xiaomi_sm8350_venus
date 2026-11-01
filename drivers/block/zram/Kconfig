@@ -45,6 +45,18 @@ config ZRAM_DEF_COMP_842
 
 endchoice
 
+config ZRAM_ZSTD_PARAMS
+	bool "Zstd compression level parameters"
+	depends on ZRAM && CRYPTO_ZSTD
+	default y
+	select ZSTD_COMPRESS
+	select ZSTD_DECOMPRESS
+	help
+	  Allow setting a Zstd level for each zram compressor through
+	  algorithm_params before device initialization. Explicit levels use
+	  per-CPU Zstd workspaces sized for one page. Other compressors and
+	  Zstd without explicit parameters continue to use the Crypto API.
+
 config ZRAM_DEF_COMP
 	string
 	default "lzo-rle" if ZRAM_DEF_COMP_LZORLE
@@ -96,3 +108,16 @@ config ZRAM_MULTI_COMP
 	  Enable secondary compression streams so selected zram pages can be
 	  recompressed with a slower but more effective algorithm. Idle-page
 	  selection by age additionally requires ZRAM_TRACK_ENTRY_ACTIME.
+
+config XIAOMI_ZRAM_EXTM
+	bool "Xiaomi zram-control extent and encrypted writeback ABI"
+	depends on XIAOMI_MEMCG_RECLAIM && ZRAM_WRITEBACK
+	depends on KEYS && BLK_INLINE_ENCRYPTION
+	select CRYPTO_XTS
+	select CRYPTO_AES
+	default n
+	help
+	  Provide the native zram-control SET/GET_BDEV ABI with checked extent
+	  mapping and real software or inline AES-XTS encryption. Key or device
+	  capability failures are returned to userspace; there is no plaintext
+	  fallback. This does not enable writeback until userspace configures it.

@@ -21,6 +21,7 @@
 #include "msm_gem.h"
 #include "msm_kms.h"
 #include "sde_trace.h"
+#include "mi_disp/mi_disp_timer.h"
 #include <drm/drm_atomic_uapi.h>
 
 #define MULTIPLE_CONN_DETECTED(x) (x > 1)
@@ -501,16 +502,21 @@ static void complete_commit(struct msm_commit *c)
 	struct drm_device *dev = state->dev;
 	struct msm_drm_private *priv = dev->dev_private;
 	struct msm_kms *kms = priv->kms;
+	struct mi_commit_timer *timer = mi_disp_timer_begin(state);
 
 	drm_atomic_helper_wait_for_fences(dev, state, false);
 
+	mi_disp_timer_stage(timer, MI_COMMIT_PREPARE);
 	kms->funcs->prepare_commit(kms, state);
 
+	mi_disp_timer_stage(timer, MI_COMMIT_DISABLE);
 	msm_atomic_helper_commit_modeset_disables(dev, state);
 
+	mi_disp_timer_stage(timer, MI_COMMIT_PLANES);
 	drm_atomic_helper_commit_planes(dev, state,
 				DRM_PLANE_COMMIT_ACTIVE_ONLY);
 
+	mi_disp_timer_stage(timer, MI_COMMIT_ENABLE);
 	msm_atomic_helper_commit_modeset_enables(dev, state);
 
 	/* NOTE: _wait_for_vblanks() only waits for vblank on
@@ -526,11 +532,15 @@ static void complete_commit(struct msm_commit *c)
 	 * not be critical path)
 	 */
 
+	mi_disp_timer_stage(timer, MI_COMMIT_WAIT);
 	msm_atomic_wait_for_commit_done(dev, state);
 
+	mi_disp_timer_stage(timer, MI_COMMIT_CLEANUP);
 	drm_atomic_helper_cleanup_planes(dev, state);
 
+	mi_disp_timer_stage(timer, MI_COMMIT_COMPLETE);
 	kms->funcs->complete_commit(kms, state);
+	mi_disp_timer_end(timer);
 
 	drm_atomic_state_put(state);
 

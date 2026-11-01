@@ -645,6 +645,12 @@ struct binder_transaction {
 	 */
 	spinlock_t lock;
 	ANDROID_VENDOR_DATA(1);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct task_struct *xr_qos_source;
+	struct xr_qos_link xr_qos;
+	bool xr_qos_async;
+#endif
+
 };
 
 /**

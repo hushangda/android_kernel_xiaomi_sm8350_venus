@@ -1,0 +1,77 @@
+What:           /sys/class/mi_display/disp-DSI-<n>/disp_count
+Date:           November 2026
+Contact:        Xiaomi Venus kernel maintainers
+Description:
+                Restores the stock Venus display-count persistence interface.
+                A read returns these unsigned decimal key=value lines in order:
+
+                  panel_active
+                  panel_kickoff_count
+                  kernel_boottime
+                  kernel_rtctime
+                  kernel_days
+                  bl_duration
+                  bl_level_integral
+                  bl_highlevel_duration
+                  bl_lowlevel_duration
+                  hbm_duration
+                  hbm_times
+                  fps60_times
+                  fps90_times
+                  fps120_times
+                  record_end
+
+                panel_active is normal-on time in kernel jiffies (HZ=250 in
+                the Venus configuration). Successful LP1/LP2 transitions stop
+                it; successful ON/NOLP or continuous-splash handoff start it.
+                The stock FOD skip-NOLP path also starts the normal-on timer.
+                panel_kickoff_count counts non-error DSI encoder submissions,
+                including AOD submissions, not completed frames or vblanks.
+
+                bl_duration, bl_highlevel_duration and bl_lowlevel_duration
+                are jiffies with nonzero DCS backlight, at least 1536, and
+                below 1536 respectively. bl_level_integral is backlight level
+                multiplied by jiffies. Only successful DCS brightness writes
+                change the recorded level. LP entry does not imply brightness
+                zero; panel disable stops all ongoing backlight accounting.
+
+                hbm_duration and fps{60,90,120}_times are seconds. The HBM
+                input is the stock brightness_clone value after clamping,
+                compared strictly above mi,panel-hbm-backlight-threshold;
+                it is not an inferred FOD command or measured luminance.
+                hbm_times counts completed nonzero-length HBM intervals.
+                HBM seconds round down per interval as in the stock driver;
+                reads preserve fractions within an ongoing interval. FPS
+                seconds preserve fractions per rate across transitions and
+                only accrue while normal-on. Unsupported refresh rates have
+                no FPS bucket. Panel disable also ends an HBM interval.
+
+                kernel_boottime is the restored prior-boot total plus current
+                boot time, in seconds including suspend. kernel_rtctime is a
+                Unix-seconds anchor for kernel_days. Whole days advance the
+                anchor. Unset RTC, rollback or a jump beyond ten years reset
+                the anchor without inventing elapsed days. record_end is zero.
+
+                A write atomically replaces the persisted totals with all 15
+                lines in exactly this order. The final newline is optional.
+                Missing/extra fields, signed values, nondecimal values,
+                embedded NUL, trailing data and nonzero record_end return
+                EINVAL. Decimal overflow returns ERANGE. Writes must be less
+                than PAGE_SIZE. Invalid writes leave the state unchanged.
+                The live panel state is retained; its elapsed-time baseline
+                is reset at restore. This is a prior-boot restore operation,
+                not an idempotent writeback of a current-boot read, because
+                kernel_boottime is a cumulative prior-boot base on write.
+
+                Counters saturate at U64_MAX. Reads account elapsed intervals
+                before taking one coherent snapshot. State is per panel and
+                serialized by a leaf spinlock, with no device I/O, allocation,
+                display-lock acquisition or formatting inside that lock.
+                State is initialized before sysfs attachment and lives inside
+                the panel; sysfs removal drains callbacks before panel release.
+
+                Permissions are 0664. The existing vendor early-boot init rule
+                assigns the system owner/group. The vendor displaycount daemon
+                persists this raw text via pread/pwrite. This interface does
+                not implement newer display ioctl 0x0d or feature IDs 35/39/40.
+Users:          /vendor/bin/displaycount

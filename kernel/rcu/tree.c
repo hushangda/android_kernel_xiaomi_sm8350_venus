@@ -18,6 +18,7 @@
 #define pr_fmt(fmt) "rcu: " fmt
 
 #include <linux/types.h>
+#include <linux/xr_qos.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/spinlock.h>
@@ -3982,7 +3983,7 @@ static int rcu_blocking_is_gp(void)
  * Implementation of these memory-ordering guarantees is described here:
  * Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst.
  */
-void synchronize_rcu(void)
+static void __synchronize_rcu(void)
 {
 	unsigned long flags;
 	struct rcu_node *rnp;
@@ -4018,6 +4019,18 @@ void synchronize_rcu(void)
 	for (rnp = this_cpu_ptr(&rcu_data)->mynode; rnp; rnp = rnp->parent)
 		rnp->gp_seq_needed = rnp->gp_seq = rcu_state.gp_seq;
 	local_irq_restore(flags);
+}
+void synchronize_rcu(void)
+{
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct xr_qos_rcu_wait wait;
+
+	xr_qos_rcu_wait_start(&wait);
+#endif
+	__synchronize_rcu();
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_rcu_wait_end(&wait);
+#endif
 }
 EXPORT_SYMBOL_GPL(synchronize_rcu);
 

@@ -1,0 +1,34 @@
+What:           /sys/class/mi_display/disp-DSI-0/disp_count_info
+Date:           November 2026
+Contact:        Xiaomi Venus kernel maintainers
+Description:
+                Read-only diagnostics for the newer count-info ioctl. The
+                original disp_count node retains its 15-field persistence ABI.
+
+                system_build_version: bounded software build identifier.
+                poweron_samples: completed OFF-to-ON measurements.
+                poweron_last_ns, poweron_total_ns: monotonic time from the
+                count-info ON request while the panel is OFF, to its first
+                successful nonzero DCS backlight update. Repeated ON messages
+                do not restart a pending measurement; OFF cancels it.
+                commit_long: saturating sum of userspace frame-drop reports.
+                tpidle_count: absolute counter last reported by SurfaceFlinger;
+                repeated reports are not added, and a client restart may lower
+                it. This is not a hardware touch interrupt count.
+                fullscreen_aod_times: sessions with fullscreen requested and
+                the panel in LP1/LP2. Duplicate state notifications are ignored.
+                fullscreen_aod_active_ns, fullscreen_aod_longest_ns: monotonic
+                durations including the currently open session.
+
+                A different build identifier resets these software-generation
+                diagnostics. Panel lifetime counters are unaffected. These
+                diagnostics are not persisted across reboot.
+
+What:           /sys/class/mi_display/disp-DSI-0/fullscreen_aod_status
+Date:           November 2026
+Contact:        Xiaomi Venus kernel maintainers
+Description:
+                Read-only boolean requested by display feature 35. The same
+                request sends display event 15 with a four-byte value and
+                enables actual fullscreen-AOD session accounting. Venus keeps
+                its existing panel-specific AOD and fingerprint commands.

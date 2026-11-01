@@ -8,6 +8,7 @@
 #include "pelt.h"
 
 #include <linux/interrupt.h>
+#include <linux/xr_qos.h>
 
 #include <trace/events/sched.h>
 
@@ -592,7 +593,7 @@ static int rt_se_boosted(struct sched_rt_entity *rt_se)
 		return !!rt_rq->rt_nr_boosted;
 
 	p = rt_task_of(rt_se);
-	return p->prio != p->normal_prio;
+	return p->prio != p->normal_prio && !xr_qos_only_rt_boost(p);
 }
 
 #ifdef CONFIG_SMP
@@ -1304,7 +1305,7 @@ unsigned int rt_se_rr_nr_running(struct sched_rt_entity *rt_se)
 
 	tsk = rt_task_of(rt_se);
 
-	return (tsk->policy == SCHED_RR) ? 1 : 0;
+	return (tsk->policy == SCHED_RR || xr_qos_only_rt_boost(tsk)) ? 1 : 0;
 }
 
 static inline
@@ -2744,7 +2745,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	 * RR tasks need a special form of timeslice management.
 	 * FIFO tasks have no timeslices.
 	 */
-	if (p->policy != SCHED_RR)
+	if (p->policy != SCHED_RR && !xr_qos_only_rt_boost(p))
 		return;
 
 	if (--p->rt.time_slice)

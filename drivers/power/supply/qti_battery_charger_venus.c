@@ -2355,6 +2355,24 @@ static ssize_t resistance_show(struct class *c,
 }
 static CLASS_ATTR_RO(resistance);
 
+static ssize_t charge_counter_show(struct class *c,
+		struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	struct power_supply *psy = bcdev->psy_list[PSY_TYPE_BATTERY].psy;
+	union power_supply_propval val;
+	int rc;
+
+	/* Match the battery power_supply value and its microamp-hour units. */
+	rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_CHARGE_COUNTER, &val);
+	if (rc < 0)
+		return rc;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val.intval);
+}
+static CLASS_ATTR_RO(charge_counter);
+
 static ssize_t soh_show(struct class *c, struct class_attribute *attr,
 			char *buf)
 {
@@ -4347,9 +4365,27 @@ static ssize_t last_node_store(struct class *c,
 }
 static CLASS_ATTR_RW(last_node);
 
+#ifdef CONFIG_QTI_THERMAL
+static ssize_t board_sensor_temp_show(struct class *c,
+		struct class_attribute *attr, char *buf)
+{
+	int temp, ret;
+
+	ret = thermal_message_get_board_temp(&temp);
+	if (ret)
+		return ret;
+	return scnprintf(buf, PAGE_SIZE, "%d\n", temp);
+}
+static CLASS_ATTR_RO(board_sensor_temp);
+#endif
+
 static struct attribute *battery_class_attrs[] = {
 	&class_attr_soh.attr,
 	&class_attr_resistance.attr,
+	&class_attr_charge_counter.attr,
+#ifdef CONFIG_QTI_THERMAL
+	&class_attr_board_sensor_temp.attr,
+#endif
 	&class_attr_moisture_detection_status.attr,
 	&class_attr_moisture_detection_en.attr,
 	&class_attr_wireless_boost_en.attr,

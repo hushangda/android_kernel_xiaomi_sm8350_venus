@@ -38,10 +38,10 @@ struct notifier_block { int dummy; };
 struct mi_disp_notifier { int disp_id; void *data; };
 struct test_queue { struct work_struct *pending; };
 struct fts_ts_info {
+	void *dev;
 	struct work_struct resume_work, suspend_work, switch_mode_work;
 	struct notifier_block notifier;
 	struct test_queue *event_wq;
-	bool aod_status_from_display;
 	bool power_state_valid, sensor_sleep, fod_pressed, probe_ok;
 	bool palm_sensor_switch, palm_sensor_changed, enable_touch_raw;
 	int resume_bit, charging_status, sleep_finger, gesture_enabled, fod_mutex;
@@ -49,6 +49,17 @@ struct fts_ts_info {
 };
 static struct fts_ts_info info;
 static struct fts_ts_info *fts_info = &info;
+static int wake_references;
+static void pm_stay_awake(void *dev)
+{
+	assert(dev == &info);
+	wake_references++;
+}
+static void pm_relax(void *dev)
+{
+	assert(dev == &info && wake_references > 0);
+	wake_references--;
+}
 static int resets, mode_calls, fail_mode, fail_reset, irq_enable, irq_disable;
 static int scans, scan_mode, commands;
 static u8 last_command[6];
@@ -109,12 +120,6 @@ static void flush_workqueue(struct test_queue *q)
 		assert(!work);
 }
 
-static void schedule_work(struct work_struct *work)
-{
-	assert(work == &info.switch_mode_work);
-	fts_switch_mode_work(work);
-}
-
 static void notify_display(int event, unsigned int blank)
 {
 	struct mi_disp_notifier notification = { MI_DISPLAY_PRIMARY, &blank };
@@ -126,6 +131,7 @@ int main(void)
 {
 	int before, before_commands;
 
+	info.dev = &info;
 	info.fod_status = -1;
 	info.resume_bit = 1;
 	/* Unknown initial state must not suppress the first transition. */
@@ -207,7 +213,10 @@ int main(void)
 	info.aod_status = 0;
 	notify_display(MI_DISP_DPMS_EARLY_EVENT, MI_DISP_DPMS_LP1);
 	flush_workqueue(&event_queue);
-	assert(info.aod_status == 1 && info.aod_status_from_display);
+	/* Stock policy owns AOD: LP notifications cannot override an explicit 0. */
+	assert(info.aod_status == 0 && info.sensor_sleep);
+	info.aod_status = 1;
+	fts_switch_mode_work(&info.switch_mode_work);
 	assert(last_command[5] & FOD_SINGLETAP_EVENT);
 	before = mode_calls;
 	notify_display(MI_DISP_DPMS_EARLY_EVENT, MI_DISP_DPMS_LP2);
@@ -215,8 +224,9 @@ int main(void)
 	assert(mode_calls == before);
 	notify_display(MI_DISP_DPMS_EVENT, MI_DISP_DPMS_ON);
 	flush_workqueue(&event_queue);
-	assert(!info.aod_status && !info.aod_status_from_display);
+	assert(info.aod_status == 1 && !info.sensor_sleep);
 	assert(scans > 0 && irq_enable > 0 && irq_disable > 0);
+	assert(!wake_references);
 	puts("PASS touch: duplicates, failure retries, queued OFF/ON order, LP1/LP2/AOD/double-tap/non-UI/FOD");
 	return 0;
 }

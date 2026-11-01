@@ -22,6 +22,42 @@ else
   echo "ERROR: MGLRU must be 1 or 0" >&2
   exit 1
 fi
+# Keep the established EROFS workqueue path as the default until device testing.
+# EROFS_PCPU=1 enables the optional per-CPU workers at normal priority.
+EROFS_PCPU="${EROFS_PCPU:-0}"
+if [[ "$EROFS_PCPU" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
+  EROFS_PCPU=1
+elif [[ "$EROFS_PCPU" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
+  EROFS_PCPU=0
+else
+  echo "ERROR: EROFS_PCPU must be 1 or 0" >&2
+  exit 1
+fi
+# Complete native backends for the newer ROM ABI. The matching xr_fbt node
+# label/permissions and thermal producer belong in the companion ROM package.
+# MIMD v2 transport remains separate: the installed legacy HAL cannot parse it.
+ROM_COMPAT="${ROM_COMPAT:-0}"
+if [[ "$ROM_COMPAT" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
+  ROM_COMPAT=1
+elif [[ "$ROM_COMPAT" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
+  ROM_COMPAT=0
+else
+  echo "ERROR: ROM_COMPAT must be 1 or 0" >&2
+  exit 1
+fi
+MIMD_V2="${MIMD_V2:-0}"
+if [[ "$MIMD_V2" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
+  MIMD_V2=1
+elif [[ "$MIMD_V2" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
+  MIMD_V2=0
+else
+  echo "ERROR: MIMD_V2 must be 1 or 0" >&2
+  exit 1
+fi
+if (( MIMD_V2 && !ROM_COMPAT )); then
+  echo "ERROR: MIMD_V2 requires ROM_COMPAT=1 and the matching ROM companion" >&2
+  exit 1
+fi
 # Keep interactive desktop sessions responsive by default.  Dedicated build
 # hosts can still override this explicitly, for example JOBS=16.
 JOBS="${JOBS:-2}"
@@ -86,6 +122,8 @@ CONFIG_ARGS=(
   --enable VIRTIO_VSOCKETS \
   --enable ZRAM \
   --enable ZRAM_MULTI_COMP \
+  --enable ZRAM_ZSTD_PARAMS \
+  --enable CRYPTO_ZSTD \
   --enable CRYPTO_LZ4 \
   --enable ZRAM_DEF_COMP_LZ4 \
   --disable ZRAM_DEF_COMP_LZORLE \
@@ -133,6 +171,24 @@ else
   CONFIG_ARGS+=(--disable LRU_GEN_ENABLED)
 fi
 
+if (( EROFS_PCPU )); then
+  CONFIG_ARGS+=(--enable EROFS_FS_PCPU_KTHREAD)
+else
+  CONFIG_ARGS+=(--disable EROFS_FS_PCPU_KTHREAD)
+fi
+CONFIG_ARGS+=(--disable EROFS_FS_PCPU_KTHREAD_HIPRI)
+
+if (( ROM_COMPAT )); then
+  CONFIG_ARGS+=(--enable RCU_BOOST --enable XIAOMI_XR_QOS
+    --enable XIAOMI_MEMCG_RECLAIM --enable XIAOMI_SMART_CACHE
+    --enable ZRAM_WRITEBACK --enable KEYS --enable BLK_INLINE_ENCRYPTION
+    --enable XIAOMI_ZRAM_EXTM)
+fi
+if (( MIMD_V2 )); then
+  CONFIG_ARGS+=(--enable PERF_HELPER --enable BOOTUP_RECLAIM
+    --enable XIAOMI_MIMD_TRIGGER --enable XIAOMI_MIMD_RECLAIM)
+fi
+
 HAS_KPM=0
 HAS_RECOVERY_GUARD=0
 if grep -q '^config KPM$' "$ROOT_DIR/KernelSU/kernel/Kconfig"; then
@@ -154,6 +210,34 @@ fi
 
 "$ROOT_DIR/scripts/config" --file "$OUT_DIR/.config" "${CONFIG_ARGS[@]}"
 make "${MAKE_ARGS[@]}" olddefconfig
+if (( ROM_COMPAT )); then
+  for compat_config in RCU_BOOST XIAOMI_XR_QOS XIAOMI_MEMCG_RECLAIM \
+    XIAOMI_SMART_CACHE ZRAM_WRITEBACK XIAOMI_ZRAM_EXTM; do
+    grep -Fxq "CONFIG_${compat_config}=y" "$OUT_DIR/.config" || {
+      echo "ERROR: requested ROM compatibility backend $compat_config is unavailable" >&2
+      exit 1
+    }
+  done
+fi
+if (( MIMD_V2 )); then
+  for mimd_config in PERF_HELPER BOOTUP_RECLAIM XIAOMI_MIMD_TRIGGER XIAOMI_MIMD_RECLAIM; do
+    grep -Fxq "CONFIG_${mimd_config}=y" "$OUT_DIR/.config" || {
+      echo "ERROR: requested MIMD backend $mimd_config is unavailable" >&2
+      exit 1
+    }
+  done
+fi
+# Verify the opt-in survived dependency resolution; never select FIFO workers.
+if (( EROFS_PCPU )); then
+  grep -Fxq 'CONFIG_EROFS_FS_PCPU_KTHREAD=y' "$OUT_DIR/.config" || {
+    echo "ERROR: EROFS per-CPU workers were requested but are unavailable" >&2
+    exit 1
+  }
+fi
+if grep -q '^CONFIG_EROFS_FS_PCPU_KTHREAD_HIPRI=y$' "$OUT_DIR/.config"; then
+  echo "ERROR: EROFS high-priority workers must remain disabled" >&2
+  exit 1
+fi
 # Check the requested config after Kconfig dependencies have been resolved.
 # PAGE_OWNER must stay disabled because it selects DEBUG_FS.
 for required_config in \
@@ -174,6 +258,8 @@ grep -q '^CONFIG_ZRAM_DEF_COMP="lz4"$' "$OUT_DIR/.config" || {
   exit 1
 }
 for required_config in \
+  'CONFIG_ZRAM_ZSTD_PARAMS=y' \
+  'CONFIG_CRYPTO_ZSTD=y' \
   'CONFIG_F2FS_FS_COMPRESSION=y' \
   'CONFIG_F2FS_FS_LZO=y' \
   'CONFIG_F2FS_FS_LZORLE=y' \
@@ -321,6 +407,10 @@ echo "F2FS compression: enabled"
 echo "F2FS performance options: unfair rwsem + checkpoint fsync optimization enabled"
 echo "Vendor freezer protocol 29: HANS/MILLET auto multiplex enabled"
 echo "ZRAM multi-compressor recompression: enabled"
+echo "ZRAM explicit Zstd compression levels: enabled (default compressor unchanged)"
+echo "EROFS per-CPU workers: $([[ "$EROFS_PCPU" == 1 ]] && echo enabled || echo disabled) (normal priority)"
+echo "Native ROM compatibility backends: ROM_COMPAT=$ROM_COMPAT"
+echo "MIMD v2 matched-ROM backends: MIMD_V2=$MIMD_V2"
 echo "Recovery/TWRP custom KSU guard: $([[ "$HAS_RECOVERY_GUARD" == 1 ]] && echo enabled || echo absent-in-upstream)"
 echo "Image (for TWRP prebuilt/venus/kernel): $KERNEL_IMAGE"
 echo "Image.gz: $KERNEL_IMAGE_GZ"

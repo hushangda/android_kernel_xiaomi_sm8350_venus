@@ -21,6 +21,7 @@
 #include <linux/ratelimit.h>
 #include <linux/list_lru.h>
 #include <linux/iversion.h>
+#include <linux/mi_smart_cache.h>
 #include <trace/events/writeback.h>
 #include "internal.h"
 
@@ -251,6 +252,7 @@ static struct inode *alloc_inode(struct super_block *sb)
 
 void __destroy_inode(struct inode *inode)
 {
+	mi_smart_cache_inode_free(inode);
 	BUG_ON(inode_has_buffers(inode));
 	inode_detach_wb(inode);
 	security_inode_free(inode);

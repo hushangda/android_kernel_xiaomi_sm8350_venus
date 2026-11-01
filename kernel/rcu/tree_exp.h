@@ -821,7 +821,7 @@ static int rcu_print_task_exp_stall(struct rcu_node *rnp)
  *
  * This has the same semantics as (but is more brutal than) synchronize_rcu().
  */
-void synchronize_rcu_expedited(void)
+static void __synchronize_rcu_expedited(void)
 {
 	bool boottime = (rcu_scheduler_active == RCU_SCHEDULER_INIT);
 	unsigned long flags;
@@ -884,6 +884,18 @@ void synchronize_rcu_expedited(void)
 
 	if (likely(!boottime))
 		destroy_work_on_stack(&rew.rew_work);
+}
+void synchronize_rcu_expedited(void)
+{
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct xr_qos_rcu_wait wait;
+
+	xr_qos_rcu_wait_start(&wait);
+#endif
+	__synchronize_rcu_expedited();
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_rcu_wait_end(&wait);
+#endif
 }
 EXPORT_SYMBOL_GPL(synchronize_rcu_expedited);
 

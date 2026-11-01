@@ -28,6 +28,116 @@
 #include "mi_dsi_display.h"
 #include "mi_disp_feature.h"
 #include "mi_disp_file.h"
+#include "mi_disp_timer.h"
+
+struct mi_count_work {
+	struct kthread_work work;
+	struct disp_display *display;
+	u32 type, len;
+	s32 value;
+	char payload[MI_BUILD_VERSION_SIZE];
+};
+
+static int mi_disp_apply_count(struct mi_count_work *w)
+{
+	struct dsi_display *display = w->display->display;
+	struct dsi_panel *panel;
+	int ret;
+
+	if (!display || !display->panel)
+		return -ENODEV;
+	panel = display->panel;
+	if (w->type == 3) {
+		mi_disp_timer_enable(w->value);
+		return 0;
+	}
+	if (w->type == 9 || w->type == 10)
+		return mi_disp_timer_set_power_timeout(w->type, w->value);
+	mutex_lock(&panel->panel_lock);
+	ret = mi_panel_stats_set(&panel->mi_stats, w->type, w->value,
+		w->payload, w->len, panel->power_mode == SDE_MODE_DPMS_OFF);
+	mutex_unlock(&panel->panel_lock);
+	return ret;
+}
+
+static void mi_disp_count_work(struct kthread_work *work)
+{
+	struct mi_count_work *w = container_of(work, struct mi_count_work, work);
+
+	mi_disp_apply_count(w);
+	kfree(w);
+}
+
+static int mi_disp_ioctl_set_count_info(struct disp_feature_client *client, void *data)
+{
+	struct disp_count_req *req = data;
+	struct mi_count_work *w;
+	u32 i;
+	int ret;
+
+	if (!is_support_disp_id(req->base.disp_id) || req->base.flag > 1 || req->rx_len)
+		return -EINVAL;
+	if (req->count_type > 4 && req->count_type != 9 && req->count_type != 10)
+		return -EOPNOTSUPP;
+	if ((req->count_type == 0 && (req->count_value < 0 || req->count_value > 3)) ||
+		((req->count_type == 2 || req->count_type == 4) && req->count_value < 0) ||
+		(req->count_type == 3 && (req->count_value < 0 || req->count_value > 1)) ||
+		((req->count_type == 9 || req->count_type == 10) &&
+		 (req->count_value < 1 || req->count_value > 60000)))
+		return -EINVAL;
+	if (req->count_type == 1) {
+		if (!req->tx_len || req->tx_len > MI_BUILD_VERSION_SIZE)
+			return -EINVAL;
+	} else if (req->tx_len) {
+		return -EINVAL;
+	}
+	ret = mutex_lock_interruptible(&client->client_lock);
+	if (ret)
+		return ret;
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	w->display = &client->df->d_display[req->base.disp_id];
+	if (w->display->intf_type != MI_INTF_DSI || !w->display->display) {
+		ret = -ENODEV;
+		goto free;
+	}
+	w->type = req->count_type;
+	w->value = req->count_value;
+	w->len = req->tx_len;
+	if (w->len && copy_from_user(w->payload, u64_to_user_ptr(req->tx_ptr), w->len)) {
+		ret = -EFAULT;
+		goto free;
+	}
+	/* Reject malformed strings before accepting asynchronous work. */
+	if (w->type == 1) {
+		for (i = 0; i < w->len && w->payload[i]; i++)
+			if (w->payload[i] < ' ' || w->payload[i] > '~')
+				break;
+		if (!i || (i < w->len && w->payload[i])) {
+			ret = -EINVAL;
+			goto free;
+		}
+	}
+	if (req->base.flag == MI_DISP_FLAG_NONBLOCK) {
+		kthread_init_work(&w->work, mi_disp_count_work);
+		if (!kthread_queue_work(&w->display->d_thread.worker, &w->work)) {
+			ret = -EBUSY;
+			goto free;
+		}
+		/* A single allocation owns the bounded payload until work completes. */
+		ret = 0;
+		goto unlock;
+	}
+	ret = mi_disp_apply_count(w);
+free:
+	kfree(w);
+unlock:
+	mutex_unlock(&client->client_lock);
+	return ret;
+}
 
 int mi_disp_open(struct inode *inode, struct file *file)
 {
@@ -927,6 +1037,7 @@ static const struct disp_ioctl_desc disp_ioctls[] = {
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_READ_DSI_CMD, mi_disp_ioctl_read_dsi_cmd),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_GET_BRIGHTNESS, mi_disp_ioctl_get_brightness),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_GET_FEATURE, mi_disp_ioctl_get_feature),
+	DISP_IOCTL_DEF(MI_DISP_IOCTL_SET_COUNT_INFO, mi_disp_ioctl_set_count_info),
 	DISP_IOCTL_DEF(MI_DISP_IOCTL_SET_LOCAL_HBM, mi_disp_ioctl_set_local_hbm),
 };
 
@@ -943,6 +1054,10 @@ long mi_disp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	char *kdata = NULL;
 	unsigned int in_size, out_size, drv_size, ksize;
 
+	/* The count contract has no historical short or differently typed form. */
+	if (nr == _IOC_NR(MI_DISP_IOCTL_SET_COUNT_INFO) &&
+			cmd != MI_DISP_IOCTL_SET_COUNT_INFO)
+		return -ENOTTY;
 
 	if (nr >= MI_DISP_IOCTL_COUNT)
 		goto err_i1;

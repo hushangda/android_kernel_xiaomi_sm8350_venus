@@ -61,6 +61,10 @@ static struct fuse_req *fuse_request_alloc(gfp_t flags)
 
 static void fuse_request_free(struct fuse_req *req)
 {
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&req->xr_qos_link);
+	WARN_ON(req->xr_qos_source);
+#endif
 	kmem_cache_free(fuse_req_cachep, req);
 }
 
@@ -283,6 +287,9 @@ void fuse_request_end(struct fuse_conn *fc, struct fuse_req *req)
 
 	if (test_and_set_bit(FR_FINISHED, &req->flags))
 		goto put_request;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&req->xr_qos_link);
+#endif
 
 	/*
 	 * test_and_set_bit() implies smp_mb() between bit
@@ -411,6 +418,10 @@ static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 	struct fuse_iqueue *fiq = &fc->iq;
 
 	BUG_ON(test_bit(FR_BACKGROUND, &req->flags));
+#ifdef CONFIG_XIAOMI_XR_QOS
+	get_task_struct(current);
+	req->xr_qos_source = current;
+#endif
 	spin_lock(&fiq->lock);
 	if (!fiq->connected) {
 		spin_unlock(&fiq->lock);
@@ -426,6 +437,11 @@ static void __fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
 		/* Pairs with smp_wmb() in fuse_request_end() */
 		smp_rmb();
 	}
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&req->xr_qos_link);
+	req->xr_qos_source = NULL;
+	put_task_struct(current);
+#endif
 }
 
 static void fuse_adjust_compat(struct fuse_conn *fc, struct fuse_args *args)
@@ -1270,6 +1286,11 @@ static ssize_t fuse_dev_do_read(struct fuse_dev *fud, struct file *file,
 	req = list_entry(fiq->pending.next, struct fuse_req, list);
 	clear_bit(FR_PENDING, &req->flags);
 	list_del_init(&req->list);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (req->xr_qos_source)
+		xr_qos_link_add(&req->xr_qos_link, req->xr_qos_source,
+				current, XR_QOS_FUSE);
+#endif
 	spin_unlock(&fiq->lock);
 
 	args = req->args;

@@ -64,6 +64,8 @@ static inline void mmap_read_unlock(struct mm_struct *mm)
 static inline bool mmap_read_trylock_non_owner(struct mm_struct *mm)
 {
 	if (down_read_trylock(&mm->mmap_lock)) {
+		/* Ownership is explicitly transferable; do not retain this task. */
+		rwsem_xr_qos_forget_reader(&mm->mmap_lock);
 		rwsem_release(&mm->mmap_lock.dep_map, _RET_IP_);
 		return true;
 	}

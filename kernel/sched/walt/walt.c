@@ -3,6 +3,7 @@
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  */
 #include <linux/syscore_ops.h>
+#include <linux/xr_qos.h>
 #include <linux/cpufreq.h>
 #include <linux/list_sort.h>
 #include <linux/jiffies.h>
@@ -3065,6 +3066,80 @@ void add_new_task_to_grp(struct task_struct *new)
 	write_unlock_irqrestore(&related_thread_group_lock, flags);
 }
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+/*
+ * QoS owns only groups it attached from group 0. Explicit proc/cgroup changes
+ * revoke ownership below. A nonzero-to-nonzero move keeps grouped busy time
+ * and per-CPU history intact; all groups share rq->wrq.grp_time in this tree.
+ */
+int walt_xr_qos_set_group(struct task_struct *p, unsigned int group_id)
+{
+	struct walt_related_thread_group *old, *new, *first, *second;
+	struct rq_flags rf;
+	struct rq *rq;
+	unsigned long flags;
+	int ret = 0;
+
+	if (group_id == DEFAULT_CGROUP_COLOC_ID ||
+	    group_id >= MAX_NUM_CGROUP_COLOC_ID)
+		return -EINVAL;
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	write_lock(&related_thread_group_lock);
+	old = p->wts.grp;
+	if (!group_id) {
+		if (p->xr_qos_rtg_owned && old)
+			remove_task_from_group(p);
+		p->xr_qos_rtg_owned = false;
+		p->xr_qos_rtg_blocked = false;
+		goto out;
+	}
+	if (p->flags & PF_EXITING) {
+		ret = -ESRCH;
+		goto out;
+	}
+	if (p->xr_qos_rtg_blocked || uclamp_task_colocated(p) ||
+	    (old && !p->xr_qos_rtg_owned)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	new = lookup_related_thread_group(group_id);
+	if (!new) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (old == new)
+		goto out;
+	if (!old) {
+		if (list_empty(&new->list))
+			list_add(&new->list, &active_related_thread_groups);
+		ret = add_task_to_group(p, new);
+		if (!ret)
+			p->xr_qos_rtg_owned = true;
+		goto out;
+	}
+	first = old->id < new->id ? old : new;
+	second = first == old ? new : old;
+	raw_spin_lock(&first->lock);
+	raw_spin_lock_nested(&second->lock, SINGLE_DEPTH_NESTING);
+	rq = __task_rq_lock(p, &rf);
+	if (list_empty(&new->list))
+		list_add(&new->list, &active_related_thread_groups);
+	list_move(&p->wts.grp_list, &new->tasks);
+	rcu_assign_pointer(p->wts.grp, new);
+	__task_rq_unlock(rq, &rf);
+	if (list_empty(&old->tasks))
+		list_del_init(&old->list);
+	_set_preferred_cluster(old);
+	_set_preferred_cluster(new);
+	raw_spin_unlock(&second->lock);
+	raw_spin_unlock(&first->lock);
+out:
+	write_unlock(&related_thread_group_lock);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+	return ret;
+}
+#endif
+
 static int __sched_set_group_id(struct task_struct *p, unsigned int group_id)
 {
 	int rc = 0;
@@ -3076,6 +3151,17 @@ static int __sched_set_group_id(struct task_struct *p, unsigned int group_id)
 
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
 	write_lock(&related_thread_group_lock);
+
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (p->xr_qos_rtg_owned) {
+		if (p->wts.grp)
+			remove_task_from_group(p);
+		p->xr_qos_rtg_owned = false;
+	}
+	/* An explicit write also wins against a queued, not-yet-applied request. */
+	if (xr_qos_group_requested(p))
+		p->xr_qos_rtg_blocked = true;
+#endif
 
 	/* Switching from one group to another directly is not permitted */
 	if ((!p->wts.grp && !group_id) || (p->wts.grp && group_id))

@@ -17,6 +17,7 @@
 #include <linux/kdev_t.h>
 #include <linux/idr.h>
 #include <linux/thermal.h>
+#include <linux/timekeeping.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/of.h>
@@ -68,7 +69,12 @@ static atomic_t poor_modem_limit = ATOMIC_INIT(0);
 static char boost_buf[128];
 const char *board_sensor;
 static char board_sensor_temp[128];
+/* Stock publication is every 10 s; expire a crashed/stalled producer. */
+#define BOARD_SENSOR_MAX_AGE_NS (30ULL * NSEC_PER_SEC)
+static u64 board_sensor_updated_ns;
+static int board_sensor_error = -ENODATA;
 static char board_sensor_second_temp[128];
+static DEFINE_MUTEX(thermal_message_lock);
 #endif
 /*
  * Governor section: set of functions to handle thermal governors
@@ -1878,20 +1884,44 @@ thermal_balance_mode_store(struct device *dev,
 static DEVICE_ATTR(balance_mode, 0664,
 		   thermal_balance_mode_show, thermal_balance_mode_store);
 
+/* These attributes relay userspace text; it must never be a format string. */
+static ssize_t thermal_message_string_show(char *buf, const char *value)
+{
+	ssize_t ret;
+
+	mutex_lock(&thermal_message_lock);
+	ret = scnprintf(buf, PAGE_SIZE, "%s", value);
+	mutex_unlock(&thermal_message_lock);
+
+	return ret;
+}
+
+static ssize_t thermal_message_string_store(char *value, size_t capacity,
+					   const char *buf, size_t len)
+{
+	if (len >= capacity)
+		return -E2BIG;
+
+	mutex_lock(&thermal_message_lock);
+	memcpy(value, buf, len);
+	value[len] = '\0';
+	mutex_unlock(&thermal_message_lock);
+
+	return len;
+}
+
 static ssize_t
 thermal_boost_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, boost_buf);
+	return thermal_message_string_show(buf, boost_buf);
 }
 
 static ssize_t
 thermal_boost_store(struct device *dev,
 				      struct device_attribute *attr, const char *buf, size_t len)
 {
-	int ret;
-	ret = snprintf(boost_buf, PAGE_SIZE, buf);
-	return len;
+	return thermal_message_string_store(boost_buf, sizeof(boost_buf), buf, len);
 }
 
 static DEVICE_ATTR(boost, 0644,
@@ -1964,35 +1994,64 @@ static ssize_t
 thermal_board_sensor_temp_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, board_sensor_temp);
+	int temp, ret = thermal_message_get_board_temp(&temp);
+
+	return ret ? ret : scnprintf(buf, PAGE_SIZE, "%d\n", temp);
 }
 
 static ssize_t
 thermal_board_sensor_temp_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
-	snprintf(board_sensor_temp, PAGE_SIZE, buf);
+	int temp;
 
+	if (len >= sizeof(board_sensor_temp))
+		return -E2BIG;
+	mutex_lock(&thermal_message_lock);
+	memcpy(board_sensor_temp, buf, len);
+	board_sensor_temp[len] = '\0';
+	board_sensor_error = !len ? -ENODATA : memchr(buf, '\0', len) ?
+		-EINVAL : kstrtoint(board_sensor_temp, 10, &temp);
+	board_sensor_updated_ns = ktime_get_boottime_ns();
+	mutex_unlock(&thermal_message_lock);
 	return len;
 }
 
 static DEVICE_ATTR(board_sensor_temp, 0664,
 		thermal_board_sensor_temp_show, thermal_board_sensor_temp_store);
 
+/* The MiCharge compatibility reader uses the same published mC sample. */
+int thermal_message_get_board_temp(int *temp)
+{
+	int ret;
+
+	if (!temp)
+		return -EINVAL;
+	mutex_lock(&thermal_message_lock);
+	ret = board_sensor_error;
+	if (!ret && ktime_get_boottime_ns() - board_sensor_updated_ns >
+			BOARD_SENSOR_MAX_AGE_NS)
+		ret = -ENODATA;
+	if (!ret)
+		ret = kstrtoint(board_sensor_temp, 10, temp);
+	mutex_unlock(&thermal_message_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(thermal_message_get_board_temp);
+
 static ssize_t
 thermal_board_sensor_second_temp_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, board_sensor_second_temp);
+	return thermal_message_string_show(buf, board_sensor_second_temp);
 }
 
 static ssize_t
 thermal_board_sensor_second_temp_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
-	snprintf(board_sensor_second_temp, PAGE_SIZE, buf);
-
-	return len;
+	return thermal_message_string_store(board_sensor_second_temp,
+					   sizeof(board_sensor_second_temp), buf, len);
 }
 
 static DEVICE_ATTR(board_sensor_second_temp, 0664,

@@ -826,6 +826,36 @@ static void binder_restore_priority(struct binder_thread *thread,
 	binder_do_set_priority(thread, desired, /* verify = */ false);
 }
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+static void binder_xr_qos_release(struct binder_transaction *t)
+{
+	xr_qos_link_del(&t->xr_qos);
+	if (t->xr_qos_source) {
+		put_task_struct(t->xr_qos_source);
+		t->xr_qos_source = NULL;
+	}
+}
+
+static void binder_xr_qos_inherit(struct binder_transaction *t,
+				 struct task_struct *target)
+{
+	struct xr_qos_link *link;
+	int ret;
+
+	if (!t->xr_qos_source ||
+	    ((t->flags & TF_ONE_WAY) && !t->xr_qos_async))
+		return;
+	link = t->flags & TF_ONE_WAY ? &t->buffer->xr_qos : &t->xr_qos;
+	ret = xr_qos_link_add(link, t->xr_qos_source, target, XR_QOS_BINDER);
+	if (ret && ret != -EALREADY && ret != -ESRCH)
+		pr_warn_ratelimited("binder: QoS dependency failed: %d\n", ret);
+}
+#else
+static inline void binder_xr_qos_release(struct binder_transaction *t) { }
+static inline void binder_xr_qos_inherit(struct binder_transaction *t,
+				       struct task_struct *target) { }
+#endif
+
 static void binder_transaction_priority(struct binder_thread *thread,
 					struct binder_transaction *t,
 					struct binder_node *node)
@@ -880,6 +910,7 @@ static void binder_transaction_priority(struct binder_thread *thread,
 	spin_unlock(&thread->prio_lock);
 
 	binder_set_priority(thread, &desired);
+	binder_xr_qos_inherit(t, task);
 	trace_android_vh_binder_set_priority(t, task);
 }
 
@@ -1755,6 +1786,7 @@ static void binder_free_transaction(struct binder_transaction *t)
 {
 	struct binder_proc *target_proc = t->to_proc;
 
+	binder_xr_qos_release(t);
 	if (target_proc) {
 		binder_inner_proc_lock(target_proc);
 		target_proc->outstanding_txns--;
@@ -1845,6 +1877,10 @@ static void binder_cleanup_transaction(struct binder_transaction *t,
 				       const char *reason,
 				       uint32_t error_code)
 {
+#ifdef CONFIG_XIAOMI_XR_QOS
+	/* An undelivered oneway buffer must not retain a receiver boost. */
+	xr_qos_link_del(&t->buffer->xr_qos);
+#endif
 	if (t->buffer->target_node && !(t->flags & TF_ONE_WAY)) {
 		binder_send_failed_reply(t, error_code);
 	} else {
@@ -2920,6 +2956,12 @@ static int binder_proc_transaction(struct binder_transaction *t,
 	if (!thread && !pending_async)
 		thread = binder_select_thread_ilocked(proc);
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+	/* Consume only after the destination passed dead/frozen validation. */
+	if (oneway && t->xr_qos_source)
+		t->xr_qos_async = xr_qos_async_consume(t->xr_qos_source);
+#endif
+
 	if (thread) {
 		binder_transaction_priority(thread, t, node);
 		binder_enqueue_thread_work_ilocked(thread, &t->work);
@@ -3257,6 +3299,12 @@ static void binder_transaction(struct binder_proc *proc,
 	binder_stats_created(BINDER_STAT_TRANSACTION);
 	spin_lock_init(&t->lock);
 	trace_android_vh_binder_transaction_init(t);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (!reply) {
+		get_task_struct(current);
+		t->xr_qos_source = current;
+	}
+#endif
 
 	tcomplete = kmem_cache_zalloc(binder_work_pool, GFP_KERNEL);
 	if (tcomplete == NULL) {
@@ -3785,6 +3833,7 @@ err_get_secctx_failed:
 	kmem_cache_free(binder_work_pool, tcomplete);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION_COMPLETE);
 err_alloc_tcomplete_failed:
+	binder_xr_qos_release(t);
 	kmem_cache_free(binder_transaction_pool, t);
 	binder_stats_deleted(BINDER_STAT_TRANSACTION);
 err_alloc_t_failed:

@@ -479,6 +479,16 @@ config HAVE_SCHED_AVG_IRQ
 	depends on IRQ_TIME_ACCOUNTING || PARAVIRT_TIME_ACCOUNTING
 	depends on SMP
 
+config XIAOMI_XR_QOS
+	bool "Xiaomi task QoS and dependency inheritance"
+	depends on SMP && RT_MUTEXES && SCHED_WALT && !RT_GROUP_SCHED
+	depends on RCU_BOOST && ANDROID_BINDER_IPC && FUTEX && FUSE_FS=y
+	default n
+	help
+	  Native task QoS contributions and dependency inheritance. This is
+	  isolated from the normal scheduler unless explicitly enabled. The
+	  userspace device is exposed only with the complete dependency backend.
+
 config SCHED_WALT
 	bool "Support window based load tracking"
 	depends on SMP

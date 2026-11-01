@@ -369,6 +369,18 @@ extern unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
 						  unsigned long nr_pages,
 						  gfp_t gfp_mask,
 						  bool may_swap);
+/* Explicit page classes for Xiaomi per-memcg proactive reclaim. */
+enum xiaomi_reclaim_type {
+	XIAOMI_RECLAIM_INACTIVE_ANON,
+	XIAOMI_RECLAIM_ANON,
+	XIAOMI_RECLAIM_INACTIVE_FILE,
+	XIAOMI_RECLAIM_FILE,
+};
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+/* Caller holds a css reference and must not already be in reclaim context. */
+unsigned long xiaomi_reclaim_memcg(struct mem_cgroup *memcg,
+		unsigned long nr_pages, enum xiaomi_reclaim_type type);
+#endif
 extern unsigned long mem_cgroup_shrink_node(struct mem_cgroup *mem,
 						gfp_t gfp_mask, bool noswap,
 						pg_data_t *pgdat,

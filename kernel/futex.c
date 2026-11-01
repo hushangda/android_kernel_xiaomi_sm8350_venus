@@ -31,6 +31,7 @@
  *  "The futexes are also cursed."
  *  "But they come in a choice of three flavours!"
  */
+#include <linux/xr_qos.h>
 #include <linux/compat.h>
 #include <linux/slab.h>
 #include <linux/poll.h>
@@ -2964,14 +2965,44 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+/* Xiaomi userspace supplies an optional owner hint in the otherwise unused
+ * WAIT uaddr2 argument. Never trust it as a pointer to a kernel lock owner. */
+static struct task_struct *futex_xr_owner(u32 __user *uaddr, u32 __user *hint)
+{
+	struct task_struct *p;
+	u32 word;
+	pid_t tid;
+
+	if (!hint || get_user(word, hint) ||
+	    (word & 0xffff) != (((unsigned long)uaddr >> 2) & 0xffff))
+		return NULL;
+	tid = (s16)(word >> 16);
+	if (tid <= 0)
+		return NULL;
+	rcu_read_lock();
+	p = find_task_by_vpid(tid);
+	if (p && p != current && READ_ONCE(p->mm) == current->mm)
+		get_task_struct(p);
+	else
+		p = NULL;
+	rcu_read_unlock();
+	return p;
+}
+#endif
+
 static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
-		      ktime_t *abs_time, u32 bitset)
+		      ktime_t *abs_time, u32 bitset, u32 __user *owner_hint)
 {
 	struct hrtimer_sleeper timeout, *to;
 	struct restart_block *restart;
 	struct futex_hash_bucket *hb;
 	struct futex_q q = futex_q_init;
 	int ret;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct xr_qos_link xr_link = { };
+	struct task_struct *xr_owner = NULL;
+#endif
 
 	if (!bitset)
 		return -EINVAL;
@@ -2980,6 +3011,9 @@ static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 	to = futex_setup_timer(abs_time, &timeout, flags,
 			       current->timer_slack_ns);
 retry:
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_owner = futex_xr_owner(uaddr, owner_hint);
+#endif
 	/*
 	 * Prepare to wait on uaddr. On success, holds hb lock and increments
 	 * q.key refs.
@@ -2988,8 +3022,19 @@ retry:
 	if (ret)
 		goto out;
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (xr_owner)
+		xr_qos_link_add(&xr_link, current, xr_owner, XR_QOS_FUTEX);
+#endif
 	/* queue_me and wait for wakeup, timeout, or a signal. */
 	futex_wait_queue_me(hb, &q, to);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&xr_link);
+	if (xr_owner) {
+		put_task_struct(xr_owner);
+		xr_owner = NULL;
+	}
+#endif
 
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
@@ -3013,6 +3058,7 @@ retry:
 
 	restart = &current->restart_block;
 	restart->futex.uaddr = uaddr;
+	restart->futex.uaddr2 = owner_hint;
 	restart->futex.val = val;
 	restart->futex.time = *abs_time;
 	restart->futex.bitset = bitset;
@@ -3021,6 +3067,10 @@ retry:
 	ret = set_restart_fn(restart, futex_wait_restart);
 
 out:
+#ifdef CONFIG_XIAOMI_XR_QOS
+	if (xr_owner)
+		put_task_struct(xr_owner);
+#endif
 	if (to) {
 		hrtimer_cancel(&to->timer);
 		destroy_hrtimer_on_stack(&to->timer);
@@ -3041,7 +3091,8 @@ static long futex_wait_restart(struct restart_block *restart)
 	restart->fn = do_no_restart_syscall;
 
 	return (long)futex_wait(uaddr, restart->futex.flags,
-				restart->futex.val, tp, restart->futex.bitset);
+				restart->futex.val, tp, restart->futex.bitset,
+				restart->futex.uaddr2);
 }
 
 
@@ -4028,7 +4079,7 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		/* fall through */
 	case FUTEX_WAIT_BITSET:
-		return futex_wait(uaddr, flags, val, timeout, val3);
+		return futex_wait(uaddr, flags, val, timeout, val3, uaddr2);
 	case FUTEX_WAKE:
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		/* fall through */

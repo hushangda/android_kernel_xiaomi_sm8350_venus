@@ -1,0 +1,13 @@
+# Merge only when the installed thermal daemon does not publish board temp.
+service venus_board_temp /vendor/bin/venus-board-temp --publish
+    class main
+    user root
+    group system
+    seclabel u:r:mi_thermald:s0
+    disabled
+
+on boot && property:ro.product.vendor.device=venus
+    start venus_board_temp
+
+on charger && property:ro.product.vendor.device=venus
+    start venus_board_temp

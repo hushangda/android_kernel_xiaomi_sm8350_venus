@@ -26,6 +26,8 @@
 #include <linux/sched/clock.h>
 #include <linux/export.h>
 #include <linux/rwsem.h>
+#include <linux/xr_qos.h>
+#include <linux/slab.h>
 #include <linux/atomic.h>
 
 #include "rwsem.h"
@@ -326,6 +328,9 @@ void __init_rwsem(struct rw_semaphore *sem, const char *name,
 	osq_lock_init(&sem->osq);
 #endif
 	trace_android_vh_rwsem_init(sem);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	sem->xr_qos = NULL;
+#endif
 }
 EXPORT_SYMBOL(__init_rwsem);
 
@@ -342,9 +347,210 @@ struct rwsem_waiter {
 
 	/* Writer only, not initialized in reader */
 	bool handoff_set;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct xr_qos_link xr_qos;
+#endif
 };
 #define rwsem_first_waiter(sem) \
 	list_first_entry(&sem->wait_list, struct rwsem_waiter, list)
+
+#ifdef CONFIG_XIAOMI_XR_QOS
+/*
+ * Only mmap and outer percpu locks need reader tracking. A fixed bound keeps
+ * fault-path work and memory usage predictable. Overflow affects QoS coverage,
+ * never locking.
+ * Each recorded task has a reference; nested reads share a depth counter.
+ */
+void rwsem_xr_qos_init(struct rw_semaphore *sem, bool mmap)
+{
+	struct xr_rwsem_state *state;
+
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (state)
+		state->mmap = mmap;
+	else
+		pr_warn_ratelimited("xr_qos: rwsem reader metadata allocation failed\n");
+	WRITE_ONCE(sem->xr_qos, state);
+}
+EXPORT_SYMBOL_GPL(rwsem_xr_qos_init);
+
+void rwsem_xr_qos_destroy(struct rw_semaphore *sem)
+{
+	struct xr_rwsem_state *state = sem->xr_qos;
+	int i;
+
+	/* Called only after the owning mm/percpu semaphore is quiescent. */
+	if (!state)
+		return;
+	sem->xr_qos = NULL;
+	WARN_ON_ONCE(state->drain_task || state->drain_link.from);
+	xr_qos_link_del(&state->drain_link);
+	for (i = 0; i < XR_RWSEM_READERS; i++)
+		if (state->readers[i].task)
+			put_task_struct(state->readers[i].task);
+	if (!state->static_state)
+		kfree(state);
+	else {
+		memset(state, 0, sizeof(*state));
+		state->static_state = true;
+	}
+}
+EXPORT_SYMBOL_GPL(rwsem_xr_qos_destroy);
+
+static void rwsem_xr_qos_refresh(struct rw_semaphore *sem)
+{
+	struct xr_rwsem_state *state = READ_ONCE(sem->xr_qos);
+	struct rwsem_waiter *waiter;
+	struct task_struct *owner = NULL, *writer = NULL;
+	enum xr_qos_dependency kind = state && !state->mmap ?
+		XR_QOS_PERCPU_RWSEM : XR_QOS_RWSEM;
+	unsigned long value;
+	int i;
+
+	lockdep_assert_held(&sem->wait_lock);
+	if (state && state->drain_task) {
+		struct task_struct *reader = NULL;
+
+		for (i = 0; i < XR_RWSEM_READERS; i++)
+			if (state->readers[i].task) {
+				reader = state->readers[i].task;
+				break;
+			}
+		if (!reader || !xr_qos_link_matches(&state->drain_link, reader)) {
+			xr_qos_link_del(&state->drain_link);
+			if (reader)
+				xr_qos_link_add(&state->drain_link, state->drain_task,
+						reader, XR_QOS_PERCPU_RWSEM);
+		}
+	}
+	rcu_read_lock();
+	value = atomic_long_read(&sem->owner);
+	if (!(value & RWSEM_READER_OWNED) && value != RWSEM_OWNER_UNKNOWN)
+		owner = (struct task_struct *)(value & ~RWSEM_OWNER_FLAGS_MASK);
+	else if ((value & RWSEM_READER_OWNED) && state && state->mmap)
+		for (i = 0; i < XR_RWSEM_READERS; i++)
+			if (state->readers[i].task) {
+				owner = state->readers[i].task;
+				break;
+			}
+	list_for_each_entry(waiter, &sem->wait_list, list) {
+		struct task_struct *to = writer ? writer : owner;
+
+		if (!to || !xr_qos_link_matches(&waiter->xr_qos, to)) {
+			xr_qos_link_del(&waiter->xr_qos);
+			if (to && to != waiter->task)
+				xr_qos_link_add(&waiter->xr_qos, waiter->task, to, kind);
+		}
+		/* Readers behind a queued writer depend on that writer too. */
+		if (waiter->type == RWSEM_WAITING_FOR_WRITE)
+			writer = waiter->task;
+	}
+	rcu_read_unlock();
+}
+
+static void rwsem_xr_qos_record_reader(struct rw_semaphore *sem, bool mmap)
+{
+	struct xr_rwsem_state *state = READ_ONCE(sem->xr_qos);
+	unsigned long flags;
+	bool overflow = false;
+	int i, empty = -1;
+
+	if (!state || state->mmap != mmap)
+		return;
+	raw_spin_lock_irqsave(&sem->wait_lock, flags);
+	for (i = 0; i < XR_RWSEM_READERS; i++) {
+		if (state->readers[i].task == current) {
+			state->readers[i].depth++;
+			goto done;
+		}
+		if (!state->readers[i].task && empty < 0)
+			empty = i;
+	}
+	if (empty >= 0) {
+		get_task_struct(current);
+		state->readers[empty].task = current;
+		state->readers[empty].depth = 1;
+	} else {
+		overflow = true;
+	}
+done:
+	rwsem_xr_qos_refresh(sem);
+	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+	if (overflow)
+		pr_warn_ratelimited("xr_qos: rwsem reader capacity exhausted\n");
+}
+
+static void rwsem_xr_qos_read_acquired(struct rw_semaphore *sem)
+{
+	rwsem_xr_qos_record_reader(sem, true);
+}
+
+void rwsem_xr_qos_percpu_read_acquired(struct rw_semaphore *sem)
+{
+	rwsem_xr_qos_record_reader(sem, false);
+}
+EXPORT_SYMBOL_GPL(rwsem_xr_qos_percpu_read_acquired);
+
+void rwsem_xr_qos_percpu_wait(struct rw_semaphore *sem, bool start)
+{
+	struct xr_rwsem_state *state = READ_ONCE(sem->xr_qos);
+	unsigned long flags;
+
+	if (!state || state->mmap)
+		return;
+	raw_spin_lock_irqsave(&sem->wait_lock, flags);
+	if (start) {
+		/* Current remains alive until its exclusive drain completes. */
+		state->drain_task = current;
+		rwsem_xr_qos_refresh(sem);
+	} else {
+		xr_qos_link_del(&state->drain_link);
+		state->drain_task = NULL;
+	}
+	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+}
+EXPORT_SYMBOL_GPL(rwsem_xr_qos_percpu_wait);
+
+void rwsem_xr_qos_forget_reader(struct rw_semaphore *sem)
+{
+	struct xr_rwsem_state *state = READ_ONCE(sem->xr_qos);
+	struct task_struct *put = NULL;
+	unsigned long flags;
+	int i;
+
+	if (!state)
+		return;
+	raw_spin_lock_irqsave(&sem->wait_lock, flags);
+	for (i = 0; i < XR_RWSEM_READERS; i++)
+		if (state->readers[i].task == current) {
+			if (!--state->readers[i].depth) {
+				put = state->readers[i].task;
+				state->readers[i].task = NULL;
+			}
+			break;
+		}
+	rwsem_xr_qos_refresh(sem);
+	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+	if (put)
+		put_task_struct(put);
+}
+EXPORT_SYMBOL_GPL(rwsem_xr_qos_forget_reader);
+
+void rwsem_xr_qos_owner_changed(struct rw_semaphore *sem)
+{
+	unsigned long flags;
+
+	if (!(atomic_long_read(&sem->count) & RWSEM_FLAG_WAITERS))
+		return;
+	raw_spin_lock_irqsave(&sem->wait_lock, flags);
+	rwsem_xr_qos_refresh(sem);
+	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+}
+EXPORT_SYMBOL_GPL(rwsem_xr_qos_owner_changed);
+#else
+static inline void rwsem_xr_qos_refresh(struct rw_semaphore *sem) { }
+static inline void rwsem_xr_qos_read_acquired(struct rw_semaphore *sem) { }
+#endif
 
 enum rwsem_wake_type {
 	RWSEM_WAKE_ANY,		/* Wake whatever's at head of wait list */
@@ -385,7 +591,11 @@ static inline void
 rwsem_del_waiter(struct rw_semaphore *sem, struct rwsem_waiter *waiter)
 {
 	lockdep_assert_held(&sem->wait_lock);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&waiter->xr_qos);
+#endif
 	list_del(&waiter->list);
+	rwsem_xr_qos_refresh(sem);
 	if (likely(!list_empty(&sem->wait_list)))
 		return;
 
@@ -546,6 +756,9 @@ static void rwsem_mark_wake(struct rw_semaphore *sem,
 		struct task_struct *tsk;
 
 		tsk = waiter->task;
+#ifdef CONFIG_XIAOMI_XR_QOS
+		xr_qos_link_del(&waiter->xr_qos);
+#endif
 		get_task_struct(tsk);
 
 		/*
@@ -561,6 +774,7 @@ static void rwsem_mark_wake(struct rw_semaphore *sem,
 		 */
 		wake_q_add_safe(wake_q, tsk);
 	}
+	rwsem_xr_qos_refresh(sem);
 }
 
 /*
@@ -622,7 +836,11 @@ static inline bool rwsem_try_write_lock(struct rw_semaphore *sem,
 	 * success.
 	 */
 	list_del(&waiter->list);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&waiter->xr_qos);
+#endif
 	rwsem_set_owner(sem);
+	rwsem_xr_qos_refresh(sem);
 	return true;
 }
 
@@ -983,6 +1201,9 @@ rwsem_down_read_slowpath(struct rw_semaphore *sem, long count, int state)
 
 queue:
 	waiter.task = current;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	memset(&waiter.xr_qos, 0, sizeof(waiter.xr_qos));
+#endif
 	waiter.type = RWSEM_WAITING_FOR_READ;
 	waiter.timeout = jiffies + RWSEM_WAIT_TIMEOUT;
 
@@ -1029,6 +1250,7 @@ queue:
 		rwsem_mark_wake(sem, RWSEM_WAKE_ANY, &wake_q);
 
 	trace_android_vh_rwsem_wake(sem);
+	rwsem_xr_qos_refresh(sem);
 	raw_spin_unlock_irq(&sem->wait_lock);
 	wake_up_q(&wake_q);
 
@@ -1089,6 +1311,9 @@ rwsem_down_write_slowpath(struct rw_semaphore *sem, int state)
 	 */
 	waiter.task = current;
 	waiter.type = RWSEM_WAITING_FOR_WRITE;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	memset(&waiter.xr_qos, 0, sizeof(waiter.xr_qos));
+#endif
 	waiter.timeout = jiffies + RWSEM_WAIT_TIMEOUT;
 	waiter.handoff_set = false;
 
@@ -1144,6 +1369,7 @@ wait:
 			break;
 		}
 
+		rwsem_xr_qos_refresh(sem);
 		raw_spin_unlock_irq(&sem->wait_lock);
 
 		if (signal_pending_state(state, current))
@@ -1341,6 +1567,8 @@ static inline void __up_write(struct rw_semaphore *sem)
 			    !rwsem_test_oflags(sem, RWSEM_NONSPINNABLE), sem);
 
 	rwsem_clear_owner(sem);
+	/* Retire donations while the releasing task still owns the lock. */
+	rwsem_xr_qos_owner_changed(sem);
 	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);
 	if (unlikely(tmp & RWSEM_FLAG_WAITERS))
 		rwsem_wake(sem, tmp);
@@ -1377,6 +1605,7 @@ void __sched down_read(struct rw_semaphore *sem)
 	rwsem_acquire_read(&sem->dep_map, 0, 0, _RET_IP_);
 
 	LOCK_CONTENDED(sem, __down_read_trylock, __down_read);
+	rwsem_xr_qos_read_acquired(sem);
 }
 EXPORT_SYMBOL(down_read);
 
@@ -1390,6 +1619,7 @@ int __sched down_read_killable(struct rw_semaphore *sem)
 		return -EINTR;
 	}
 
+	rwsem_xr_qos_read_acquired(sem);
 	return 0;
 }
 EXPORT_SYMBOL(down_read_killable);
@@ -1401,8 +1631,10 @@ int down_read_trylock(struct rw_semaphore *sem)
 {
 	int ret = __down_read_trylock(sem);
 
-	if (ret == 1)
+	if (ret == 1) {
 		rwsem_acquire_read(&sem->dep_map, 0, 1, _RET_IP_);
+		rwsem_xr_qos_read_acquired(sem);
+	}
 	return ret;
 }
 EXPORT_SYMBOL(down_read_trylock);
@@ -1415,6 +1647,7 @@ void __sched down_write(struct rw_semaphore *sem)
 	might_sleep();
 	rwsem_acquire(&sem->dep_map, 0, 0, _RET_IP_);
 	LOCK_CONTENDED(sem, __down_write_trylock, __down_write);
+	rwsem_xr_qos_owner_changed(sem);
 }
 EXPORT_SYMBOL(down_write);
 
@@ -1432,6 +1665,7 @@ int __sched down_write_killable(struct rw_semaphore *sem)
 		return -EINTR;
 	}
 
+	rwsem_xr_qos_owner_changed(sem);
 	return 0;
 }
 EXPORT_SYMBOL(down_write_killable);
@@ -1443,8 +1677,10 @@ int down_write_trylock(struct rw_semaphore *sem)
 {
 	int ret = __down_write_trylock(sem);
 
-	if (ret == 1)
+	if (ret == 1) {
 		rwsem_acquire(&sem->dep_map, 0, 1, _RET_IP_);
+		rwsem_xr_qos_owner_changed(sem);
+	}
 
 	return ret;
 }
@@ -1456,6 +1692,7 @@ EXPORT_SYMBOL(down_write_trylock);
 void up_read(struct rw_semaphore *sem)
 {
 	rwsem_release(&sem->dep_map, _RET_IP_);
+	rwsem_xr_qos_forget_reader(sem);
 	__up_read(sem);
 }
 EXPORT_SYMBOL(up_read);
@@ -1479,6 +1716,8 @@ void downgrade_write(struct rw_semaphore *sem)
 	lock_downgrade(&sem->dep_map, _RET_IP_);
 	trace_android_vh_rwsem_write_finished(sem);
 	__downgrade_write(sem);
+	rwsem_xr_qos_read_acquired(sem);
+	rwsem_xr_qos_owner_changed(sem);
 }
 EXPORT_SYMBOL(downgrade_write);
 
@@ -1489,6 +1728,7 @@ void down_read_nested(struct rw_semaphore *sem, int subclass)
 	might_sleep();
 	rwsem_acquire_read(&sem->dep_map, subclass, 0, _RET_IP_);
 	LOCK_CONTENDED(sem, __down_read_trylock, __down_read);
+	rwsem_xr_qos_read_acquired(sem);
 }
 EXPORT_SYMBOL(down_read_nested);
 
@@ -1497,9 +1737,13 @@ void _down_write_nest_lock(struct rw_semaphore *sem, struct lockdep_map *nest)
 	might_sleep();
 	rwsem_acquire_nest(&sem->dep_map, 0, 0, nest, _RET_IP_);
 	LOCK_CONTENDED(sem, __down_write_trylock, __down_write);
+	rwsem_xr_qos_owner_changed(sem);
 }
 EXPORT_SYMBOL(_down_write_nest_lock);
 
+#endif
+
+#if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_XIAOMI_XR_QOS)
 void down_read_non_owner(struct rw_semaphore *sem)
 {
 	might_sleep();
@@ -1507,12 +1751,15 @@ void down_read_non_owner(struct rw_semaphore *sem)
 	__rwsem_set_reader_owned(sem, NULL);
 }
 EXPORT_SYMBOL(down_read_non_owner);
+#endif
 
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
 void down_write_nested(struct rw_semaphore *sem, int subclass)
 {
 	might_sleep();
 	rwsem_acquire(&sem->dep_map, subclass, 0, _RET_IP_);
 	LOCK_CONTENDED(sem, __down_write_trylock, __down_write);
+	rwsem_xr_qos_owner_changed(sem);
 }
 EXPORT_SYMBOL(down_write_nested);
 
@@ -1527,10 +1774,13 @@ int __sched down_write_killable_nested(struct rw_semaphore *sem, int subclass)
 		return -EINTR;
 	}
 
+	rwsem_xr_qos_owner_changed(sem);
 	return 0;
 }
 EXPORT_SYMBOL(down_write_killable_nested);
+#endif
 
+#if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_XIAOMI_XR_QOS)
 void up_read_non_owner(struct rw_semaphore *sem)
 {
 	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);

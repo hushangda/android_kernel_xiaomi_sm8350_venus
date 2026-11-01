@@ -14,7 +14,6 @@
 #ifdef CONFIG_BOOTUP_RECLAIM
 #define BUFF_SIZE           64
 static DEFINE_SPINLOCK(mr_lock);
-static DEFINE_SPINLOCK(ml_lock);
 static char reclaim_buff[BUFF_SIZE];
 #endif
 
@@ -102,7 +101,7 @@ static ssize_t perflock_records_write(struct file *file, const char __user *user
 {
 	char buf[MAX_ONE_RECORD_SIZE] = {0};
 
-	if (count > MAX_ONE_RECORD_SIZE)
+	if (!count || count >= MAX_ONE_RECORD_SIZE)
 		return -EINVAL;
 
 	if (copy_from_user(buf, userbuf, count))
@@ -116,11 +115,11 @@ static ssize_t perflock_records_write(struct file *file, const char __user *user
 #ifdef CONFIG_BOOTUP_RECLAIM
 static int global_reclaim_show(struct seq_file *seq, void *v)
 {
-	spin_lock(&ml_lock);
+	spin_lock(&mr_lock);
 
 	seq_printf(seq, "%s", reclaim_buff);
 
-	spin_unlock(&ml_lock);
+	spin_unlock(&mr_lock);
 
 	return 0;
 }
@@ -140,15 +139,21 @@ static void global_reclaim_record(unsigned long nr_reclaim)
 	spin_unlock(&mr_lock);
 }
 
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+#include "perf_helper_reclaim.c"
+#endif
+
 static ssize_t global_reclaim_write(struct file *file, const char __user *userbuf,
 		size_t count, loff_t *data)
 {
 	char buf[BUFF_SIZE] = {0};
 	unsigned long reclaim_size = 0;
+#ifndef CONFIG_XIAOMI_MIMD_RECLAIM
 	unsigned long nr_reclaim = 0;
+#endif
 	int err = 0;
 
-	if (count > BUFF_SIZE)
+	if (!count || count >= BUFF_SIZE)
 		return -EINVAL;
 
 	if (copy_from_user(buf, userbuf, count))
@@ -161,8 +166,14 @@ static ssize_t global_reclaim_write(struct file *file, const char __user *userbu
 	if(reclaim_size <= 0)
 		return 0;
 
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+	err = mimd_reclaim_submit(reclaim_size);
+	if (err)
+		return err;
+#else
 	nr_reclaim = try_to_free_mem_cgroup_pages(NULL, reclaim_size, GFP_KERNEL, true);
 	global_reclaim_record(nr_reclaim);
+#endif
 
 	return count;
 }
@@ -186,24 +197,69 @@ static const struct file_operations global_reclaim_ops = {
 };
 #endif
 
+#ifdef CONFIG_XIAOMI_MIMD_TRIGGER
+#include "perf_helper_mimd.c"
+#endif
+
 static int __init perf_helper_init(void)
 {
 	struct proc_dir_entry *entry;
-#ifdef CONFIG_BOOTUP_RECLAIM
-        struct proc_dir_entry *global_reclaim_entry;
+#if defined(CONFIG_XIAOMI_MIMD_TRIGGER) || defined(CONFIG_XIAOMI_MIMD_RECLAIM)
+	int ret;
 #endif
 
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+	ret = mimd_reclaim_init();
+	if (ret)
+		return ret;
+#endif
 	entry = proc_create("perflock_records", 0664, NULL, &perflock_records_ops);
-	if (!entry)
-		printk(KERN_ERR "%s: create perflock_records node failed\n");
-
-#ifdef CONFIG_BOOTUP_RECLAIM
-        global_reclaim_entry = proc_create("global_reclaim", 0664, NULL, &global_reclaim_ops);
-        if (!global_reclaim_entry)
-                printk(KERN_ERR "%s: create global_reclaim node failed\n");
+	if (!entry) {
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+		mimd_reclaim_exit();
 #endif
-
+		return -ENOMEM;
+	}
+#ifdef CONFIG_BOOTUP_RECLAIM
+	entry = proc_create("global_reclaim", 0664, NULL, &global_reclaim_ops);
+	if (!entry) {
+		remove_proc_entry("perflock_records", NULL);
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+		mimd_reclaim_exit();
+#endif
+		return -ENOMEM;
+	}
+#endif
+#ifdef CONFIG_XIAOMI_MIMD_TRIGGER
+	ret = mimd_init();
+	if (ret) {
+#ifdef CONFIG_BOOTUP_RECLAIM
+		remove_proc_entry("global_reclaim", NULL);
+#endif
+		remove_proc_entry("perflock_records", NULL);
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+		mimd_reclaim_exit();
+#endif
+		return ret;
+	}
+#endif
 	return 0;
 }
 
+static void __exit perf_helper_exit(void)
+{
+#ifdef CONFIG_XIAOMI_MIMD_TRIGGER
+	mimd_exit();
+#endif
+#ifdef CONFIG_BOOTUP_RECLAIM
+	remove_proc_entry("global_reclaim", NULL);
+#endif
+	remove_proc_entry("perflock_records", NULL);
+#ifdef CONFIG_XIAOMI_MIMD_RECLAIM
+	mimd_reclaim_exit();
+#endif
+}
+
 module_init(perf_helper_init);
+module_exit(perf_helper_exit);
+MODULE_LICENSE("GPL v2");

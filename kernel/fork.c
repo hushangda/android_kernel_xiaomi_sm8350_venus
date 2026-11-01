@@ -13,6 +13,7 @@
  */
 
 #include <linux/anon_inodes.h>
+#include <linux/xr_qos.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
 #include <linux/sched/mm.h>
@@ -736,6 +737,7 @@ void __mmdrop(struct mm_struct *mm)
 	mmu_notifier_mm_destroy(mm);
 	check_mm(mm);
 	put_user_ns(mm->user_ns);
+	rwsem_xr_qos_destroy(&mm->mmap_lock);
 	free_mm(mm);
 }
 EXPORT_SYMBOL_GPL(__mmdrop);
@@ -782,6 +784,7 @@ void __put_task_struct(struct task_struct *tsk)
 	WARN_ON(tsk == current);
 
 	cgroup_free(tsk);
+	xr_qos_free(tsk);
 	task_numa_free(tsk, true);
 	security_task_free(tsk);
 	exit_creds(tsk);
@@ -930,6 +933,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	stack_vm_area = task_stack_vm_area(tsk);
 
 	err = arch_dup_task_struct(tsk, orig);
+	xr_qos_fork(tsk);
 
 	/*
 	 * arch_dup_task_struct() clobbers the stack-related fields.  Make
@@ -1107,6 +1111,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 
 	mm->user_ns = get_user_ns(user_ns);
 	lru_gen_init_mm(mm);
+	rwsem_xr_qos_init(&mm->mmap_lock, true);
 	return mm;
 
 fail_nocontext:

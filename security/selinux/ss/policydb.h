@@ -22,6 +22,7 @@
 #ifndef _SS_POLICYDB_H_
 #define _SS_POLICYDB_H_
 
+#include <linux/overflow.h>
 #include "symtab.h"
 #include "avtab.h"
 #include "sidtab.h"
@@ -358,7 +359,16 @@ static inline int next_entry(void *buf, struct policy_file *fp, size_t bytes)
 
 static inline int put_entry(const void *buf, size_t bytes, int num, struct policy_file *fp)
 {
-	size_t len = bytes * num;
+	size_t len;
+
+	if (num < 0 || check_mul_overflow(bytes, (size_t)num, &len))
+		return -EOVERFLOW;
+	/* A NULL data pointer requests an exact, allocation-free size pass. */
+	if (!fp->data) {
+		if (check_add_overflow(fp->len, len, &fp->len))
+			return -EOVERFLOW;
+		return 0;
+	}
 
 	if (len > fp->len)
 		return -EINVAL;

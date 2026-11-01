@@ -74,7 +74,8 @@ int mi_dsi_panel_init(struct dsi_panel *panel)
 		mi_display_pm_suspend_callback_set(mi_display_pm_suspend);
 
 	mi_cfg = &panel->mi_cfg;
-
+	mi_panel_count_init(&panel->mi_count);
+	mi_panel_stats_init(&panel->mi_stats);
 
 	mi_cfg->doze_wakelock = wakeup_source_register(NULL, "doze_wakelock");
 	if (!mi_cfg->doze_wakelock) {
@@ -1855,6 +1856,8 @@ int mi_dsi_panel_set_brightness_clone(struct dsi_panel *panel,
 		brightness_clone = mi_cfg->max_brightness_clone;
 
 	mi_cfg->brightness_clone = brightness_clone;
+	mi_panel_count_hbm(&panel->mi_count,
+		brightness_clone > mi_cfg->hbm_backlight_threshold);
 	DISP_UTC_INFO("%s panel set brightness clone to %d\n",
 			panel->type, brightness_clone);
 
@@ -2053,6 +2056,50 @@ int mi_dsi_panel_update_dc_status(struct dsi_panel *panel, int brightness)
 	return rc;
 }
 
+/* Called with panel_lock held; reuse this panel's existing DT command sets. */
+int mi_dsi_panel_prepare_early_dimming(struct dsi_panel *panel)
+{
+	struct mi_dsi_panel_cfg *cfg = &panel->mi_cfg;
+	int rc;
+
+	if (!mi_early_dimming_needs_off(&cfg->early_dimming,
+			panel->panel_initialized, is_hbm_fod_on(panel) || cfg->in_fod_calibration))
+		return 0;
+	if (!panel->cur_mode || !panel->cur_mode->priv_info ||
+		!panel->cur_mode->priv_info->cmd_sets[DSI_CMD_SET_MI_DIMMINGOFF].count ||
+		!panel->cur_mode->priv_info->cmd_sets[DSI_CMD_SET_MI_DIMMINGON].count)
+		return -EOPNOTSUPP;
+	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_DIMMINGOFF);
+	if (!rc) {
+		cfg->early_dimming.off_sent = true;
+		cfg->feature_val[DISP_FEATURE_DIMMING] = FEATURE_OFF;
+	}
+	return rc;
+}
+
+int mi_dsi_panel_finish_early_dimming(struct dsi_panel *panel, u32 brightness)
+{
+	struct mi_dsi_panel_cfg *cfg = &panel->mi_cfg;
+	int rc;
+
+	if (!mi_early_dimming_needs_on(&cfg->early_dimming, brightness,
+			cfg->dimming_state == STATE_DIM_BLOCK || is_hbm_fod_on(panel) ||
+			cfg->in_fod_calibration))
+		return 0;
+	if (!panel->cur_mode || !panel->cur_mode->priv_info ||
+		!panel->cur_mode->priv_info->cmd_sets[DSI_CMD_SET_MI_DIMMINGON].count)
+		return -EOPNOTSUPP;
+	/* Stock early-screen transition waits 10 ms after the first normal DBV. */
+	usleep_range(10000, 10010);
+	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_DIMMINGON);
+	if (!rc) {
+		cfg->early_dimming.pending = false;
+		cfg->early_dimming.off_sent = false;
+		cfg->feature_val[DISP_FEATURE_DIMMING] = FEATURE_ON;
+	}
+	return rc;
+}
+
 void mi_dsi_panel_update_last_bl_level(struct dsi_panel *panel, int brightness)
 {
 	struct mi_dsi_panel_cfg *mi_cfg;
@@ -2069,7 +2116,7 @@ void mi_dsi_panel_update_last_bl_level(struct dsi_panel *panel, int brightness)
 	mi_cfg = &panel->mi_cfg;
 
 	if ((mi_cfg->last_bl_level == 0 || mi_cfg->dimming_state == STATE_DIM_RESTORE) &&
-		brightness > 0 && !is_hbm_fod_on(panel) &&
+		brightness > 0 && !mi_cfg->early_dimming.pending && !is_hbm_fod_on(panel) &&
 		panel->power_mode == SDE_MODE_DPMS_ON) {
 		disp_id = mi_get_disp_id(display);
 		mi_disp_set_dimming_queue_delayed_work(&df->d_display[disp_id], panel);
@@ -2099,6 +2146,7 @@ void mi_dsi_update_micfg_flags(struct dsi_panel *panel, int power_mode)
 
 	switch (power_mode) {
 	case PANEL_OFF:
+		memset(&mi_cfg->early_dimming, 0, sizeof(mi_cfg->early_dimming));
 		mi_cfg->in_fod_calibration = false;
 		mi_cfg->fod_hbm_layer_enabled = false;
 		mi_cfg->fod_anim_layer_enabled = false;
@@ -2679,6 +2727,9 @@ static int mi_dsi_update_hbm_cmd_51reg(struct dsi_panel *panel,
 bool mi_dsi_panel_is_need_tx_cmd(u32 feature_id)
 {
 	switch (feature_id) {
+	case DISP_FEATURE_LAYER_HAS_AOD:
+	case DISP_FEATURE_EARLY_SCREEN_STATUS:
+	case DISP_FEATURE_FULLSCREEN_AOD:
 	case DISP_FEATURE_SENSOR_LUX:
 	case DISP_FEATURE_LOW_BRIGHTNESS_FOD:
 	case DISP_FEATURE_FP_STATUS:
@@ -2708,7 +2759,10 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 			ctl->feature_id != DISP_FEATURE_SENSOR_LUX &&
 			ctl->feature_id != DISP_FEATURE_LOW_BRIGHTNESS_FOD &&
 			ctl->feature_id != DISP_FEATURE_FOLD_STATUS &&
-			ctl->feature_id != DISP_FEATURE_FP_STATUS) {
+			ctl->feature_id != DISP_FEATURE_FP_STATUS &&
+			ctl->feature_id != DISP_FEATURE_FULLSCREEN_AOD &&
+			ctl->feature_id != DISP_FEATURE_LAYER_HAS_AOD &&
+			ctl->feature_id != DISP_FEATURE_EARLY_SCREEN_STATUS) {
 		DISP_WARN("Panel not initialized!\n");
 		rc = -ENODEV;
 		goto exit;
@@ -2716,8 +2770,47 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 	mi_cfg = &panel->mi_cfg;
 
 	switch (ctl->feature_id) {
+	case DISP_FEATURE_LAYER_HAS_AOD:
+		if (ctl->feature_val != 0 && ctl->feature_val != 1) {
+			rc = -EINVAL;
+			break;
+		}
+		mi_cfg->early_dimming.layer_has_aod = ctl->feature_val;
+		mi_cfg->feature_val[DISP_FEATURE_LAYER_HAS_AOD] = ctl->feature_val;
+		break;
+	case DISP_FEATURE_EARLY_SCREEN_STATUS:
+		if (ctl->feature_val != 0 && ctl->feature_val != 1) {
+			rc = -EINVAL;
+			break;
+		}
+		mi_early_dimming_request(&mi_cfg->early_dimming, ctl->feature_val);
+		mi_cfg->feature_val[DISP_FEATURE_EARLY_SCREEN_STATUS] = ctl->feature_val;
+		/* A powered-off panel consumes this request before its next DBV. */
+		if (ctl->feature_val &&
+			!sde_kms_is_suspend_blocked(to_dsi_display(panel->host)->drm_dev))
+			rc = mi_dsi_panel_prepare_early_dimming(panel);
+		break;
+
+	case DISP_FEATURE_FULLSCREEN_AOD: {
+		struct disp_event event = {
+			.disp_id = mi_get_disp_id(to_dsi_display(panel->host)),
+			.type = MI_DISP_EVENT_FULLSCREEN_AOD,
+			.length = sizeof(ctl->feature_val),
+		};
+
+		if (ctl->feature_val != 0 && ctl->feature_val != 1) {
+			rc = -EINVAL;
+			break;
+		}
+		mi_cfg->feature_val[DISP_FEATURE_FULLSCREEN_AOD] = ctl->feature_val;
+		mi_panel_stats_fullscreen(&panel->mi_stats, ctl->feature_val);
+		mi_disp_feature_event_notify(&event, (u8 *)&ctl->feature_val);
+		break;
+	}
+
 	case DISP_FEATURE_DIMMING:
-		if (mi_cfg->dimming_state != STATE_DIM_BLOCK) {
+		if (mi_cfg->dimming_state != STATE_DIM_BLOCK &&
+			!mi_cfg->early_dimming.pending) {
 			if (ctl->feature_val == FEATURE_ON)
 				dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_DIMMINGON);
 			else

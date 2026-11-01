@@ -25,3 +25,24 @@ command line::
 Omitting the argument, or using ``vendor_freezer=auto``, keeps handshake-based
 detection.  When one backend is selected, callbacks belonging to the other
 backend are passive, including its Binder, signal, network, and cgroup paths.
+
+MILLET notifications cover both the legacy freezer and the unified hierarchy's
+``cgroup.freeze`` requests. The latter do not set ``PF_FROZEN`` or increment
+``system_freezing_cnt``; checking only the legacy freezer would suppress Binder
+and signal notifications for apps frozen through cgroup v2. The unified lookup
+uses ``cgroup_task_freeze()``, including its RCU protection, so it also covers
+the transition into the frozen state. Userspace still owns the thaw policy.
+
+``/proc/millet/millet_stat`` counts a successful notification only after the
+netlink send succeeds. Filtered notifications and an inactive backend are not
+counted. A successful send confirms queueing to the userspace socket, not that
+Greeze consumed the message or thawed the target.
+
+The bounded host regressions are::
+
+	python3 tools/testing/selftests/venus/millet_freezer_test.py
+	python3 tools/testing/selftests/venus/millet_delivery_test.py
+
+They exercise the production predicates and delivery functions with mock task
+and netlink state. Booting the rebuilt kernel and observing the target cgroup,
+Binder queue and Greeze behavior is still required for runtime validation.

@@ -1,0 +1,92 @@
+What:           /sys/kernel/smart_cache/file
+Date:           November 2026
+Contact:        Venus kernel maintainers
+Description:
+                Write-only SmartCache file policy. Write decimal fd-level
+                pairs separated by commas, optionally ending in a newline.
+                Levels 1..3 select a registered memory.mctrl.level group;
+                level 0 removes the inode tag and migrates its currently
+                cache-group-charged pages to the root memory cgroup. The fd
+                belongs to the writing task, and is pinned during the write.
+                Regular file page cache is supported, including overlayfs
+                data files resolved by overlayfs itself. DAX, hugetlb, shmem and
+                non-regular files are rejected. At most 64 pairs per write
+                and 4096 live inode tags are accepted.
+
+                With enable=1, tagging also migrates existing cached pages
+                using real memory/memsw charge transfer, LRU isolation and
+                VM-stat transfer. Newly inserted pages are charged directly
+                to the selected group. A repeated write retries migration
+                and does not double-account pages already in that group.
+                With enable=0, tags are recorded, but positive-level writes
+                do not migrate pages until repeated after enabling.
+
+                Syntax and all descriptors are validated before mutation.
+                Runtime errors can leave earlier pairs and migrated pages
+                applied; this is not an atomic multi-file transaction.
+                EBUSY/EAGAIN/ENOMEM, EINTR, and the per-file five-second
+                ETIMEDOUT report incomplete migration. The requested tag
+                remains installed, or removed for level 0, and retrying is
+                safe. Concurrent insertion, truncation, copy-up or external
+                task charge migration can change the cache after the walk.
+                Inode destruction removes the tag; tags do not pin inodes,
+                files or mounts after the write returns.
+
+What:           /sys/kernel/smart_cache/enable
+Date:           November 2026
+Contact:        Venus kernel maintainers
+Description:
+                Read/write 0 or 1; initially 0. Enables tagged-file charge
+                selection and bounded reclaim protection. Disabling takes
+                effect for subsequent decisions; an already selected charge
+                or in-flight reclaim decision may finish. It does not alter
+                page charge accounting or discard stored inode tags.
+
+What:           /sys/kernel/smart_cache/ratio
+Date:           November 2026
+Contact:        Venus kernel maintainers
+Description:
+                Read/write percentage 0..100; initially 0. Limits protected
+                cache to this fraction of each NUMA node's active+inactive
+                file LRU pages, not its RAM size. Level 1 has first claim on
+                the budget, then 2, then 3. Each level is also bounded by
+                memory.mctrl.max. A group's file LRU remains reclaimable
+                while above its effective budget. These sampled VM counters
+                are a reclaim policy, not an exact hard allocation limit.
+                Urgent reclaim priorities 1/0 and explicit targeted memcg
+                reclaim bypass protection, so the policy cannot pin all RAM.
+
+What:           /sys/kernel/smart_cache/stat
+Date:           November 2026
+Contact:        Venus kernel maintainers
+Description:
+                Read-only local diagnostics: live tags, successfully migrated
+                base pages, and failed page migration attempts. Already-owned
+                pages are not counted again. A signal/timeout that aborts a
+                walk before trying a page does not count as a page failure.
+
+What:           memory.mctrl.level (memory cgroup v1 and v2)
+Date:           November 2026
+Contact:        Venus kernel maintainers
+Description:
+                Read/write 0..3. Nonzero levels are globally exclusive;
+                assigning an occupied slot returns EBUSY. Repeating the same
+                assignment is valid. Changing or clearing a level releases
+                its previous slot. Ancestor/descendant cache groups are
+                rejected to prevent hierarchical double counting. Offlining
+                clears the slot before CSS can be released. The root file
+                is visible for ROM mount-point discovery but positive root
+                assignments are rejected. Assignment does not move tasks.
+                Existing pages in a removed/replaced group keep their real
+                charge until migration/freeing, and lose cache protection.
+
+What:           memory.mctrl.max (memory cgroup v1 and v2)
+Date:           November 2026
+Contact:        Venus kernel maintainers
+Description:
+                Read/write page-aligned unsigned byte count, initially zero.
+                Bounds this group's protected file LRU pages per NUMA node,
+                matching the donor ABI (Venus has one memory node). This is
+                distinct from memory.limit_in_bytes/memory.max: it neither
+                fabricates usage nor imposes a hard charging limit. Zero
+                grants no reclaim protection. Root writes are rejected.

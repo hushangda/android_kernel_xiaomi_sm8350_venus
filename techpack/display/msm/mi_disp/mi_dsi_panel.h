@@ -14,6 +14,7 @@
 #include "dsi_panel.h"
 #include "dsi_defs.h"
 #include "mi_disp_feature.h"
+#include "mi_early_dimming.h"
 #include <linux/pm_wakeup.h>
 #include "drm_mipi_dsi.h"
 
@@ -215,6 +216,7 @@ struct mi_dsi_panel_cfg {
 	bool delay_before_fod_hbm_off;
 
 	u32 dimming_state;
+	struct mi_early_dimming early_dimming;
 
 
 	bool aod_bl_51ctl;
@@ -351,6 +353,9 @@ ssize_t mi_dsi_panel_show_dsi_cmd_set_type(struct dsi_panel *panel,
 
 int mi_dsi_panel_update_dc_status(struct dsi_panel *panel,
 			int brightness);
+
+int mi_dsi_panel_prepare_early_dimming(struct dsi_panel *panel);
+int mi_dsi_panel_finish_early_dimming(struct dsi_panel *panel, u32 brightness);
 
 void mi_dsi_panel_update_last_bl_level(struct dsi_panel *panel,
 			int brightness);

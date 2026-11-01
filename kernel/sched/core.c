@@ -9,6 +9,7 @@
 #include "sched.h"
 
 #include <linux/nospec.h>
+#include <linux/xr_qos.h>
 
 #include <linux/kcov.h>
 #include <linux/irq.h>
@@ -4741,7 +4742,7 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
 {
 	struct task_struct *pi_task = rt_mutex_get_top_task(p);
 
-	return __rt_effective_prio(pi_task, prio);
+	return xr_qos_effective_prio(p, __rt_effective_prio(pi_task, prio));
 }
 
 /*
@@ -4762,10 +4763,21 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	const struct sched_class *prev_class;
 	struct rq_flags rf;
 	struct rq *rq;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	bool xr_only;
+#endif
 
 	trace_android_rvh_rtmutex_prepare_setprio(p, pi_task);
 	/* XXX used to be waiter->prio, not waiter->task->prio */
-	prio = __rt_effective_prio(pi_task, p->normal_prio);
+	prio = xr_qos_effective_prio(p,
+			__rt_effective_prio(pi_task, p->normal_prio));
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_only = rt_prio(prio) && prio < p->normal_prio &&
+		(!pi_task || pi_task->prio > prio);
+	/* Requeue if the reason for an equal priority changed (RT accounting). */
+	if (xr_only != p->xr_qos_rt_only)
+		goto requeue;
+#endif
 
 	/*
 	 * If nothing changed; bail early.
@@ -4773,6 +4785,9 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	if (p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio))
 		return;
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+requeue:
+#endif
 	rq = __task_rq_lock(p, &rf);
 	update_rq_clock(rq);
 	/*
@@ -4790,7 +4805,11 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	/*
 	 * For FIFO/RR we only need to set prio, if that matches we're done.
 	 */
-	if (prio == p->prio && !dl_prio(prio))
+	if (prio == p->prio && !dl_prio(prio)
+#ifdef CONFIG_XIAOMI_XR_QOS
+	    && xr_only == p->xr_qos_rt_only
+#endif
+	   )
 		goto out_unlock;
 
 	/*
@@ -4859,6 +4878,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 
 	p->prio = prio;
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+	p->xr_qos_rt_only = xr_only;
+#endif
+
 	if (queued)
 		enqueue_task(rq, p, queue_flag);
 	if (running)
@@ -4877,6 +4900,36 @@ out_unlock:
 static inline int rt_effective_prio(struct task_struct *p, int prio)
 {
 	return prio;
+}
+#endif
+
+#ifdef CONFIG_XIAOMI_XR_QOS
+int xr_qos_effective_prio(struct task_struct *p, int prio)
+{
+	return p->xr_qos ? min(prio, p->xr_qos_rt_prio) : prio;
+}
+
+bool xr_qos_only_rt_boost(struct task_struct *p)
+{
+	return p->xr_qos_rt_only;
+}
+
+void xr_qos_sched_apply(struct task_struct *p, int rt_prio, unsigned int vip)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+	p->xr_qos_rt_prio = rt_prio;
+	rt_mutex_setprio(p, rt_mutex_get_top_task(p));
+	rq = __task_rq_lock(p, &rf);
+	update_rq_clock(rq);
+	xr_qos_vip_changed(rq, p, vip);
+	__task_rq_unlock(rq, &rf);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+	/* Propagate changed effective priority through an existing rtmutex chain. */
+	rt_mutex_adjust_pi(p);
 }
 #endif
 
@@ -5112,6 +5165,11 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 	p->prio = normal_prio(p);
 	if (keep_boost)
 		p->prio = rt_effective_prio(p, p->prio);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	p->xr_qos_rt_only = rt_prio(p->prio) && p->prio < p->normal_prio &&
+		(!rt_mutex_get_top_task(p) ||
+		 rt_mutex_get_top_task(p)->prio > p->prio);
+#endif
 
 	if (dl_prio(p->prio))
 		p->sched_class = &dl_sched_class;
@@ -7197,6 +7255,9 @@ void __init sched_init(void)
 		rq->calc_load_active = 0;
 		rq->calc_load_update = jiffies + LOAD_FREQ;
 		init_cfs_rq(&rq->cfs);
+#ifdef CONFIG_XIAOMI_XR_QOS
+		INIT_LIST_HEAD(&rq->xr_vip_tasks);
+#endif
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
 #ifdef CONFIG_FAIR_GROUP_SCHED

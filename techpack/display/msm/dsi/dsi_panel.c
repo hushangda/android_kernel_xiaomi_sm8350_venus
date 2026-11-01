@@ -590,6 +590,10 @@ int dsi_panel_update_backlight(struct dsi_panel *panel,
 	}
 
 
+	rc = mi_dsi_panel_prepare_early_dimming(panel);
+	if (rc)
+		goto restore_flags;
+
 	bl_tmp = bl_lvl;
 
 	if (panel->bl_config.bl_inverted_dbv)
@@ -599,10 +603,14 @@ int dsi_panel_update_backlight(struct dsi_panel *panel,
 	if (rc < 0)
 		DSI_ERR("failed to update dcs backlight:%d\n", bl_lvl);
 	else {
+		mi_panel_count_backlight(&panel->mi_count, bl_tmp);
+		mi_panel_stats_backlight(&panel->mi_stats, bl_tmp);
 		mi_dsi_panel_demura_comp(panel, bl_tmp);
 		mi_dsi_panel_dc_vi_setting(panel, bl_tmp);
+		rc = mi_dsi_panel_finish_early_dimming(panel, bl_tmp);
 	}
 
+restore_flags:
 	if (unlikely(panel->bl_config.lp_mode))
 		dsi->mode_flags = mode_flags;
 
@@ -699,6 +707,8 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		rc = -ENOTSUPP;
 	}
 
+	if (rc < 0)
+		return rc;
 	panel->mi_cfg.bl_need_update = false;
 	rc = mi_dsi_panel_update_dc_status(panel, bl_lvl);
 	mi_dsi_panel_update_last_bl_level(panel, bl_lvl);
@@ -4625,7 +4635,10 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 				panel->mi_cfg.aod_brightness_work_flag = true;
 		}
 	}
-
+	if (!rc) {
+		mi_panel_count_active(&panel->mi_count, false);
+		mi_panel_stats_power(&panel->mi_stats, true, false);
+	}
 
 exit:
 	mi_dsi_update_micfg_flags(panel, PANEL_LP1);
@@ -4658,7 +4671,10 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP2 cmd, rc=%d\n",
 		       panel->name, rc);
-
+	else {
+		mi_panel_count_active(&panel->mi_count, false);
+		mi_panel_stats_power(&panel->mi_stats, true, false);
+	}
 
 exit:
 	mi_dsi_update_micfg_flags(panel, PANEL_LP2);
@@ -4727,6 +4743,10 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 		}
 	}
 exit1:
+	if (!rc) {
+		mi_panel_count_active(&panel->mi_count, true);
+		mi_panel_stats_power(&panel->mi_stats, false, false);
+	}
 	DSI_INFO("skip panel status changed\n");
 
 exit:
@@ -5110,8 +5130,11 @@ int dsi_panel_enable(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_ON cmds, rc=%d\n",
 		       panel->name, rc);
-	else
+	else {
 		panel->panel_initialized = true;
+		mi_panel_count_active(&panel->mi_count, true);
+		mi_panel_stats_power(&panel->mi_stats, false, false);
+	}
 
 	if (panel->mi_cfg.dc_type == 0 && panel->mi_cfg.feature_val[DISP_FEATURE_DC] == FEATURE_ON)
 		mi_dsi_dc_mode_enable(panel, true);
@@ -5268,6 +5291,8 @@ int dsi_panel_disable(struct dsi_panel *panel)
 	}
 	panel->panel_initialized = false;
 	panel->power_mode = SDE_MODE_DPMS_OFF;
+	mi_panel_count_disable(&panel->mi_count);
+	mi_panel_stats_power(&panel->mi_stats, false, true);
 	mi_dsi_update_micfg_flags(panel, PANEL_OFF);
 
 

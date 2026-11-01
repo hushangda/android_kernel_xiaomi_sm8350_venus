@@ -2,6 +2,7 @@
 #define MILLET_H
 
 #include <linux/freezer.h>
+#include <linux/cgroup.h>
 #include <net/sock.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
@@ -70,6 +71,13 @@ static inline int unregister_millet_hook(int type) { return 0; }
 #endif
 static inline int frozen_task_group(struct task_struct *task)
 {
-	return (freezing(task) || frozen(task));
+	/*
+	 * The unified hierarchy uses JOBCTL_TRAP_FREEZE, not PF_FROZEN or
+	 * system_freezing_cnt.  Include its freeze request so Binder and signal
+	 * notifications also reach Greeze while a cgroup-v2 task is freezing.
+	 * cgroup_task_freeze() protects the css_set lookup with RCU and returns
+	 * false when CONFIG_CGROUPS is disabled.
+	 */
+	return freezing(task) || frozen(task) || cgroup_task_freeze(task);
 }
 #endif

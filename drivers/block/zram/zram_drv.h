@@ -69,6 +69,10 @@ struct zram_table_entry {
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
 	ktime_t ac_time;
 #endif
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	/* Protected by the slot lock; owns one CSS reference while non-NULL. */
+	struct mem_cgroup *memcg;
+#endif
 };
 
 struct zram_stats {
@@ -123,6 +127,7 @@ struct zram {
 	 */
 	u64 disksize;	/* bytes */
 	const char *comp_algs[ZRAM_MAX_COMPS];
+	int comp_levels[ZRAM_MAX_COMPS];
 	s8 num_active_comps;
 	/*
 	 * zram is claimed so open request will be failed
@@ -140,6 +145,18 @@ struct zram {
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
+#endif
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	/* Set before disksize initialization, immutable while IO is possible. */
+	bool group_enabled;
+#ifdef CONFIG_ZRAM_WRITEBACK
+	/* Slot ownership plus temporary group-readback IO references. */
+	atomic_t *backing_refs;
+	struct workqueue_struct *group_read_wq;
+#ifdef CONFIG_XIAOMI_ZRAM_EXTM
+	struct zram_extm *extm;
+#endif
+#endif
 #endif
 };
 #endif

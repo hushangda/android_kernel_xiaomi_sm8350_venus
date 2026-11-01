@@ -17,12 +17,25 @@ struct percpu_rw_semaphore {
 	int			readers_block;
 };
 
+#ifdef CONFIG_XIAOMI_XR_QOS
+#define __PERCPU_RWSEM_XR_STATE(name)				\
+static struct xr_rwsem_state __percpu_rwsem_xr_##name = {		\
+	.static_state = true,					\
+};
+#define __PERCPU_RWSEM_XR_PTR(name) (&__percpu_rwsem_xr_##name)
+#else
+#define __PERCPU_RWSEM_XR_STATE(name)
+#define __PERCPU_RWSEM_XR_PTR(name) NULL
+#endif
+
 #define __DEFINE_PERCPU_RWSEM(name, is_static)				\
+__PERCPU_RWSEM_XR_STATE(name)					\
 static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
 is_static struct percpu_rw_semaphore name = {				\
 	.rss = __RCU_SYNC_INITIALIZER(name.rss),			\
 	.read_count = &__percpu_rwsem_rc_##name,			\
-	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+	.rw_sem = __RWSEM_INITIALIZER_XR(name.rw_sem,			\
+				       __PERCPU_RWSEM_XR_PTR(name)),	\
 	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
 }
 #define DEFINE_PERCPU_RWSEM(name)		\
@@ -51,6 +64,7 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
 	__this_cpu_inc(*sem->read_count);
 	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
 		__percpu_down_read(sem, false); /* Unconditional memory barrier */
+	rwsem_xr_qos_percpu_read_acquired(&sem->rw_sem);
 	/*
 	 * The preempt_enable() prevents the compiler from
 	 * bleeding the critical section out.
@@ -69,6 +83,8 @@ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
 	__this_cpu_inc(*sem->read_count);
 	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
 		ret = __percpu_down_read(sem, true); /* Unconditional memory barrier */
+	if (ret)
+		rwsem_xr_qos_percpu_read_acquired(&sem->rw_sem);
 	preempt_enable();
 	/*
 	 * The barrier() from preempt_enable() prevents the compiler from
@@ -83,6 +99,8 @@ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
 
 static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
 {
+	/* Remove task ownership before the final counter decrement can wake a writer. */
+	rwsem_xr_qos_forget_reader(&sem->rw_sem);
 	preempt_disable();
 	/*
 	 * Same as in percpu_down_read().
@@ -118,21 +136,30 @@ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
 static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
 					bool read, unsigned long ip)
 {
+	/* Async I/O can transfer this read hold to another task without unlocking. */
+	if (read)
+		rwsem_xr_qos_forget_reader(&sem->rw_sem);
 	lock_release(&sem->rw_sem.dep_map, ip);
-#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+#if defined(CONFIG_RWSEM_SPIN_ON_OWNER) || defined(CONFIG_XIAOMI_XR_QOS)
 	if (!read)
 		atomic_long_set(&sem->rw_sem.owner, RWSEM_OWNER_UNKNOWN);
 #endif
+	if (!read)
+		rwsem_xr_qos_owner_changed(&sem->rw_sem);
 }
 
 static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
 					bool read, unsigned long ip)
 {
+	if (read)
+		rwsem_xr_qos_percpu_read_acquired(&sem->rw_sem);
 	lock_acquire(&sem->rw_sem.dep_map, 0, 1, read, 1, NULL, ip);
-#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+#if defined(CONFIG_RWSEM_SPIN_ON_OWNER) || defined(CONFIG_XIAOMI_XR_QOS)
 	if (!read)
 		atomic_long_set(&sem->rw_sem.owner, (long)current);
 #endif
+	if (!read)
+		rwsem_xr_qos_owner_changed(&sem->rw_sem);
 }
 
 #endif

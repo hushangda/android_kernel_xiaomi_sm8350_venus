@@ -67,6 +67,28 @@ cache_strategy=%s      Select a strategy for cached decompression from now on:
                                    It still does in-place I/O decompression
                                    for the rest compressed physical clusters.
 
+Asynchronous decompression workers
+==================================
+
+CONFIG_EROFS_FS_PCPU_KTHREAD selects one decompression kthread per online CPU.
+I/O completion in atomic context queues decompression on the completing CPU's
+worker. Existing synchronous decompression decisions remain unchanged. The
+unbound workqueue remains the fallback when no per-CPU worker is available,
+including worker allocation failure and CPU hotplug transitions.
+
+Workers are created during filesystem subsystem initialization and CPU online.
+CPU offline removes the worker from new submissions, waits for concurrent
+enqueue operations, and drains queued work before freeing the worker. Module
+exit removes CPU hotplug callbacks and drains workers before freeing resources.
+No filesystem image changes or mount options are required.
+
+Both CONFIG_EROFS_FS_PCPU_KTHREAD and CONFIG_EROFS_FS_PCPU_KTHREAD_HIPRI default
+to disabled. The latter selects SCHED_FIFO priority 1; without it the workers
+use the normal scheduling policy. Measure compressed cold reads, application
+startup, CPU hotplug under load, and power before enabling high priority.
+The Venus build script keeps per-CPU workers disabled by default; building with
+EROFS_PCPU=1 enables them at normal priority while keeping HIPRI disabled.
+
 On-disk details
 ===============
 

@@ -25,6 +25,7 @@ endif
 obj-y += core.o loadavg.o clock.o cputime.o
 obj-y += idle.o fair.o rt.o deadline.o
 obj-y += wait.o wait_bit.o swait.o completion.o
+obj-$(CONFIG_XIAOMI_XR_QOS) += xr_qos.o xr_qos_device.o
 
 obj-$(CONFIG_SCHED_WALT) += walt/
 obj-$(CONFIG_SMP) += cpupri.o cpudeadline.o topology.o stop_task.o pelt.o

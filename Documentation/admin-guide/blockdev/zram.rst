@@ -204,6 +204,7 @@ writeback_limit_enable  RW	show and set writeback_limit feature
 max_comp_streams  	RW	the number of possible concurrent compress
 				operations
 comp_algorithm    	RW	show and change the compression algorithm
+algorithm_params  	WO	set an explicit Zstd compression level
 recomp_algorithm  	RW	show and set secondary compression algorithms
 recompress        	WO	trigger recompression with a secondary algorithm
 compact           	WO	trigger memory compaction
@@ -318,12 +319,50 @@ setting ``disksize``; lower priority numbers are tried first::
 	# Use zstd as the first recompression algorithm
 	echo "algo=zstd priority=1" > /sys/block/zram0/recomp_algorithm
 
+With ``CONFIG_ZRAM_ZSTD_PARAMS``, set an explicit Zstd level after choosing
+the algorithm and before setting ``disksize``::
+
+	echo "priority=1 level=6" > /sys/block/zram0/algorithm_params
+	# Alternatively, select the first configured slot named zstd
+	echo "algo=zstd level=6" > /sys/block/zram0/algorithm_params
+
+Without a selector, ``algorithm_params`` selects the primary compressor.
+When both ``algo`` and ``priority`` are supplied, they must name the same
+configured slot. Only Zstd levels from 1 through ``ZSTD_maxCLevel()``
+(22 in this tree) are supported. A level is required; dictionaries, unknown
+keys, duplicate keys, and levels for other algorithms are rejected. Changing
+an algorithm or resetting the device clears its explicit level. Changing
+parameters after device initialization returns ``-EBUSY``.
+
+Explicit levels use dedicated per-CPU Zstd contexts with compression
+parameters sized for ``PAGE_SIZE`` input. Higher levels can require more
+workspace memory and CPU time per online CPU and per configured compressor;
+measure latency and memory use before increasing the level. The ordinary
+Crypto API path, including its default Zstd level, is unchanged when no
+explicit level is set. This does not change Zstd settings for other users
+such as F2FS, or change the default LZ4 selection in the Venus build.
+
 After the device is initialized, recompression can target all eligible
 objects, idle objects, huge objects, or objects above a size threshold::
 
 	echo "threshold=3000" > /sys/block/zram0/recompress
 	echo "type=idle threshold=2000" > /sys/block/zram0/recompress
 	echo "type=huge algo=zstd" > /sys/block/zram0/recompress
+	echo "type=idle priority=1 max_pages=256" > /sys/block/zram0/recompress
+
+``priority`` selects one configured secondary compressor (1 through 3);
+priority 0 is treated as priority 1. ``algo`` selects the first matching
+secondary slot. If both selectors are supplied, they must match. Slots
+already compressed at that or a higher priority are skipped. Without either
+selector, all configured secondary compressors are tried in priority order.
+
+``max_pages`` limits pages on which compression is attempted, including
+attempts that fail or do not save memory. Trying multiple algorithms on one
+page consumes one unit. Omit it for an unrestricted pass; an explicit zero
+performs no compression. Skipped pages do not consume this budget, so it
+does not bound scanning time or total operation latency. Unknown or duplicate
+keys and unconfigured priorities are rejected. Repeated calls start scanning
+at the beginning of the device; they do not maintain a continuation cursor.
 
 Mark pages idle first with ``echo all > /sys/block/zram0/idle``. Selecting
 idle pages by age additionally requires ``CONFIG_ZRAM_TRACK_ENTRY_ACTIME``;

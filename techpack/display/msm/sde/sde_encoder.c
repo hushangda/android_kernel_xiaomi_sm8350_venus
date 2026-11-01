@@ -4346,6 +4346,8 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error,
 
 	/* All phys encs are ready to go, trigger the kickoff */
 	_sde_encoder_kickoff_phys(sde_enc, config_changed);
+	if (!is_error && dsi_display && dsi_display->panel)
+		mi_panel_count_kickoff(&dsi_display->panel->mi_count);
 
 	/* allow phys encs to handle any post-kickoff business */
 	for (i = 0; i < sde_enc->num_phys_encs; i++) {

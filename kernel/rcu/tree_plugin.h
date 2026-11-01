@@ -1055,6 +1055,9 @@ static int rcu_boost(struct rcu_node *rnp)
 	unsigned long flags;
 	struct task_struct *t;
 	struct list_head *tb;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	struct xr_qos_link xr_link = { };
+#endif
 
 	if (READ_ONCE(rnp->exp_tasks) == NULL &&
 	    READ_ONCE(rnp->boost_tasks) == NULL)
@@ -1100,10 +1103,16 @@ static int rcu_boost(struct rcu_node *rnp)
 	 */
 	t = container_of(tb, struct task_struct, rcu_node_entry);
 	rt_mutex_init_proxy_locked(&rnp->boost_mtx, t);
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_rcu_boost(&xr_link, t);
+#endif
 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
 	/* Lock only for side effect: boosts task t's priority. */
 	rt_mutex_lock(&rnp->boost_mtx);
 	rt_mutex_unlock(&rnp->boost_mtx);  /* Then keep lockdep happy. */
+#ifdef CONFIG_XIAOMI_XR_QOS
+	xr_qos_link_del(&xr_link);
+#endif
 	rnp->n_boosts++;
 
 	return READ_ONCE(rnp->exp_tasks) != NULL ||

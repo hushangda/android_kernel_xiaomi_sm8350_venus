@@ -13,6 +13,7 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/list_lru.h>
+#include <linux/xr_qos.h>
 #include <uapi/linux/android/binder.h>
 
 extern struct list_lru binder_alloc_lru;
@@ -58,6 +59,11 @@ struct binder_buffer {
 	size_t extra_buffers_size;
 	void __user *user_data;
 	int    pid;
+#ifdef CONFIG_XIAOMI_XR_QOS
+	/* Oneway contribution outlives its binder_transaction until BC_FREE_BUFFER. */
+	struct xr_qos_link xr_qos;
+#endif
+
 };
 
 /**

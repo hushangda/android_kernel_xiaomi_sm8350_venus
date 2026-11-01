@@ -24,6 +24,7 @@
 
 #include <linux/page_counter.h>
 #include <linux/memcontrol.h>
+#include <linux/mi_smart_cache.h>
 #include <linux/cgroup.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
@@ -5091,6 +5092,9 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 
 	size = sizeof(struct mem_cgroup);
 	size += nr_node_ids * sizeof(struct mem_cgroup_per_node *);
+#ifdef CONFIG_XIAOMI_MEMCG_RECLAIM
+	size += sizeof(struct mi_memcg);
+#endif
 
 	memcg = kzalloc(size, GFP_KERNEL);
 	if (!memcg)
@@ -5124,6 +5128,7 @@ static struct mem_cgroup *mem_cgroup_alloc(void)
 	INIT_LIST_HEAD(&memcg->oom_notify);
 	mutex_init(&memcg->thresholds_lock);
 	spin_lock_init(&memcg->move_lock);
+	mi_memcg_init(memcg);
 	vmpressure_init(&memcg->vmpressure);
 	INIT_LIST_HEAD(&memcg->event_list);
 	spin_lock_init(&memcg->event_list_lock);
@@ -5230,6 +5235,7 @@ static int mem_cgroup_css_online(struct cgroup_subsys_state *css)
 	/* Online state pins memcg ID, memcg ID pins CSS */
 	refcount_set(&memcg->id.ref, 1);
 	css_get(css);
+	mi_memcg_online(memcg);
 	return 0;
 }
 
@@ -5237,6 +5243,9 @@ static void mem_cgroup_css_offline(struct cgroup_subsys_state *css)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
 	struct mem_cgroup_event *event, *tmp;
+
+	mi_smart_cache_offline(memcg);
+	mi_memcg_offline(memcg);
 
 	/*
 	 * Unregister events and notify userspace.
@@ -5468,7 +5477,7 @@ static struct page *mc_handle_file_pte(struct vm_area_struct *vma,
  * This function doesn't do "charge" to new cgroup and doesn't do "uncharge"
  * from old cgroup.
  */
-static int mem_cgroup_move_account(struct page *page,
+static int mem_cgroup_move_account_locked(struct page *page,
 				   bool compound,
 				   struct mem_cgroup *from,
 				   struct mem_cgroup *to)
@@ -5476,23 +5485,14 @@ static int mem_cgroup_move_account(struct page *page,
 	struct lruvec *from_vec, *to_vec;
 	struct pglist_data *pgdat;
 	unsigned int nr_pages = compound ? hpage_nr_pages(page) : 1;
-	int ret;
 
 	VM_BUG_ON(from == to);
 	VM_BUG_ON_PAGE(PageLRU(page), page);
+	VM_BUG_ON_PAGE(!PageLocked(page), page);
 	VM_BUG_ON(compound && !PageTransHuge(page));
 
-	/*
-	 * Prevent mem_cgroup_migrate() from looking at
-	 * page->mem_cgroup of its source page while we change it.
-	 */
-	ret = -EBUSY;
-	if (!trylock_page(page))
-		goto out;
-
-	ret = -EINVAL;
 	if (page->mem_cgroup != from)
-		goto out_unlock;
+		return -EINVAL;
 
 	pgdat = page_pgdat(page);
 	from_vec = mem_cgroup_lruvec(from, pgdat);
@@ -5555,19 +5555,106 @@ static int mem_cgroup_move_account(struct page *page,
 
 	__unlock_page_memcg(from);
 
-	ret = 0;
-
 	local_irq_disable();
 	mem_cgroup_charge_statistics(to, page, nr_pages);
 	memcg_check_events(to, page);
 	mem_cgroup_charge_statistics(from, page, -nr_pages);
 	memcg_check_events(from, page);
 	local_irq_enable();
-out_unlock:
+	return 0;
+}
+
+static int mem_cgroup_move_account(struct page *page, bool compound,
+				  struct mem_cgroup *from,
+				  struct mem_cgroup *to)
+{
+	int ret;
+
+	/* Page lock excludes concurrent mem_cgroup_migrate() and THP split. */
+	if (!trylock_page(page))
+		return -EBUSY;
+	ret = mem_cgroup_move_account_locked(page, compound, from, to);
 	unlock_page(page);
-out:
 	return ret;
 }
+
+#ifdef CONFIG_XIAOMI_SMART_CACHE
+void mi_smart_cache_move_end(struct mem_cgroup **source)
+{
+	if (*source) {
+		atomic_dec(&(*source)->moving_account);
+		css_put(&(*source)->css);
+		*source = NULL;
+	}
+}
+
+/*
+ * The caller owns a page reference, but neither its lock nor its LRU lock.
+ * Keep the source's stat-migration barrier for adjacent pages from that group;
+ * otherwise every page would incur an RCU grace period. All exits restore LRU
+ * membership and balance charge/CSS references, including failed migration.
+ */
+int mi_smart_cache_move_page(struct page *page, struct mem_cgroup *to,
+			     struct mem_cgroup **source)
+{
+	struct mem_cgroup *from;
+	unsigned int nr_pages;
+	int ret;
+
+	if (PageTail(page) || PageAnon(page) || PageSwapBacked(page) ||
+	    PageHuge(page) || !page_mapping(page))
+		return -EINVAL;
+	rcu_read_lock();
+	from = page_memcg_rcu(page);
+	if (from)
+		css_get(&from->css);
+	rcu_read_unlock();
+	if (!from)
+		return -EAGAIN;
+	if (from == to) {
+		css_put(&from->css);
+		return 0;
+	}
+	if (*source != from) {
+		mi_smart_cache_move_end(source);
+		*source = from;
+		atomic_inc(&from->moving_account);
+		synchronize_rcu();
+	} else {
+		css_put(&from->css);
+	}
+
+	if (!trylock_page(page))
+		return -EBUSY;
+	if (page->mem_cgroup != from || !page_mapping(page) ||
+	    PageAnon(page) || PageSwapBacked(page) || PageTail(page)) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	/* Keep order stable across charge, accounting and THP split. */
+	nr_pages = hpage_nr_pages(page);
+	ret = try_charge(to, GFP_NOWAIT | __GFP_NORETRY, nr_pages);
+	if (ret)
+		goto unlock;
+	ret = isolate_lru_page(page);
+	if (ret)
+		goto cancel;
+	ret = mem_cgroup_move_account_locked(page, PageTransHuge(page), from, to);
+	if (!ret)
+		cancel_charge(from, nr_pages);
+	else
+		cancel_charge(to, nr_pages);
+	unlock_page(page);
+	/* Also releases the extra reference obtained by isolate_lru_page(). */
+	putback_lru_page(page);
+	return ret ? ret : (int)nr_pages;
+cancel:
+	cancel_charge(to, nr_pages);
+unlock:
+	unlock_page(page);
+	return ret;
+}
+#endif
 
 /**
  * get_mctgt_type - get target type of moving charge
@@ -6592,6 +6679,9 @@ int mem_cgroup_charge(struct page *page, struct mm_struct *mm, gfp_t gfp_mask)
 		rcu_read_unlock();
 	}
 
+	/* filemap has set mapping/index before charging a locked file page. */
+	if (!memcg)
+		memcg = mi_smart_cache_charge_target(page);
 	if (!memcg)
 		memcg = get_mem_cgroup_from_mm(mm);
 

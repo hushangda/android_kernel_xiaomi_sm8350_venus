@@ -156,7 +156,8 @@ int millet_sendto_user(struct task_struct *tsk,
 					monitor_port);
 	}
 
-	return RET_OK;
+	/* A positive result distinguishes a sent message from a filtered one. */
+	return 1;
 }
 
 int millet_sendmsg(enum MILLET_TYPE type, struct task_struct *tsk,

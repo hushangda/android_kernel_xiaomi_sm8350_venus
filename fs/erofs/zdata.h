@@ -9,6 +9,9 @@
 
 #include "internal.h"
 #include "zpvec.h"
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+#include <linux/kthread.h>
+#endif
 
 #define Z_EROFS_PCLUSTER_MAX_PAGES	(Z_EROFS_PCLUSTER_MAX_SIZE / PAGE_SIZE)
 #define Z_EROFS_NR_INLINE_PAGEVECS      3
@@ -100,6 +103,9 @@ struct z_erofs_decompressqueue {
 	union {
 		wait_queue_head_t wait;
 		struct work_struct work;
+#ifdef CONFIG_EROFS_FS_PCPU_KTHREAD
+		struct kthread_work kthread_work;
+#endif
 	} u;
 };
 

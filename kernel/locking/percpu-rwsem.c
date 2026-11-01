@@ -22,6 +22,7 @@ int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
 	__init_rwsem(&sem->rw_sem, name, rwsem_key);
 	rcuwait_init(&sem->writer);
 	sem->readers_block = 0;
+	rwsem_xr_qos_init(&sem->rw_sem, false);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(__percpu_init_rwsem);
@@ -36,6 +37,7 @@ void percpu_free_rwsem(struct percpu_rw_semaphore *sem)
 		return;
 
 	rcu_sync_dtor(&sem->rss);
+	rwsem_xr_qos_destroy(&sem->rw_sem);
 	free_percpu(sem->read_count);
 	sem->read_count = NULL; /* catch use after free bugs */
 }
@@ -162,7 +164,9 @@ void percpu_down_write(struct percpu_rw_semaphore *sem)
 	 */
 
 	/* Wait for all now active readers to complete. */
+	rwsem_xr_qos_percpu_wait(&sem->rw_sem, true);
 	rcuwait_wait_event(&sem->writer, readers_active_check(sem), TASK_UNINTERRUPTIBLE);
+	rwsem_xr_qos_percpu_wait(&sem->rw_sem, false);
 }
 EXPORT_SYMBOL_GPL(percpu_down_write);
 

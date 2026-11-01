@@ -12,6 +12,7 @@
 #include <linux/splice.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <linux/mi_smart_cache.h>
 #include "overlayfs.h"
 
 #define OVL_IOCB_MASK (IOCB_DSYNC | IOCB_HIPRI | IOCB_NOWAIT | IOCB_SYNC)
@@ -688,3 +689,22 @@ const struct file_operations ovl_file_operations = {
 	.copy_file_range	= ovl_copy_file_range,
 	.remap_file_range	= ovl_remap_file_range,
 };
+
+#ifdef CONFIG_XIAOMI_SMART_CACHE
+/* Use overlayfs' data-file resolution, including metacopy/copy-up handling. */
+struct file *ovl_smart_cache_real_file(struct file *file)
+{
+	struct fd real;
+	struct file *result;
+	int ret;
+
+	if (file->f_op != &ovl_file_operations)
+		return ERR_PTR(-EOPNOTSUPP);
+	ret = ovl_real_fdget(file, &real);
+	if (ret)
+		return ERR_PTR(ret);
+	result = get_file(real.file);
+	fdput(real);
+	return result;
+}
+#endif

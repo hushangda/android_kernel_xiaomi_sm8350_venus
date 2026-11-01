@@ -536,6 +536,25 @@ config PERF_HELPER
 	help
 	  this module support record perf lock history and other perf messages.
 
+config XIAOMI_MIMD_TRIGGER
+	bool "Xiaomi MIMD2 framework event queue"
+	depends on PERF_HELPER=y && SYSFS
+	default n
+	help
+	  Provide the bounded colon-delimited event FIFO used by MIMD2.
+	  Requires a matching ROM daemon, JSON policy and init/SELinux permissions.
+	  Reading dequeues one event; queue-full writes fail instead of losing events.
+
+config XIAOMI_MIMD_RECLAIM
+	bool "Xiaomi MIMD2 bounded global and memcg reclaim commands"
+	depends on PERF_HELPER=y && BOOTUP_RECLAIM && XIAOMI_MEMCG_RECLAIM
+	default n
+	help
+	  Decode the MIMD2 10-million prefix protocol and queue scoped anon/file
+	  reclaim with progress, timeout and shutdown handling. Also provide the
+	  per-group reclaim_once result and foreground cancellation interfaces.
+	  Requires matching ROM configuration; normal reclaim policy is unchanged.
+
 config GPIO_TESTING_MODE
 	tristate "A simple GPIO testing mode driver"
 	default n
