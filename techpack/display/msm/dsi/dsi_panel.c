@@ -676,6 +676,9 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	if (panel->host_config.ext_bridge_mode)
 		return 0;
 
+	if (mi_dsi_panel_is_k2_fullscreen_aod(panel))
+		return mi_dsi_panel_set_fullscreen_aod_backlight(panel, bl_lvl);
+
 	if (is_backlight_set_skip(panel, bl_lvl)) {
 		mi_dsi_panel_update_last_bl_level(panel, bl_lvl);
 		return 0;
@@ -4744,6 +4747,7 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 	}
 exit1:
 	if (!rc) {
+		panel->mi_cfg.fullscreen_aod_bl_valid = false;
 		mi_panel_count_active(&panel->mi_count, true);
 		mi_panel_stats_power(&panel->mi_stats, false, false);
 	}

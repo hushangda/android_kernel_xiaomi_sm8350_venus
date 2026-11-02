@@ -150,6 +150,141 @@ bool is_aod_and_panel_initialized(struct dsi_panel *panel)
 	}
 }
 
+bool mi_dsi_panel_is_k2_fullscreen_aod(struct dsi_panel *panel)
+{
+	return panel->mi_cfg.panel_id == 0x4A3200380800 &&
+		panel->mi_cfg.feature_val[DISP_FEATURE_FULLSCREEN_AOD] == FEATURE_ON &&
+		!panel->mi_cfg.aod_bl_51ctl && is_aod_and_panel_initialized(panel);
+}
+
+/* panel_lock is held by both the backlight and feature-control callers. */
+int mi_dsi_panel_set_fullscreen_aod_backlight(struct dsi_panel *panel, u32 bl_lvl)
+{
+	struct mi_dsi_panel_cfg *cfg = &panel->mi_cfg;
+	enum dsi_cmd_set_type type;
+	u32 doze, layers;
+	bool anim;
+	int state, dbv, rc;
+
+	if (!mi_dsi_panel_is_k2_fullscreen_aod(panel))
+		return -EINVAL;
+
+	cfg->fullscreen_aod_bl = bl_lvl;
+	cfg->fullscreen_aod_bl_valid = true;
+	mi_dsi_panel_update_last_bl_level(panel, bl_lvl);
+
+	/* FOD owns the panel until its existing exit sequence has completed. */
+	if (is_hbm_fod_on(panel) || cfg->in_fod_calibration ||
+		cfg->local_hbm_to_normal || cfg->fod_anim_on)
+		return 0;
+
+	if (!bl_lvl) {
+		/* Keep the LP exit selector, but do not clear the user's DC state. */
+		rc = mipi_dsi_dcs_set_display_brightness(&panel->mipi_device, 0);
+		if (rc < 0)
+			return rc;
+		cfg->doze_brightness = DOZE_TO_NORMAL;
+		WRITE_ONCE(cfg->fullscreen_aod_bl_pending, false);
+		mi_panel_count_backlight(&panel->mi_count, 0);
+		mi_panel_stats_backlight(&panel->mi_stats, 0);
+		return 0;
+	}
+
+	/* A preserve-only frame precedes the actual AOD/animation content. */
+	layers = READ_ONCE(cfg->fullscreen_aod_layer_state);
+	if ((layers & MI_DIMLAYER_BL_PRESERVE ||
+		READ_ONCE(cfg->fullscreen_aod_bl_pending)) &&
+		!(layers & (MI_DIMLAYER_AOD | MI_DIMLAYER_FOD_ANIM))) {
+		if (!READ_ONCE(cfg->fullscreen_aod_bl_pending))
+			DISP_INFO("K2 AOD defer backlight %u, layers=0x%x\n",
+				bl_lvl, layers);
+		WRITE_ONCE(cfg->fullscreen_aod_bl_pending, true);
+		return 0;
+	}
+
+	/* K2 exposes two native AOD levels, not the newer panel's normal DBV. */
+	if (cfg->doze_lbm_dbv_level <= 0 ||
+		cfg->doze_hbm_dbv_level < cfg->doze_lbm_dbv_level)
+		return -EOPNOTSUPP;
+	if (bl_lvl <= (u32)cfg->doze_lbm_dbv_level) {
+		doze = DOZE_BRIGHTNESS_LBM;
+		type = DSI_CMD_SET_MI_DOZE_LBM;
+		state = PANEL_STATE_DOZE_LOW;
+		dbv = cfg->doze_lbm_dbv_level;
+	} else {
+		doze = DOZE_BRIGHTNESS_HBM;
+		type = DSI_CMD_SET_MI_DOZE_HBM;
+		state = PANEL_STATE_DOZE_HIGH;
+		dbv = cfg->doze_hbm_dbv_level;
+	}
+	/* The first committed FOD animation already requires the NOLP mode.
+	 * Lighting native doze here, then switching at the next layer fence,
+	 * exposes a frame at a different luminance. Switch while DBV is zero.
+	 */
+	anim = (layers & MI_DIMLAYER_FOD_ANIM) &&
+		cfg->feature_val[DISP_FEATURE_FP_STATUS] != ENROLL_STOP &&
+		cfg->feature_val[DISP_FEATURE_FP_STATUS] != AUTH_STOP &&
+		cfg->feature_val[DISP_FEATURE_FP_STATUS] != HEART_RATE_STOP;
+	if (anim) {
+		type = doze == DOZE_BRIGHTNESS_HBM ?
+			DSI_CMD_SET_MI_DOZE_HBM_NOLP : DSI_CMD_SET_MI_DOZE_LBM_NOLP;
+		state = PANEL_STATE_ON;
+	}
+	if (!panel->cur_mode || !panel->cur_mode->priv_info ||
+		!panel->cur_mode->priv_info->cmd_sets[type].count)
+		return -EOPNOTSUPP;
+	if (!anim && !READ_ONCE(cfg->fullscreen_aod_bl_pending) &&
+		cfg->doze_brightness == doze && cfg->panel_state == state)
+		return 0;
+	if (anim) {
+		u16 wire_dbv = dbv;
+
+		rc = mipi_dsi_dcs_set_display_brightness(&panel->mipi_device, 0);
+		if (rc < 0)
+			return rc;
+		rc = dsi_panel_tx_cmd_set(panel, type);
+		if (rc)
+			return rc;
+		if (panel->bl_config.bl_inverted_dbv)
+			wire_dbv = (wire_dbv << 8) | (wire_dbv >> 8);
+		rc = mipi_dsi_dcs_set_display_brightness(&panel->mipi_device, wire_dbv);
+		if (rc < 0)
+			return rc;
+		cfg->fod_anim_on = true;
+	} else {
+		rc = mi_dsi_update_hbm_cmd_51reg(panel, type, dbv);
+		if (rc)
+			return rc;
+		rc = dsi_panel_tx_cmd_set(panel, type);
+		if (rc)
+			return rc;
+	}
+	WRITE_ONCE(cfg->fullscreen_aod_bl_pending, false);
+	cfg->doze_brightness = doze;
+	cfg->doze_brightness_backup = doze;
+	cfg->panel_state = state;
+	cfg->dimming_state = STATE_DIM_BLOCK;
+	cfg->aod_brightness_work_flag = true;
+	mi_panel_count_backlight(&panel->mi_count, dbv);
+	mi_panel_stats_backlight(&panel->mi_stats, dbv);
+	DISP_INFO("K2 fullscreen AOD backlight %u -> %s doze %u, DBV %d\n",
+		bl_lvl, anim ? "animation" : "native", doze, dbv);
+	return 0;
+}
+
+static int mi_dsi_panel_restore_fullscreen_aod_backlight(struct dsi_panel *panel)
+{
+	if (!panel->mi_cfg.fullscreen_aod_bl_valid ||
+		!mi_dsi_panel_is_k2_fullscreen_aod(panel) ||
+		is_hbm_fod_on(panel) || panel->mi_cfg.in_fod_calibration ||
+		panel->mi_cfg.local_hbm_to_normal || panel->mi_cfg.fod_anim_on)
+		return 0;
+	/* FOD/calibration may have changed DBV without changing the cached level. */
+	panel->mi_cfg.doze_brightness = DOZE_TO_NORMAL;
+	return mi_dsi_panel_set_fullscreen_aod_backlight(panel,
+		panel->mi_cfg.fullscreen_aod_bl);
+}
+
 bool is_backlight_set_skip(struct dsi_panel *panel, u32 bl_lvl)
 {
 	DSI_DEBUG("panel->mi_cfg.panel_id >> 32 = %x\n", panel->mi_cfg.panel_id >> 32);
@@ -2146,6 +2281,9 @@ void mi_dsi_update_micfg_flags(struct dsi_panel *panel, int power_mode)
 
 	switch (power_mode) {
 	case PANEL_OFF:
+		mi_cfg->fullscreen_aod_bl_valid = false;
+		WRITE_ONCE(mi_cfg->fullscreen_aod_layer_state, 0);
+		WRITE_ONCE(mi_cfg->fullscreen_aod_bl_pending, false);
 		memset(&mi_cfg->early_dimming, 0, sizeof(mi_cfg->early_dimming));
 		mi_cfg->in_fod_calibration = false;
 		mi_cfg->fod_hbm_layer_enabled = false;
@@ -2159,6 +2297,8 @@ void mi_dsi_update_micfg_flags(struct dsi_panel *panel, int power_mode)
 		mi_cfg->feature_val[DISP_FEATURE_LOCAL_HBM] = LOCAL_HBM_OFF_TO_NORMAL;
 		break;
 	case PANEL_ON:
+		WRITE_ONCE(mi_cfg->fullscreen_aod_layer_state, 0);
+		WRITE_ONCE(mi_cfg->fullscreen_aod_bl_pending, false);
 		mi_cfg->in_fod_calibration = false;
 		mi_cfg->fod_hbm_layer_enabled = false;
 		mi_cfg->fod_anim_layer_enabled = false;
@@ -2701,17 +2841,17 @@ static int mi_dsi_update_hbm_cmd_51reg(struct dsi_panel *panel,
 	/* restore last backlight value when hbm off */
 	cmds = priv_info->cmd_sets[type].cmds;
 	count = priv_info->cmd_sets[type].count;
-	if (cmds && count >= index) {
+	if (cmds && (u32)index < count) {
 		tx_buf = (u8 *)cmds[index].msg.tx_buf;
-		if (tx_buf && tx_buf[0] == 0x51) {
+		if (tx_buf && cmds[index].msg.tx_len >= 3 && tx_buf[0] == 0x51) {
 			tx_buf[1] = (bl_lvl >> 8) & 0x0f;
 			tx_buf[2] = bl_lvl & 0xff;
 		} else {
-			if (tx_buf) {
+			if (tx_buf && cmds[index].msg.tx_len) {
 				DISP_ERROR("%s panel tx_buf[0] = 0x%02X, check cmd[%s] 0x51 index\n",
 					panel->type, tx_buf[0], cmd_set_prop_map[type]);
 			} else {
-				DISP_ERROR("%s panel tx_buf is NULL pointer\n", panel->type);
+				DISP_ERROR("%s panel 0x51 payload is missing\n", panel->type);
 			}
 			rc = -EINVAL;
 		}
@@ -2803,6 +2943,10 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 			break;
 		}
 		mi_cfg->feature_val[DISP_FEATURE_FULLSCREEN_AOD] = ctl->feature_val;
+		if (!ctl->feature_val) {
+			mi_cfg->fullscreen_aod_bl_valid = false;
+			WRITE_ONCE(mi_cfg->fullscreen_aod_bl_pending, false);
+		}
 		mi_panel_stats_fullscreen(&panel->mi_stats, ctl->feature_val);
 		mi_disp_feature_event_notify(&event, (u8 *)&ctl->feature_val);
 		break;
@@ -2869,6 +3013,8 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 			}
 		}
 		mi_cfg->feature_val[DISP_FEATURE_HBM_FOD] = ctl->feature_val;
+		if (!rc && ctl->feature_val == FEATURE_OFF)
+			rc = mi_dsi_panel_restore_fullscreen_aod_backlight(panel);
 		break;
 	case DISP_FEATURE_DOZE_BRIGHTNESS:
 #ifdef CONFIG_FACTORY_BUILD
@@ -2928,6 +3074,7 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 				mi_cfg->last_bl_level);
 			dsi_panel_update_backlight(panel, mi_cfg->last_bl_level);
 			mi_cfg->in_fod_calibration = false;
+			rc = mi_dsi_panel_restore_fullscreen_aod_backlight(panel);
 		} else {
 			if (ctl->feature_val >= 0 && ctl->feature_val <= panel->bl_config.bl_max_level) {
 				mi_cfg->in_fod_calibration = true;
@@ -2950,6 +3097,7 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 			dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_MI_HBM_FOD_OFF);
 			mi_cfg->dimming_state = STATE_DIM_RESTORE;
 			mi_cfg->in_fod_calibration = false;
+			rc = mi_dsi_panel_restore_fullscreen_aod_backlight(panel);
 		} else {
 			mi_cfg->in_fod_calibration = true;
 			if (mi_cfg->hbm_51_ctl_flag && mi_cfg->hbm_fod_on_51_index >= 0) {
@@ -3393,6 +3541,10 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 		}
 
 		if (ctl->feature_val == FEATURE_ON) {
+			if (mi_dsi_panel_is_k2_fullscreen_aod(panel) &&
+				mi_cfg->fullscreen_aod_bl_valid && mi_cfg->fod_anim_on &&
+				mi_cfg->panel_state == PANEL_STATE_ON)
+				break;
 			switch (mi_cfg->doze_brightness_backup) {
 			case DOZE_BRIGHTNESS_HBM:
 				DISP_INFO("enter DOZE HBM NOLP\n");
@@ -3480,6 +3632,8 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 					mi_cfg->doze_brightness_backup);
 				break;
 			}
+			if (!rc)
+				rc = mi_dsi_panel_restore_fullscreen_aod_backlight(panel);
 		}
 		break;
 	case DISP_FEATURE_COLOR_INVERT:
@@ -3491,7 +3645,10 @@ int mi_dsi_panel_set_disp_param(struct dsi_panel *panel, struct disp_feature_ctl
 		mi_cfg->feature_val[DISP_FEATURE_COLOR_INVERT] = ctl->feature_val;
 	case DISP_FEATURE_DC_BACKLIGHT:
 		DISP_INFO("DC backlight:%d\n", ctl->feature_val);
-		mi_dsi_update_dc_backlight(panel, ctl->feature_val);
+		if (mi_dsi_panel_is_k2_fullscreen_aod(panel))
+			rc = mi_dsi_panel_set_fullscreen_aod_backlight(panel, ctl->feature_val);
+		else
+			mi_dsi_update_dc_backlight(panel, ctl->feature_val);
 		break;
 	case DISP_FEATURE_GIR:
 		if (!mi_cfg->aod_brightness_work_flag) {

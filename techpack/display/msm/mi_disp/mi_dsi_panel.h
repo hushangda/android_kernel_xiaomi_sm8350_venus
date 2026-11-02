@@ -260,6 +260,10 @@ struct mi_dsi_panel_cfg {
 	bool local_hbm_to_normal;
 	int bl_statistic_cnt;
 	bool bl_need_update;
+	bool fullscreen_aod_bl_valid;
+	u32 fullscreen_aod_bl;
+	u32 fullscreen_aod_layer_state;
+	bool fullscreen_aod_bl_pending;
 
 
 	int aod_hbm_51_index;
@@ -300,6 +304,9 @@ int mi_dsi_release_wakelock(struct dsi_panel *panel);
 bool is_aod_and_panel_initialized(struct dsi_panel *panel);
 
 bool is_backlight_set_skip(struct dsi_panel *panel, u32 bl_lvl);
+
+bool mi_dsi_panel_is_k2_fullscreen_aod(struct dsi_panel *panel);
+int mi_dsi_panel_set_fullscreen_aod_backlight(struct dsi_panel *panel, u32 bl_lvl);
 
 bool is_hbm_fod_on(struct dsi_panel *panel);
 

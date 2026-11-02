@@ -460,6 +460,36 @@ int mi_sde_connector_dc_fence(struct drm_connector *connector)
 	return rc;
 }
 
+/* Replay the deferred, already scaled DBV under the normal panel/clock locks. */
+static int mi_sde_connector_replay_aod_backlight(struct dsi_display *display)
+{
+	struct dsi_panel *panel = display->panel;
+	struct mi_dsi_panel_cfg *cfg = &panel->mi_cfg;
+	int rc = 0, clk_rc;
+
+	mutex_lock(&panel->panel_lock);
+	if (!mi_dsi_panel_is_k2_fullscreen_aod(panel) ||
+		!cfg->fullscreen_aod_bl_valid ||
+		!READ_ONCE(cfg->fullscreen_aod_bl_pending) ||
+		!(READ_ONCE(cfg->fullscreen_aod_layer_state) &
+		(MI_DIMLAYER_AOD | MI_DIMLAYER_FOD_ANIM)))
+		goto out;
+
+	rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_CORE_CLK, DSI_CLK_ON);
+	if (rc)
+		goto out;
+	rc = mi_dsi_panel_set_fullscreen_aod_backlight(panel,
+		cfg->fullscreen_aod_bl);
+	clk_rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+		DSI_CORE_CLK, DSI_CLK_OFF);
+	if (!rc)
+		rc = clk_rc;
+out:
+	mutex_unlock(&panel->panel_lock);
+	return rc;
+}
+
 int mi_sde_connector_fod_hbm_fence(struct drm_connector *connector)
 {
 	int rc = 0;
@@ -492,6 +522,8 @@ int mi_sde_connector_fod_hbm_fence(struct drm_connector *connector)
 	mi_cfg = &dsi_display->panel->mi_cfg;
 
 	/* Stock layer bit 0x10 keeps the existing backlight across LP1. */
+	WRITE_ONCE(mi_cfg->fullscreen_aod_layer_state,
+		c_conn->mi_layer_state.mi_layer_type);
 	mi_cfg->bl_preserve_layer_enabled =
 		!!(c_conn->mi_layer_state.mi_layer_type & MI_DIMLAYER_BL_PRESERVE);
 
@@ -520,6 +552,14 @@ int mi_sde_connector_fod_hbm_fence(struct drm_connector *connector)
 			} else {
 				sde_enc->ready_kickoff = false;
 			}
+		}
+	}
+
+	if (c_conn->allow_bl_update && READ_ONCE(mi_cfg->fullscreen_aod_bl_pending)) {
+		rc = mi_sde_connector_replay_aod_backlight(dsi_display);
+		if (rc) {
+			DISP_ERROR("K2 AOD deferred backlight failed: %d\n", rc);
+			return rc;
 		}
 	}
 

@@ -1043,6 +1043,15 @@ void sde_connector_helper_bridge_enable(struct drm_connector *connector)
 	}
 	c_conn->allow_bl_update = true;
 
+	/* Publish the committed layer before restoring the cached backlight. */
+	WRITE_ONCE(display->panel->mi_cfg.fullscreen_aod_layer_state,
+		c_conn->mi_layer_state.mi_layer_type);
+
+	if (mi_dsi_panel_is_k2_fullscreen_aod(display->panel))
+		SDE_INFO("K2 AOD first-frame layers=0x%x, cached backlight=%u\n",
+			c_conn->mi_layer_state.mi_layer_type,
+			c_conn->bl_device ? c_conn->bl_device->props.brightness : 0);
+
 	/* wake up pending work to set doze brightness*/
 	mi_dsi_display_wakeup_pending_doze_work(display);
 
