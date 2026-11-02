@@ -7,6 +7,51 @@
  * No slot/statistics lock spans allocation, IO, or reclaim. An in-flight read
  * owns a backing-block reference; discarding its slot cannot recycle the block.
  */
+/* The ROM's ExtM file and quota both belong to zram0. Reuse its real
+ * writeback budget (4KiB units), rather than maintaining a second counter.
+ */
+u64 mi_zram_quota_read(void)
+{
+	struct zram *zram;
+	u64 bytes = 0;
+
+	mutex_lock(&zram_index_mutex);
+	zram = idr_find(&zram_index_idr, 0);
+	if (zram) {
+		down_read(&zram->init_lock);
+		spin_lock(&zram->wb_limit_lock);
+		if (zram->wb_limit_enable)
+			bytes = min_t(u64, zram->bd_wb_limit, U64_MAX >> 12) << 12;
+		spin_unlock(&zram->wb_limit_lock);
+		up_read(&zram->init_lock);
+	}
+	mutex_unlock(&zram_index_mutex);
+	return bytes;
+}
+EXPORT_SYMBOL_GPL(mi_zram_quota_read);
+
+int mi_zram_quota_write(u64 bytes)
+{
+	struct zram *zram;
+	int ret = -ENODEV;
+
+	mutex_lock(&zram_index_mutex);
+	zram = idr_find(&zram_index_idr, 0);
+	if (zram) {
+		/* Finish in-flight writes/refunds before replacing the daily budget. */
+		down_write(&zram->init_lock);
+		spin_lock(&zram->wb_limit_lock);
+		zram->bd_wb_limit = bytes >> 12;
+		zram->wb_limit_enable = true;
+		spin_unlock(&zram->wb_limit_lock);
+		up_write(&zram->init_lock);
+		ret = 0;
+	}
+	mutex_unlock(&zram_index_mutex);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mi_zram_quota_write);
+
 static bool zram_group_matches(struct zram *zram, u32 index,
 			       struct mem_cgroup *memcg)
 {

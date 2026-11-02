@@ -324,6 +324,16 @@ static ssize_t mi_reclaim_write(struct kernfs_open_file *of, char *buf,
 }
 
 #ifdef CONFIG_ZRAM_WRITEBACK
+static u64 mi_quota_read(struct cgroup_subsys_state *css, struct cftype *cft)
+{
+	return mi_zram_quota_read();
+}
+
+static int mi_quota_write(struct cgroup_subsys_state *css, struct cftype *cft, u64 val)
+{
+	return mi_zram_quota_write(val);
+}
+
 struct mi_io_context {
 	struct mem_cgroup *memcg;
 	unsigned long deadline;
@@ -553,6 +563,8 @@ static struct cftype mi_policy_files[] = {
 	  .write_u64 = mi_policy_write, .read_u64 = mi_policy_read },
 	{ .name = "xswapd.swapin", .write_u64 = mi_swapin_write },
 	{ .name = "xswapd.swapout", .write = mi_swapout_write },
+	{ .name = "xswapd.quota", .flags = CFTYPE_ONLY_ON_ROOT,
+	  .write_u64 = mi_quota_write, .read_u64 = mi_quota_read },
 #endif
 	{ .name = "mctrl.stat", .seq_show = mi_stat_show },
 	{ .name = "xswapd.reclaim", .write = mi_reclaim_write },

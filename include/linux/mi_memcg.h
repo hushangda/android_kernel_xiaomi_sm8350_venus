@@ -62,6 +62,8 @@ void mi_memcg_set_score(struct mem_cgroup *memcg, u32 score);
 void mi_memcg_backend_get(void);
 void mi_memcg_backend_put(void);
 #ifdef CONFIG_ZRAM_WRITEBACK
+u64 mi_zram_quota_read(void);
+int mi_zram_quota_write(u64 bytes);
 int mi_zram_group_io(struct mem_cgroup *memcg, u64 bytes, bool write,
 		     u64 *done, u32 ratio, bool (*cancelled)(void *), void *context);
 #endif
