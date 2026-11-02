@@ -16,8 +16,18 @@
 #define XR_QOS_TASK_MAX 8192
 #define XR_QOS_ACTIVE_MAX 128
 #define XR_QOS_UPDATE_MAX (2 * XR_QOS_ACTIVE_MAX)
-#define XR_QOS_IN_MAX 64
-#define XR_QOS_OUT_MAX 16
+#define XR_QOS_EDGE_MAX XR_QOS_TASK_MAX
+#define XR_QOS_RT_UID_MAX 4
+
+enum xr_qos_failure {
+	XR_FAIL_ALLOC, XR_FAIL_TASKS, XR_FAIL_EDGES, XR_FAIL_ACTIVE,
+	XR_FAIL_UPDATES, XR_FAIL_INCOMPLETE, XR_FAIL_RT_UID, XR_FAILURES,
+};
+
+struct xr_qos_rt_user {
+	kuid_t uid;
+	unsigned int count;
+};
 
 struct xr_qos_value {
 	u32 qos;
@@ -41,6 +51,8 @@ struct xr_qos_task {
 	u16 incoming_count;
 	u16 outgoing_count;
 	u32 static_qos;
+	/* One-based sticky admission slot; credentials may change before exit. */
+	u8 rt_slot;
 	bool async_once;
 	bool pending;
 	bool exiting;
@@ -55,11 +67,73 @@ struct xr_qos_task {
 static DEFINE_RAW_SPINLOCK(xr_qos_lock);
 static LIST_HEAD(xr_qos_tasks);
 static LIST_HEAD(xr_qos_active);
-static unsigned int xr_task_count, xr_active_count;
+static unsigned int xr_task_count, xr_active_count, xr_edge_count;
+static struct xr_qos_rt_user xr_rt_users[XR_QOS_ACTIVE_MAX];
+static unsigned long xr_failures[XR_FAILURES];
+static enum xr_qos_failure xr_last_failure;
 static u64 xr_epoch;
 /* Serialized scratch space: never place a graph-sized array on kernel stack. */
 static struct xr_qos_task *xr_update[XR_QOS_UPDATE_MAX];
 static unsigned int xr_updates;
+
+/* All admission/accounting helpers run under xr_qos_lock. */
+static int xr_fail(enum xr_qos_failure reason, int error)
+{
+	xr_failures[reason]++;
+	xr_last_failure = reason;
+	return error;
+}
+
+static void xr_warn_failure(const char *operation, int error,
+			   enum xr_qos_failure reason,
+			   struct task_struct *from, struct task_struct *to)
+{
+	static const char * const names[] = {
+		"allocation", "metadata", "edges", "active", "updates",
+		"incomplete-topology", "rt-uid-quota",
+	};
+
+	pr_warn_ratelimited("xr_qos: %s error=%d reason=%s count=%lu (%d -> %d) tasks=%u active=%u edges=%u\n",
+		operation, error, names[reason], READ_ONCE(xr_failures[reason]),
+		task_pid_nr(from), to ? task_pid_nr(to) : 0,
+		READ_ONCE(xr_task_count), READ_ONCE(xr_active_count),
+		READ_ONCE(xr_edge_count));
+}
+
+static void xr_rt_uncharge(struct xr_qos_task *q)
+{
+	if (q->rt_slot) {
+		struct xr_qos_rt_user *user = &xr_rt_users[q->rt_slot - 1];
+
+		WARN_ON_ONCE(!user->count);
+		user->count--;
+		q->rt_slot = 0;
+	}
+}
+
+static int xr_rt_slot(struct xr_qos_task *q, kuid_t uid)
+{
+	int i, free = -1;
+
+	for (i = 0; i < ARRAY_SIZE(xr_rt_users); i++) {
+		if (!xr_rt_users[i].count) {
+			if (free < 0)
+				free = i;
+			continue;
+		}
+		if (uid_eq(xr_rt_users[i].uid, uid)) {
+			if (xr_rt_users[i].count >= XR_QOS_RT_UID_MAX &&
+			    q->rt_slot != i + 1)
+				return xr_fail(XR_FAIL_RT_UID, -EDQUOT);
+			return i;
+		}
+	}
+	/* Replacing the last charge can reuse its slot after a UID change. */
+	if (free < 0 && q->rt_slot &&
+	    xr_rt_users[q->rt_slot - 1].count == 1)
+		free = q->rt_slot - 1;
+	return free < 0 ? xr_fail(XR_FAIL_RT_UID, -EDQUOT) : free;
+}
 
 /* Non-focused draw slots are process-owned while a live task requests them. */
 static struct pid *xr_draw_slots[3];
@@ -171,7 +245,8 @@ static void xr_queue(struct xr_qos_task *q)
 }
 
 /* Caller owns a task reference. State is installed once, freed with task. */
-static struct xr_qos_task *xr_get_or_alloc(struct task_struct *p)
+static struct xr_qos_task *xr_get_or_alloc(struct task_struct *p,
+					 enum xr_qos_failure *failure)
 {
 	struct xr_qos_task *q, *new;
 	unsigned long flags;
@@ -180,8 +255,14 @@ static struct xr_qos_task *xr_get_or_alloc(struct task_struct *p)
 	if (q)
 		return q;
 	new = kzalloc(sizeof(*new), GFP_ATOMIC);
-	if (!new)
+	if (!new) {
+		if (failure)
+			*failure = XR_FAIL_ALLOC;
+		raw_spin_lock_irqsave(&xr_qos_lock, flags);
+		xr_fail(XR_FAIL_ALLOC, -ENOMEM);
+		raw_spin_unlock_irqrestore(&xr_qos_lock, flags);
 		return NULL;
+	}
 	INIT_LIST_HEAD(&new->incoming);
 	INIT_LIST_HEAD(&new->active);
 	INIT_LIST_HEAD(&new->vip.entry);
@@ -204,6 +285,10 @@ static struct xr_qos_task *xr_get_or_alloc(struct task_struct *p)
 		new = NULL;
 		list_add_tail(&q->all, &xr_qos_tasks);
 		smp_store_release(&p->xr_qos, q);
+	} else if (!q && !(p->flags & PF_EXITING)) {
+		if (failure)
+			*failure = XR_FAIL_TASKS;
+		xr_fail(XR_FAIL_TASKS, -ENOMEM);
 	}
 	raw_spin_unlock_irqrestore(&xr_qos_lock, flags);
 	kfree(new);
@@ -214,15 +299,17 @@ static struct xr_qos_task *xr_get_or_alloc(struct task_struct *p)
  * L[d] is the merge of static roots at distance <= d, never a recursively
  * accumulated effective value. This removes cycles without a global reset.
  * Only changed values enqueue the next layer of downstream neighbours. A
- * transaction has at most 256 touched tasks and 64 incoming / 16 outgoing
- * edges per task; at most 128 tasks may have a nonzero effective value.
+ * transaction has at most 256 touched tasks; at most 128 tasks may have a
+ * nonzero effective value. All recorded edges share one global edge budget,
+ * so a normal high-degree dormant topology is retained for late activation.
+ * Each depth visits at most that global budget of incoming/outgoing edges.
  * Limits are checked before committing: removal never needs extra capacity.
  */
 static int xr_mark(struct xr_qos_task *q, int depth)
 {
 	if (q->epoch != xr_epoch) {
 		if (xr_updates == XR_QOS_UPDATE_MAX)
-			return -E2BIG;
+			return xr_fail(XR_FAIL_UPDATES, -E2BIG);
 		q->epoch = xr_epoch;
 		q->dirty = 0;
 		memcpy(q->trial, q->level, sizeof(q->level));
@@ -258,7 +345,7 @@ static int xr_recompute(struct xr_qos_task *root, int first, bool removing)
 				}
 			if (!removing && depth < XR_QOS_DEPTH &&
 			    (value.qos & 0xf) && q->task->xr_qos_dropped)
-				return -ENOSPC;
+				return xr_fail(XR_FAIL_INCOMPLETE, -ENOSPC);
 			if (xr_equal(value, q->trial[depth]))
 				continue;
 			q->trial[depth] = value;
@@ -277,7 +364,7 @@ static int xr_recompute(struct xr_qos_task *root, int first, bool removing)
 			  !!(q->effective.qos & 0xf);
 	}
 	if (active > XR_QOS_ACTIVE_MAX)
-		return -ENOSPC;
+		return xr_fail(XR_FAIL_ACTIVE, -ENOSPC);
 	for (n = 0; n < xr_updates; n++) {
 		q = xr_update[n];
 		memcpy(q->level, q->trial, sizeof(q->level));
@@ -314,31 +401,63 @@ void xr_qos_fork(struct task_struct *p)
 	p->xr_qos_dropped = 0;
 }
 
-int xr_qos_set(struct task_struct *p, u32 qos)
+int xr_qos_set(struct task_struct *p, u32 qos, bool unprivileged)
 {
 	struct xr_qos_task *q;
 	unsigned long flags;
 	u32 level = qos & 0xf, type = (qos >> 4) & 3, old;
-	int ret = 0;
+	kuid_t uid;
+	enum xr_qos_failure reason = XR_FAIL_ALLOC;
+	int ret = 0, slot = -1;
 
 	if (qos & ~0xffU || type == 3 || level > 10 ||
 	    (level && level < 3) || (level == 6 && type != 2) ||
 	    (level >= 7 && !type))
 		return -EINVAL;
-	q = xr_get_or_alloc(p);
-	if (!q)
+	/* The device determines privilege after its LSM and target checks. */
+	rcu_read_lock();
+	uid = task_uid(p);
+	ret = unprivileged && !uid_eq(current_euid(), uid) ? -EPERM : 0;
+	rcu_read_unlock();
+	if (ret)
+		return ret;
+	q = xr_get_or_alloc(p, &reason);
+	if (!q) {
+		if (!(p->flags & PF_EXITING))
+			xr_warn_failure("set", -ENOMEM, reason, p, NULL);
 		return p->flags & PF_EXITING ? -ESRCH : -ENOMEM;
+	}
 	raw_spin_lock_irqsave(&xr_qos_lock, flags);
 	if (q->exiting || p->flags & PF_EXITING) {
 		ret = -ESRCH;
 	} else {
+		if (unprivileged && level && type == 1) {
+			slot = xr_rt_slot(q, uid);
+			if (slot < 0) {
+				ret = slot;
+				goto out;
+			}
+		}
 		old = q->static_qos;
 		q->static_qos = level ? qos : 0;
 		ret = xr_recompute(q, 0, !level);
-		if (ret)
+		if (ret) {
 			q->static_qos = old;
+		} else {
+			/* Commit admission with the graph; rejected updates change neither. */
+			xr_rt_uncharge(q);
+			if (slot >= 0) {
+				xr_rt_users[slot].uid = uid;
+				xr_rt_users[slot].count++;
+				q->rt_slot = slot + 1;
+			}
+		}
 	}
+out:
+	reason = xr_last_failure;
 	raw_spin_unlock_irqrestore(&xr_qos_lock, flags);
+	if (ret == -EDQUOT || ret == -ENOSPC || ret == -E2BIG)
+		xr_warn_failure("set", ret, reason, p, NULL);
 	/* The userspace control path must not report before its backend runs. */
 	if (!ret)
 		flush_work(&q->work);
@@ -376,7 +495,7 @@ bool xr_qos_group_requested(struct task_struct *p)
 
 int xr_qos_async_arm(struct task_struct *p, bool enable)
 {
-	struct xr_qos_task *q = xr_get_or_alloc(p);
+	struct xr_qos_task *q = xr_get_or_alloc(p, NULL);
 	unsigned long flags;
 	int ret = 0;
 
@@ -418,12 +537,13 @@ int xr_qos_link_add(struct xr_qos_link *link, struct task_struct *from,
 {
 	struct xr_qos_task *a, *b;
 	unsigned long flags;
+	enum xr_qos_failure reason = XR_FAIL_ALLOC;
 	int ret = 0;
 
 	if (!from || !to || from == to || type >= XR_QOS_DEPENDENCIES)
 		return -EINVAL;
-	a = xr_get_or_alloc(from);
-	b = xr_get_or_alloc(to);
+	a = xr_get_or_alloc(from, &reason);
+	b = xr_get_or_alloc(to, &reason);
 	raw_spin_lock_irqsave(&xr_qos_lock, flags);
 	if (link->from) {
 		ret = -EALREADY;
@@ -441,14 +561,14 @@ int xr_qos_link_add(struct xr_qos_link *link, struct task_struct *from,
 	link->tracked = false;
 	if (!a || !b) {
 		ret = -ENOMEM;
-	} else if (a->outgoing_count == XR_QOS_OUT_MAX ||
-		   b->incoming_count == XR_QOS_IN_MAX) {
-		ret = -ENOSPC;
+	} else if (xr_edge_count >= XR_QOS_EDGE_MAX) {
+		ret = xr_fail(XR_FAIL_EDGES, -ENOSPC);
 	} else {
 		list_add_tail(&link->incoming, &b->incoming);
 		list_add_tail(&link->outgoing, &a->outgoing);
 		a->outgoing_count++;
 		b->incoming_count++;
+		xr_edge_count++;
 		if (a->level[XR_QOS_DEPTH - 1].qos & 0xf)
 			ret = xr_recompute(b, 1, false);
 		if (ret) {
@@ -456,6 +576,7 @@ int xr_qos_link_add(struct xr_qos_link *link, struct task_struct *from,
 			list_del_init(&link->outgoing);
 			a->outgoing_count--;
 			b->incoming_count--;
+			xr_edge_count--;
 		} else {
 			link->tracked = true;
 		}
@@ -463,10 +584,11 @@ int xr_qos_link_add(struct xr_qos_link *link, struct task_struct *from,
 	if (ret)
 		from->xr_qos_dropped++;
 out:
+	if (ret != -ENOMEM)
+		reason = xr_last_failure;
 	raw_spin_unlock_irqrestore(&xr_qos_lock, flags);
 	if (ret == -ENOMEM || ret == -ENOSPC || ret == -E2BIG)
-		pr_warn_ratelimited("xr_qos: dependency capacity error %d (%d -> %d)\n",
-			ret, task_pid_nr(from), task_pid_nr(to));
+		xr_warn_failure("dependency", ret, reason, from, to);
 	return ret;
 }
 
@@ -481,6 +603,7 @@ static void xr_unlink(struct xr_qos_link *link)
 		list_del_init(&link->outgoing);
 		a->outgoing_count--;
 		b->incoming_count--;
+		xr_edge_count--;
 		if (a->level[XR_QOS_DEPTH - 1].qos & 0xf)
 			WARN_ON_ONCE(xr_recompute(b, 1, true));
 	} else {
@@ -521,6 +644,7 @@ void xr_qos_exit(struct task_struct *p)
 	q->exiting = true;
 	q->async_once = false;
 	q->static_qos = 0;
+	xr_rt_uncharge(q);
 	WARN_ON_ONCE(xr_recompute(q, 0, true));
 	raw_spin_unlock_irqrestore(&xr_qos_lock, flags);
 	for (;;) {

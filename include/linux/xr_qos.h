@@ -47,7 +47,7 @@ void xr_qos_rcu_boost(struct xr_qos_link *link, struct task_struct *reader);
 void xr_qos_fork(struct task_struct *p);
 void xr_qos_exit(struct task_struct *p);
 void xr_qos_free(struct task_struct *p);
-int xr_qos_set(struct task_struct *p, u32 qos);
+int xr_qos_set(struct task_struct *p, u32 qos, bool unprivileged);
 u32 xr_qos_get(struct task_struct *p);
 u32 xr_qos_get_static(struct task_struct *p);
 bool xr_qos_group_requested(struct task_struct *p);

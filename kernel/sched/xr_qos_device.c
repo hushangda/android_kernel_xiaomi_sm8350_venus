@@ -77,12 +77,8 @@ static long xr_qos_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (ret)
 			break;
 		if (cmd == XR_QOS_SET) {
-			/* The device must not grant unprivileged callers real-time policy. */
-			if ((request.qos & 0xf) && ((request.qos >> 4) & 3) == 1 &&
-			    !xr_qos_admin())
-				ret = -EPERM;
-			else
-				ret = xr_qos_set(p, request.qos);
+			/* Fixed XR RT priority, with bounded own-UID admission in the graph. */
+			ret = xr_qos_set(p, request.qos, !xr_qos_admin());
 		}
 		else if (request.qos > 1)
 			ret = -EINVAL;

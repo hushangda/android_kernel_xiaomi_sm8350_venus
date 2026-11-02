@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """Actual fair VIP helpers with deterministic rq clocks and CFS throttling."""
 import pathlib,subprocess,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[4]
@@ -51,5 +52,5 @@ int main(void){struct rq r={0};struct task_struct t[3]={0};struct cfs_rq c[3]={0
 '''
 with tempfile.TemporaryDirectory(prefix='xr-vip-') as d:
  c=pathlib.Path(d)/'test.c';e=pathlib.Path(d)/'test';c.write_text(pre+src+main)
- subprocess.run(['clang','-std=gnu11','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-no-pie',str(c),'-o',str(e)],check=True)
+ subprocess.run([os.environ.get('HOSTCC','clang'),'-std=gnu11','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-no-pie',str(c),'-o',str(e)],check=True)
  subprocess.run([str(e)],check=True)

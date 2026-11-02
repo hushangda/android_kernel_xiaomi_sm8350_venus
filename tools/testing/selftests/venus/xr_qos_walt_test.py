@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 """Exercise actual WALT ownership/move helpers; accounting is a stub."""
 import pathlib,re,subprocess,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[4]
@@ -72,5 +73,5 @@ int main(void){init(&active_related_thread_groups);init(&task.wts.grp_list);for(
 '''
 with tempfile.TemporaryDirectory(prefix='xr-walt-') as d:
  c=pathlib.Path(d)/'test.c';e=pathlib.Path(d)/'test';c.write_text(pre+function('walt_xr_qos_set_group')+function('__sched_set_group_id')+main)
- subprocess.run(['clang','-std=gnu11','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread','-no-pie',str(c),'-o',str(e)],check=True)
+ subprocess.run([os.environ.get('HOSTCC','clang'),'-std=gnu11','-O1','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-pthread','-no-pie',str(c),'-o',str(e)],check=True)
  subprocess.run([str(e)],check=True)
