@@ -57,6 +57,9 @@ if [ -n "$SMP" ] ; then CONFIG_FLAGS="SMP"; fi
 if [ -n "$PREEMPT" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS PREEMPT"; fi
 if [ -n "$PREEMPT_RT" ] ; then CONFIG_FLAGS="$CONFIG_FLAGS PREEMPT_RT"; fi
 UTS_VERSION="$UTS_VERSION $CONFIG_FLAGS $TIMESTAMP"
+# An explicit display string can include a vendor suffix without passing that
+# suffix to tar/date through KBUILD_BUILD_TIMESTAMP.
+UTS_VERSION="${KBUILD_BUILD_UTS_VERSION:-$UTS_VERSION}"
 
 # Truncate to maximum length
 
@@ -78,7 +81,11 @@ UTS_TRUNCATE="cut -b -$UTS_LEN"
   CC_VERSION=$(echo $CC_VERSION | perl -pe 's/\(http.*?\)//gs' | sed 's/[[:space:]]*$//')
   LD_VERSION=$($LD -v | head -n1 | sed 's/(compatible with [^)]*)//' \
             | perl -pe 's/\(http.*?\)//gs' | sed 's/[[:space:]]*$//')
-  printf '#define LINUX_COMPILER "%s"\n' "$CC_VERSION, $LD_VERSION"
+  # Preserve the actual compiler in .config; optionally match a reference
+  # image's displayed compiler identification in the kernel banner.
+  LINUX_COMPILER="${KBUILD_BUILD_COMPILER:-$CC_VERSION, $LD_VERSION}"
+  LINUX_COMPILER=$(printf '%s' "$LINUX_COMPILER" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  printf '#define LINUX_COMPILER "%s"\n' "$LINUX_COMPILER"
 } > .tmpcompile
 
 # Only replace the real compile.h if the new one is different,
@@ -92,7 +99,7 @@ UTS_TRUNCATE="cut -b -$UTS_LEN"
 # changed comment in the
 # first line.
 
-if [ -z "$KBUILD_BUILD_TIMESTAMP" ]; then
+if [ -z "$KBUILD_BUILD_TIMESTAMP" ] && [ -z "$KBUILD_BUILD_UTS_VERSION" ]; then
    IGNORE_PATTERN="UTS_VERSION"
 else
    IGNORE_PATTERN="NOT_A_PATTERN_TO_BE_MATCHED"

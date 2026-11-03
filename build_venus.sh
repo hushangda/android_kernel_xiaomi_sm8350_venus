@@ -72,6 +72,32 @@ else
 fi
 OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
 
+# Match the reference Venus boot image by default. These are display/build
+# metadata; the source SUBLEVEL and feature checks remain at 5.4.302.
+export KBUILD_KERNEL_VERSION="${KBUILD_KERNEL_VERSION:-5.4.274}"
+export KBUILD_LOCALVERSION="${KBUILD_LOCALVERSION--qgki-gcc3ec22f5061}"
+export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-builder}"
+export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-pangu-build-component-vendor-472342-r50m5-nds1f-hgnpk}"
+export KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION:-1}"
+export KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP:-Wed Mar 12 07:40:57 UTC 2025}"
+export KBUILD_BUILD_UTS_VERSION="${KBUILD_BUILD_UTS_VERSION:-#$KBUILD_BUILD_VERSION SMP PREEMPT $KBUILD_BUILD_TIMESTAMP f2fs-hash:6ee821ead5}"
+export KBUILD_BUILD_COMPILER="${KBUILD_BUILD_COMPILER:-Android (6877366 based on r383902b1) clang version 11.0.2 (https://android.googlesource.com/toolchain/llvm-project b397f81060ce6d701042b782172ed13bee898b79), LLD 11.0.2 (https://android.googlesource.com/toolchain/llvm-project b397f81060ce6d701042b782172ed13bee898b79)}"
+export TZ=UTC LC_ALL=C
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u -d "$KBUILD_BUILD_TIMESTAMP" +%s)}"
+
+# Use the same Android Clang/LLD release as the reference image. A different
+# installation location can be supplied with TOOLCHAIN_DIR.
+TOOLCHAIN_DIR="${TOOLCHAIN_DIR:-$(dirname "$ROOT_DIR")/toolchains/clang-r383902b1}"
+if [[ ! -x "$TOOLCHAIN_DIR/bin/clang" || ! -x "$TOOLCHAIN_DIR/bin/ld.lld" ]]; then
+  echo "ERROR: Android Clang toolchain not found at $TOOLCHAIN_DIR" >&2
+  echo "Set TOOLCHAIN_DIR to the clang-r383902b1 installation directory." >&2
+  exit 1
+fi
+export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+export LD_LIBRARY_PATH="$TOOLCHAIN_DIR/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export HOSTCC="${HOSTCC:-gcc}"
+export HOSTCXX="${HOSTCXX:-g++}"
+
 export ARCH=arm64
 export SUBARCH=arm64
 export LLVM=1
@@ -103,6 +129,9 @@ MAKE_ARGS=(
   STRIP="$STRIP"
   READELF="$READELF"
 )
+
+# Keep the reference release independent of the current Git commit.
+MAKE_ARGS+=(KERNELVERSION="$KBUILD_KERNEL_VERSION" LOCALVERSION=)
 
 # Keep host-tool compilation independent from the target compiler sysroot.
 # Pass host compiler settings on make's command line because the kernel
@@ -164,6 +193,8 @@ CONFIG_ARGS=(
   --enable OPLUS_FEATURE_HANS \
   --enable MILLET
 )
+
+CONFIG_ARGS+=(--set-str LOCALVERSION "$KBUILD_LOCALVERSION" --disable LOCALVERSION_AUTO)
 
 if (( MGLRU )); then
   CONFIG_ARGS+=(--enable LRU_GEN_ENABLED)
