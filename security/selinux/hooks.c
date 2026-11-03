@@ -108,9 +108,6 @@ struct selinux_state selinux_state __rticdata;
 #else
 struct selinux_state selinux_state;
 #endif
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_selinux.h>
-#endif
 
 /* SECMARK reference count */
 static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
@@ -279,7 +276,7 @@ static int __inode_security_revalidate(struct inode *inode,
 
 	might_sleep_if(may_sleep);
 
-	if (selinux_state.initialized &&
+	if (selinux_initialized(&selinux_state) &&
 	    isec->initialized != LABEL_INITIALIZED) {
 		if (!may_sleep)
 			return -ECHILD;
@@ -667,7 +664,7 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 
 	mutex_lock(&sbsec->lock);
 
-	if (!selinux_state.initialized) {
+	if (!selinux_initialized(&selinux_state)) {
 		if (!opts) {
 			/* Defer initialization until selinux_complete_init,
 			   after the initial policy is loaded and the security
@@ -938,7 +935,7 @@ static int selinux_sb_clone_mnt_opts(const struct super_block *oldsb,
 	 * if the parent was able to be mounted it clearly had no special lsm
 	 * mount options.  thus we can safely deal with this superblock later
 	 */
-	if (!selinux_state.initialized)
+	if (!selinux_initialized(&selinux_state))
 		return 0;
 
 	/*
@@ -1121,7 +1118,7 @@ static int selinux_sb_show_options(struct seq_file *m, struct super_block *sb)
 	if (!(sbsec->flags & SE_SBINITIALIZED))
 		return 0;
 
-	if (!selinux_state.initialized)
+	if (!selinux_initialized(&selinux_state))
 		return 0;
 
 	if (sbsec->flags & FSCONTEXT_MNT) {
@@ -1548,7 +1545,9 @@ static int inode_doinit_with_dentry(struct inode *inode, struct dentry *opt_dent
 		/* Default to the fs superblock SID. */
 		sid = sbsec->sid;
 
-		if ((sbsec->flags & SE_SBGENFS) && !S_ISLNK(inode->i_mode)) {
+		if ((sbsec->flags & SE_SBGENFS) &&
+		     (!S_ISLNK(inode->i_mode) ||
+		      selinux_policycap_genfs_seclabel_symlinks())) {
 			/* We must have a dentry to determine the label on
 			 * procfs inodes */
 			if (opt_dentry) {
@@ -2954,7 +2953,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 		isec->initialized = LABEL_INITIALIZED;
 	}
 
-	if (!selinux_state.initialized || !(sbsec->flags & SBLABEL_MNT))
+	if (!selinux_initialized(&selinux_state) || !(sbsec->flags & SBLABEL_MNT))
 		return -EOPNOTSUPP;
 
 	if (name)
@@ -2981,7 +2980,7 @@ static int selinux_inode_init_security_anon(struct inode *inode,
 	struct inode_security_struct *isec;
 	int rc;
 
-	if (unlikely(!selinux_state.initialized))
+	if (unlikely(!selinux_initialized(&selinux_state)))
 		return 0;
 
 	isec = selinux_inode(inode);
@@ -3233,7 +3232,7 @@ static int selinux_inode_setxattr(struct dentry *dentry, const char *name,
 		return dentry_has_perm(current_cred(), dentry, FILE__SETATTR);
 	}
 
-	if (!selinux_state.initialized)
+	if (!selinux_initialized(&selinux_state))
 		return (inode_owner_or_capable(inode) ? 0 : -EPERM);
 
 	sbsec = inode->i_sb->s_security;
@@ -3319,7 +3318,7 @@ static void selinux_inode_post_setxattr(struct dentry *dentry, const char *name,
 		return;
 	}
 
-	if (!selinux_state.initialized) {
+	if (!selinux_initialized(&selinux_state)) {
 		/* If we haven't even been initialized, then we can't validate
 		 * against a policy, so leave the label as invalid. It may
 		 * resolve to a valid label on the next revalidation try if
@@ -3727,6 +3726,12 @@ static int selinux_file_ioctl(struct file *file, unsigned int cmd,
 					    CAP_OPT_NONE, true);
 		break;
 
+	case FIOCLEX:
+	case FIONCLEX:
+		if (!selinux_policycap_ioctl_skip_cloexec())
+			error = ioctl_has_perm(cred, file, FILE__IOCTL, (u16) cmd);
+		break;
+
 	/* default case assumes that the command will go
 	 * to the file's ioctl() function.
 	 */
@@ -3833,7 +3838,7 @@ static int selinux_mmap_file(struct file *file, unsigned long reqprot,
 			return rc;
 	}
 
-	if (selinux_state.checkreqprot)
+	if (checkreqprot_get(&selinux_state))
 		prot = reqprot;
 
 	return file_map_prot_check(file, prot,
@@ -3847,7 +3852,7 @@ static int selinux_file_mprotect(struct vm_area_struct *vma,
 	const struct cred *cred = current_cred();
 	u32 sid = cred_sid(cred);
 
-	if (selinux_state.checkreqprot)
+	if (checkreqprot_get(&selinux_state))
 		prot = reqprot;
 
 	if (default_noexec &&
@@ -6471,10 +6476,6 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
 	u32 mysid = current_sid(), sid = 0, ptsid;
 	int error;
 	char *str = value;
-#ifdef CONFIG_KSU_SUSFS
-	bool should_check_current = !strcmp(name, "current") &&
-		current_uid().val >= 10000 && READ_ONCE(ksu_selinux_hide_running);
-#endif
 
 	/*
 	 * Basic control over ability to set these attributes at all.
@@ -6510,19 +6511,7 @@ static int selinux_setprocattr(const char *name, void *value, size_t size)
 			str[size-1] = 0;
 			size--;
 		}
-#ifdef CONFIG_KSU_SUSFS
-		if (should_check_current) {
-			u32 hidden_sid = 0;
-			int hidden_error;
-
-			/* Parse both policies once, retaining the live SID and error. */
-			hidden_error = ksu_susfs_context_to_sid(value, size,
-					&hidden_sid, &sid, &error);
-			if (hidden_error || error)
-				return hidden_error ?: error;
-		} else
-#endif
-			error = security_context_to_sid(&selinux_state, value, size,
+		error = security_context_to_sid(&selinux_state, value, size,
 						&sid, GFP_KERNEL);
 		if (error == -EINVAL && !strcmp(name, "fscreate")) {
 			if (!has_cap_mac_admin(true)) {
@@ -7282,8 +7271,9 @@ static __init int selinux_init(void)
 
 	memset(&selinux_state, 0, sizeof(selinux_state));
 	enforcing_set(&selinux_state, selinux_enforcing_boot);
-	selinux_state.checkreqprot = selinux_checkreqprot_boot;
-	selinux_ss_init(&selinux_state.ss);
+	checkreqprot_set(&selinux_state, selinux_checkreqprot_boot);
+	mutex_init(&selinux_state.status_lock);
+	mutex_init(&selinux_state.policy_mutex);
 	selinux_avc_init(&selinux_state.avc);
 
 	/* Set the security state for the initial task. */
@@ -7438,7 +7428,7 @@ static void selinux_nf_ip_exit(void)
 #ifdef CONFIG_SECURITY_SELINUX_DISABLE
 int selinux_disable(struct selinux_state *state)
 {
-	if (state->initialized) {
+	if (selinux_initialized(state)) {
 		/* Not permitted after initial policy load. */
 		return -EINVAL;
 	}

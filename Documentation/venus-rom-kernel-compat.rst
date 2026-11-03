@@ -76,9 +76,10 @@ reports actual progress. ZRAM writeback/readback pins live backing blocks;
 the zram-control ABI validates extent maps and uses real software AES-XTS or
 inline encryption. SmartCache tags real inodes, charges/migrates file pages
 with native memcg accounting, and uses bounded, reclaimable protection.
-The options default off in Kconfig. ROM_COMPAT=1 enables their complete core
-backends in build_venus.sh; it does not enable the incompatible old MIMD HAL
-to consume the new event FIFO. See the per-feature ABI/admin documentation.
+The options default off in Kconfig, while build_venus.sh defaults ROM_COMPAT
+to 1 and enables their complete core backends. This does not enable the
+incompatible old MIMD HAL to consume the new event FIFO. See the per-feature
+ABI/admin documentation.
 
 SELinux policy export
 ---------------------
@@ -104,9 +105,10 @@ The launcher validates and prepares real v1 memory cgroups before exec, using
 write-only process_fg and read-only metadata opens for event attributes.
 It does not read/consume events or trigger IN_CLOSE_WRITE during preparation.
 
-ROM_COMPAT=1 MIMD_V2=0 builds the core image; ROM_COMPAT=1 MIMD_V2=1 enables
-the complete MIMD backend. The latter must be paired with the complete
-core-plus-MIMD companion, which already contains the core ROM changes.
+build_venus.sh defaults to ROM_COMPAT=1 MIMD_V2=1, enabling the complete core
+and MIMD backends. This image must be paired with the complete core-plus-MIMD
+companion, which already contains the core ROM changes. MIMD_V2=0 builds the
+core image only; ROM_COMPAT=0 MIMD_V2=0 disables both optional backends.
 Both profiles passed fresh complete ARM64 Image.gz builds on 2026-11-02.
 The new daemon's real-device linker resolution passed without executing
 constructors/main; startup, Binder registration, reclaim and stability in

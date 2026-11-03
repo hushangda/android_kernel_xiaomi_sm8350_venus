@@ -32,9 +32,6 @@
 #include <linux/ima.h>
 #include <linux/dnotify.h>
 #include <linux/compat.h>
-#ifdef CONFIG_KSU_SUSFS
-#include <linux/susfs_def.h>
-#endif
 
 #include "internal.h"
 
@@ -343,14 +340,6 @@ SYSCALL_DEFINE4(fallocate, int, fd, int, mode, loff_t, offset, loff_t, len)
 	return ksys_fallocate(fd, mode, offset, len);
 }
 
-#ifdef CONFIG_KSU_SUSFS
-extern struct static_key_true ksu_su_compat_enabled;
-extern bool __ksu_is_allow_uid_for_current(uid_t uid);
-extern int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *flags);
-#elif defined(CONFIG_KSU)
-extern int ksu_handle_faccessat(int *dfd, const char __user **filename, int *mode, int *flags);
-#endif
-
 /*
  * access() needs to use the real uid/gid, not the effective uid/gid.
  * We do this by temporarily clearing all FS-related capabilities and
@@ -440,12 +429,6 @@ long do_faccessat(int dfd, const char __user *filename, int mode, int flags)
 	unsigned int lookup_flags = LOOKUP_FOLLOW;
 	const struct cred *old_cred = NULL;
 
-#ifdef CONFIG_KSU_SUSFS
-	struct filename *fname;
-#elif defined(CONFIG_KSU)
-	ksu_handle_faccessat(&dfd, &filename, &mode, &flags);
-#endif
-
 	if (mode & ~S_IRWXO)
 		return -EINVAL;
 	if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
@@ -461,23 +444,7 @@ long do_faccessat(int dfd, const char __user *filename, int mode, int flags)
 			return -ENOMEM;
 	}
 retry:
-#ifdef CONFIG_KSU_SUSFS
-	fname = getname_flags(filename, lookup_flags, NULL);
-
-	if (likely(susfs_is_current_proc_no_su()))
-		goto orig_flow;
-
-	if (static_branch_likely(&ksu_su_compat_enabled)) {
-		if (unlikely(__ksu_is_allow_uid_for_current(current_uid().val)))
-			ksu_handle_faccessat(&dfd, &fname, &mode, NULL);
-	}
-
-orig_flow:
-	res = filename_lookup(dfd, fname, lookup_flags, &path, NULL);
-	// no putname(fname) here as filename_lookup() has it done for us already;
-#else
 	res = user_path_at(dfd, filename, lookup_flags, &path);
-#endif
 	if (res)
 		goto out;
 

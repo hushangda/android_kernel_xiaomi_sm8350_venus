@@ -120,6 +120,12 @@ long __probe_kernel_write(void *dst, const void *src, size_t size)
 }
 EXPORT_SYMBOL_GPL(probe_kernel_write);
 
+long copy_to_kernel_nofault(void *dst, const void *src, size_t size)
+{
+	return probe_kernel_write(dst, src, size);
+}
+EXPORT_SYMBOL_GPL(copy_to_kernel_nofault);
+
 /**
  * probe_user_write(): safely attempt to write to a user-space location
  * @dst: address to write to
@@ -146,6 +152,19 @@ long __probe_user_write(void __user *dst, const void *src, size_t size)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(probe_user_write);
+
+/* The nofault API preserves the 5.4 USER_DS and pagefault-disable checks. */
+long copy_from_user_nofault(void *dst, const void __user *src, size_t size)
+{
+	return probe_user_read(dst, src, size);
+}
+EXPORT_SYMBOL_GPL(copy_from_user_nofault);
+
+long copy_to_user_nofault(void __user *dst, const void *src, size_t size)
+{
+	return probe_user_write(dst, src, size);
+}
+EXPORT_SYMBOL_GPL(copy_to_user_nofault);
 
 /**
  * strncpy_from_unsafe: - Copy a NUL terminated string from unsafe address.
@@ -259,3 +278,10 @@ long strnlen_unsafe_user(const void __user *unsafe_addr, long count)
 
 	return ret;
 }
+
+/* Like the upstream nofault API, the result includes the terminating NUL. */
+long strncpy_from_user_nofault(char *dst, const void __user *src, long count)
+{
+	return strncpy_from_unsafe_user(dst, src, count);
+}
+EXPORT_SYMBOL_GPL(strncpy_from_user_nofault);

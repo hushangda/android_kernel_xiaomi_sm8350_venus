@@ -7,9 +7,10 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/errno.h>
+#include <linux/slab.h>
 #include "symtab.h"
 
-static unsigned int symhash(struct hashtab *h, const void *key)
+static unsigned int symhash(const void *key)
 {
 	const char *p, *keyp;
 	unsigned int size;
@@ -20,10 +21,10 @@ static unsigned int symhash(struct hashtab *h, const void *key)
 	size = strlen(keyp);
 	for (p = keyp; (p - keyp) < size; p++)
 		val = (val << 4 | (val >> (8*sizeof(unsigned int)-4))) ^ (*p);
-	return val & (h->size - 1);
+	return val;
 }
 
-static int symcmp(struct hashtab *h, const void *key1, const void *key2)
+static int symcmp(const void *key1, const void *key2)
 {
 	const char *keyp1, *keyp2;
 
@@ -32,13 +33,42 @@ static int symcmp(struct hashtab *h, const void *key1, const void *key2)
 	return strcmp(keyp1, keyp2);
 }
 
+static const struct hashtab_key_params symtab_key_params = {
+	.hash = symhash,
+	.cmp = symcmp,
+};
 
 int symtab_init(struct symtab *s, unsigned int size)
 {
-	s->table = hashtab_create(symhash, symcmp, size);
+	int rc;
+
+	s->nprim = 0;
+	s->table = kzalloc(sizeof(*s->table), GFP_KERNEL);
 	if (!s->table)
 		return -ENOMEM;
-	s->nprim = 0;
+	rc = hashtab_init(s->table, size);
+	if (rc) {
+		kfree(s->table);
+		s->table = NULL;
+		return rc;
+	}
+	s->table->key_params = symtab_key_params;
 	return 0;
 }
 
+int symtab_insert(struct symtab *s, char *name, void *datum)
+{
+	return hashtab_insert(s->table, name, datum, symtab_key_params);
+}
+
+void *symtab_search(struct symtab *s, const char *name)
+{
+	return hashtab_search(s->table, name, symtab_key_params);
+}
+
+void symtab_destroy(struct symtab *s)
+{
+	hashtab_destroy(s->table);
+	kfree(s->table);
+	s->table = NULL;
+}

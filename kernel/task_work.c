@@ -9,7 +9,7 @@ static struct callback_head work_exited; /* all we need is ->next == NULL */
  * task_work_add - ask the @task to execute @work->func()
  * @task: the task which should run the callback
  * @work: the callback to run
- * @notify: send the notification if true
+ * @notify: TWA_RESUME to notify on return to user mode, or TWA_NONE
  *
  * Queue @work for task_work_run() below and notify the @task if @notify.
  * Fails if the @task is exiting/exited and thus it can't process this @work.
@@ -25,7 +25,8 @@ static struct callback_head work_exited; /* all we need is ->next == NULL */
  * 0 if succeeds or -ESRCH.
  */
 int
-task_work_add(struct task_struct *task, struct callback_head *work, bool notify)
+task_work_add(struct task_struct *task, struct callback_head *work,
+	      enum task_work_notify_mode notify)
 {
 	struct callback_head *head;
 
@@ -36,7 +37,7 @@ task_work_add(struct task_struct *task, struct callback_head *work, bool notify)
 		work->next = head;
 	} while (cmpxchg(&task->task_works, head, work) != head);
 
-	if (notify)
+	if (notify == TWA_RESUME)
 		set_notify_resume(task);
 	return 0;
 }

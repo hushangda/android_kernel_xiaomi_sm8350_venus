@@ -63,6 +63,7 @@ struct module;
  * @max_cycles:		maximum safe cycle value which won't overflow on multiplication
  * @flags:		flags describing special properties
  * @archdata:		arch-specific data
+ * @vdso_clock_mode:	clock mode used by the generic vDSO
  * @suspend:		suspend function for the clocksource, if necessary
  * @resume:		resume function for the clocksource, if necessary
  * @mark_unstable:	Optional function to inform the clocksource driver that
@@ -89,6 +90,7 @@ struct clocksource {
 #ifdef CONFIG_ARCH_CLOCKSOURCE_DATA
 	struct arch_clocksource_data archdata;
 #endif
+	enum vdso_clock_mode vdso_clock_mode;
 	u64 max_cycles;
 	const char *name;
 	struct list_head list;

@@ -318,6 +318,10 @@ extern long probe_kernel_read(void *dst, const void *src, size_t size);
 extern long __probe_kernel_read(void *dst, const void *src, size_t size);
 
 long copy_from_kernel_nofault(void *dst, const void *src, size_t size);
+long copy_to_kernel_nofault(void *dst, const void *src, size_t size);
+long copy_from_user_nofault(void *dst, const void __user *src, size_t size);
+long copy_to_user_nofault(void __user *dst, const void *src, size_t size);
+long strncpy_from_user_nofault(char *dst, const void __user *src, long count);
 
 /*
  * probe_user_read(): safely attempt to read from a location in user space

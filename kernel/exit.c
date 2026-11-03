@@ -12,6 +12,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/stat.h>
 #include <linux/sched/task.h>
+#include <linux/seccomp.h>
 #include <linux/sched/task_stack.h>
 #include <linux/sched/cputime.h>
 #include <linux/interrupt.h>
@@ -274,6 +275,7 @@ repeat:
 	}
 
 	write_unlock_irq(&tasklist_lock);
+	seccomp_filter_release(p);
 	release_thread(p);
 	put_task_struct_rcu_user(p);
 

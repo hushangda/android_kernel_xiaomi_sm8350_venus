@@ -18,6 +18,10 @@ struct symtab {
 };
 
 int symtab_init(struct symtab *s, unsigned int size);
+void symtab_destroy(struct symtab *s);
+
+int symtab_insert(struct symtab *s, char *name, void *datum);
+void *symtab_search(struct symtab *s, const char *name);
 
 #endif	/* _SS_SYMTAB_H_ */
 

@@ -417,6 +417,8 @@ static inline pmd_t pmd_mkdevmap(pmd_t pmd)
 #define set_pmd_at(mm, addr, pmdp, pmd)	set_pte_at(mm, addr, (pte_t *)pmdp, pmd_pte(pmd))
 
 #define __pgd_to_phys(pgd)	__pte_to_phys(pgd_pte(pgd))
+/* arm64's 5level-fixup aliases p4d_t to pgd_t on this kernel. */
+#define __p4d_to_phys(p4d)	__pgd_to_phys(p4d)
 #define __phys_to_pgd_val(phys)	__phys_to_pte_val(phys)
 
 #define __pgprot_modify(prot,mask,bits) \

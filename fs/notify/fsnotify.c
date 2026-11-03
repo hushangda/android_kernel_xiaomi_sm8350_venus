@@ -231,8 +231,29 @@ static int send_to_group(struct inode *to_tell,
 	if (!(test_mask & marks_mask & ~marks_ignored_mask))
 		return 0;
 
-	return group->ops->handle_event(group, to_tell, mask, data, data_is,
-					file_name, cookie, iter_info);
+	if (group->ops->handle_event)
+		return group->ops->handle_event(group, to_tell, mask, data, data_is,
+						file_name, cookie, iter_info);
+
+	/* The older fsnotify core reports parent and child marks separately. */
+	mark = fsnotify_iter_inode_mark(iter_info);
+	if (WARN_ON_ONCE(!group->ops->handle_inode_event || !mark) ||
+	    WARN_ON_ONCE(fsnotify_iter_sb_mark(iter_info)) ||
+	    WARN_ON_ONCE(fsnotify_iter_vfsmount_mark(iter_info)))
+		return 0;
+
+	if (data_is == FSNOTIFY_EVENT_PATH && (mark->mask & FS_EXCL_UNLINK) &&
+	    d_unlinked(((const struct path *)data)->dentry))
+		return 0;
+
+	if (data_is == FSNOTIFY_EVENT_PATH)
+		data = d_inode(((const struct path *)data)->dentry);
+	else if (data_is != FSNOTIFY_EVENT_INODE)
+		data = NULL;
+
+	return group->ops->handle_inode_event(mark, mask, (struct inode *)data,
+					     file_name ? to_tell : NULL,
+					     file_name, cookie);
 }
 
 static struct fsnotify_mark *fsnotify_first_mark(struct fsnotify_mark_connector **connp)

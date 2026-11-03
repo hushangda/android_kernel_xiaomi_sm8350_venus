@@ -280,7 +280,7 @@ static void vdso_write_end(struct vdso_data *vdata)
 static bool tk_clock_mode_is_archtimer(const struct timekeeper *tk)
 {
 	return
-	(tk->tkr_mono.clock->archdata.clock_mode == VDSO_CLOCKMODE_ARCHTIMER);
+	(tk->tkr_mono.clock->vdso_clock_mode == VDSO_CLOCKMODE_ARCHTIMER);
 }
 #else
 static bool tk_clock_mode_is_archtimer(const struct timekeeper *tk)

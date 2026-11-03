@@ -115,4 +115,11 @@ extern unsigned int sysctl_mount_max;
 
 extern bool path_is_mountpoint(const struct path *path);
 
+/* Borrows path; the caller retains its dentry and mount references. */
+extern int path_mount(const char *dev_name, struct path *path,
+		      const char *type_page, unsigned long flags, void *data_page);
+
+/* Consumes the dentry and mount references in path, even on failure. */
+extern int path_umount(struct path *path, int flags);
+
 #endif /* _LINUX_MOUNT_H */

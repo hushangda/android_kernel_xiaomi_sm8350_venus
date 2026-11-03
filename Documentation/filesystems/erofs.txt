@@ -86,8 +86,8 @@ Both CONFIG_EROFS_FS_PCPU_KTHREAD and CONFIG_EROFS_FS_PCPU_KTHREAD_HIPRI default
 to disabled. The latter selects SCHED_FIFO priority 1; without it the workers
 use the normal scheduling policy. Measure compressed cold reads, application
 startup, CPU hotplug under load, and power before enabling high priority.
-The Venus build script keeps per-CPU workers disabled by default; building with
-EROFS_PCPU=1 enables them at normal priority while keeping HIPRI disabled.
+The Venus build script enables per-CPU workers at normal priority by default
+while keeping HIPRI disabled. EROFS_PCPU=0 selects the workqueue path instead.
 
 On-disk details
 ===============

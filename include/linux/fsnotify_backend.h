@@ -107,6 +107,9 @@ struct mem_cgroup;
  * these operations for each relevant group.
  *
  * handle_event - main call for a group to handle an fs event
+ * handle_inode_event - alternative callback for groups with inode marks only;
+ *		@inode is the affected inode, @dir is the directory relative to
+ *		@file_name, and @cookie is the inotify rename cookie.
  * free_group_priv - called when a group refcnt hits 0 to clean up the private union
  * freeing_mark - called when a mark is being destroyed for some reason.  The group
  * 		MUST be holding a reference on each mark and that reference must be
@@ -119,6 +122,9 @@ struct fsnotify_ops {
 			    u32 mask, const void *data, int data_type,
 			    const struct qstr *file_name, u32 cookie,
 			    struct fsnotify_iter_info *iter_info);
+	int (*handle_inode_event)(struct fsnotify_mark *mark, u32 mask,
+				  struct inode *inode, struct inode *dir,
+				  const struct qstr *file_name, u32 cookie);
 	void (*free_group_priv)(struct fsnotify_group *group);
 	void (*freeing_mark)(struct fsnotify_mark *mark, struct fsnotify_group *group);
 	void (*free_event)(struct fsnotify_event *event);

@@ -22,9 +22,9 @@ else
   echo "ERROR: MGLRU must be 1 or 0" >&2
   exit 1
 fi
-# Keep the established EROFS workqueue path as the default until device testing.
-# EROFS_PCPU=1 enables the optional per-CPU workers at normal priority.
-EROFS_PCPU="${EROFS_PCPU:-0}"
+# Enable EROFS per-CPU workers at normal priority by default.
+# EROFS_PCPU=0 selects the established workqueue path.
+EROFS_PCPU="${EROFS_PCPU:-1}"
 if [[ "$EROFS_PCPU" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
   EROFS_PCPU=1
 elif [[ "$EROFS_PCPU" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
@@ -36,7 +36,7 @@ fi
 # Complete native backends for the newer ROM ABI. The matching xr_fbt node
 # label/permissions and thermal producer belong in the companion ROM package.
 # MIMD v2 transport remains separate: the installed legacy HAL cannot parse it.
-ROM_COMPAT="${ROM_COMPAT:-0}"
+ROM_COMPAT="${ROM_COMPAT:-1}"
 if [[ "$ROM_COMPAT" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
   ROM_COMPAT=1
 elif [[ "$ROM_COMPAT" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
@@ -45,7 +45,7 @@ else
   echo "ERROR: ROM_COMPAT must be 1 or 0" >&2
   exit 1
 fi
-MIMD_V2="${MIMD_V2:-0}"
+MIMD_V2="${MIMD_V2:-1}"
 if [[ "$MIMD_V2" =~ ^(1|y|Y|yes|YES|true|TRUE|on|ON)$ ]]; then
   MIMD_V2=1
 elif [[ "$MIMD_V2" =~ ^(0|n|N|no|NO|false|FALSE|off|OFF)$ ]]; then
@@ -110,9 +110,6 @@ export OBJCOPY=llvm-objcopy
 export OBJDUMP=llvm-objdump
 export STRIP=llvm-strip
 export READELF=llvm-readelf
-# ReSukiSU multi-manager mode works through APK signature matching. Do not pass
-# KSU_MANAGER_PACKAGE, or the kernel filters managers by one package name first.
-unset KSU_MANAGER_PACKAGE
 
 MAKE_ARGS=(
   O="$OUT_DIR"
@@ -168,23 +165,14 @@ CONFIG_ARGS=(
   --enable F2FS_FS_ZSTD \
   --enable F2FS_UNFAIR_RWSEM \
   --enable F2FS_CP_OPT \
+  --enable KPROBES \
+  --enable EXT4_FS \
+  --enable HEADERS_INSTALL \
   --enable KSU \
-  --set-str KSU_FULL_NAME_FORMAT "%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%" \
-  --enable KSU_MULTI_MANAGER_SUPPORT \
-  --disable KSU_SUKISU_420_COMPAT \
-  --enable KSU_SUKISU_UAPI5_COMPAT \
-  --disable KSU_TRACEPOINT_HOOK \
-  --disable KSU_MANUAL_HOOK \
-  --enable KSU_SUSFS \
-  --enable KSU_SUSFS_SUS_PATH \
-  --enable KSU_SUSFS_SUS_MOUNT \
-  --enable KSU_SUSFS_SUS_KSTAT \
-  --enable KSU_SUSFS_SPOOF_UNAME \
-  --enable KSU_SUSFS_ENABLE_LOG \
-  --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
-  --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
-  --enable KSU_SUSFS_OPEN_REDIRECT \
-  --enable KSU_SUSFS_SUS_MAP \
+  --enable KSU_MANUAL_SU \
+  --disable KSU_DEBUG \
+  --disable KSU_DISABLE_MANAGER \
+  --disable KSU_DISABLE_POLICY \
   --enable KALLSYMS \
   --enable KALLSYMS_ALL \
   --enable BPF_STREAM_PARSER \
@@ -220,19 +208,6 @@ if (( MIMD_V2 )); then
     --enable XIAOMI_MIMD_TRIGGER --enable XIAOMI_MIMD_RECLAIM)
 fi
 
-HAS_KPM=0
-HAS_RECOVERY_GUARD=0
-if grep -q '^config KPM$' "$ROOT_DIR/KernelSU/kernel/Kconfig"; then
-  HAS_KPM=1
-elif (( KPM )); then
-  echo "ERROR: this ReSukiSU version has removed KPM support" >&2
-  exit 1
-fi
-if grep -q '^config KSU_DISABLE_IN_RECOVERY$' "$ROOT_DIR/KernelSU/kernel/Kconfig"; then
-  HAS_RECOVERY_GUARD=1
-  CONFIG_ARGS+=(--enable KSU_DISABLE_IN_RECOVERY)
-fi
-
 if (( KPM )); then
   CONFIG_ARGS+=(--enable KPM)
 else
@@ -258,7 +233,7 @@ if (( MIMD_V2 )); then
     }
   done
 fi
-# Verify the opt-in survived dependency resolution; never select FIFO workers.
+# Verify the requested workers survived dependency resolution; never select FIFO.
 if (( EROFS_PCPU )); then
   grep -Fxq 'CONFIG_EROFS_FS_PCPU_KTHREAD=y' "$OUT_DIR/.config" || {
     echo "ERROR: EROFS per-CPU workers were requested but are unavailable" >&2
@@ -330,55 +305,38 @@ grep -q '^# CONFIG_LRU_GEN_STATS is not set$' "$OUT_DIR/.config" || {
   echo "ERROR: CONFIG_LRU_GEN_STATS must stay disabled for production builds" >&2
   exit 1
 }
+# main registers probes and syscall tracepoints itself; no legacy inline hooks.
 for required_config in \
   'CONFIG_KSU=y' \
-  'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y' \
-  'CONFIG_KSU_SUKISU_UAPI5_COMPAT=y' \
-  'CONFIG_KSU_SUSFS=y' \
-  'CONFIG_KSU_SUSFS_SUS_PATH=y' \
-  'CONFIG_KSU_SUSFS_SUS_MOUNT=y' \
-  'CONFIG_KSU_SUSFS_SUS_KSTAT=y' \
-  'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' \
-  'CONFIG_KSU_SUSFS_ENABLE_LOG=y' \
-  'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' \
-  'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y' \
-  'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' \
-  'CONFIG_KSU_SUSFS_SUS_MAP=y'; do
-  grep -q "^$required_config$" "$OUT_DIR/.config" || {
-    echo "ERROR: missing $required_config" >&2
+  'CONFIG_KSU_MANUAL_SU=y' \
+  'CONFIG_KPROBES=y' \
+  'CONFIG_KRETPROBES=y' \
+  'CONFIG_HAVE_SYSCALL_TRACEPOINTS=y' \
+  'CONFIG_TRACEPOINTS=y' \
+  'CONFIG_EXT4_FS=y' \
+  'CONFIG_HEADERS_INSTALL=y' \
+  '# CONFIG_KSU_DISABLE_MANAGER is not set' \
+  '# CONFIG_KSU_DISABLE_POLICY is not set'; do
+  grep -Fxq "$required_config" "$OUT_DIR/.config" || {
+    echo "ERROR: SukiSU Ultra main requires $required_config" >&2
     exit 1
   }
 done
-grep -Fxq '# CONFIG_KSU_SUKISU_420_COMPAT is not set' "$OUT_DIR/.config" || {
-  echo "ERROR: legacy SukiSU UAPI 2 mode must be disabled" >&2
-  exit 1
-}
-grep -q '^# CONFIG_KSU_TRACEPOINT_HOOK is not set$' "$OUT_DIR/.config" || {
-  echo "ERROR: CONFIG_KSU_TRACEPOINT_HOOK must be disabled for this 5.4 tree" >&2
-  exit 1
-}
-grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set$' "$OUT_DIR/.config" || {
-  echo "ERROR: CONFIG_KSU_MANUAL_HOOK must be disabled for ReSukiSU SuSFS inline mode" >&2
-  exit 1
-}
 if (( KPM )); then
-  grep -q '^CONFIG_KPM=y$' "$OUT_DIR/.config" || {
+  grep -Fxq 'CONFIG_KPM=y' "$OUT_DIR/.config" || {
     echo "ERROR: CONFIG_KPM is not enabled" >&2
     exit 1
   }
-elif (( HAS_KPM )); then
-  grep -q '^# CONFIG_KPM is not set$' "$OUT_DIR/.config" || {
+else
+  grep -Fxq '# CONFIG_KPM is not set' "$OUT_DIR/.config" || {
     echo "ERROR: CONFIG_KPM must be disabled for this build" >&2
     exit 1
   }
 fi
 
-if (( HAS_RECOVERY_GUARD )); then
-  grep -Fxq 'CONFIG_KSU_DISABLE_IN_RECOVERY=y' "$OUT_DIR/.config" || {
-    echo "ERROR: recovery guard was requested but is not enabled" >&2
-    exit 1
-  }
-fi
+# Install UAPI headers before Kbuild is parsed so the preinit runner is included
+# on the first build as well as subsequent incremental builds.
+make "${MAKE_ARGS[@]}" headers_install
 
 rm -f "$OUT_DIR/kernel/config_data" \
       "$OUT_DIR/kernel/config_data.gz" \
@@ -386,10 +344,15 @@ rm -f "$OUT_DIR/kernel/config_data" \
       "$OUT_DIR/kernel/.configs.o.cmd"
 make -j"$JOBS" "${MAKE_ARGS[@]}" Image Image.gz dtbs
 
-if grep -aq 'com\.resukisu\.resukisu' "$OUT_DIR/vmlinux"; then
-  echo "ERROR: manager package restriction is still embedded in vmlinux" >&2
-  exit 1
-fi
+# These exact names are resolved by main's runtime probe registrations.
+for ksu_symbol in syscall_regfunc syscall_unregfunc input_event \
+  __arm64_sys_reboot __arm64_sys_ni_syscall sys_call_table security_hook_heads; do
+  awk -v symbol="$ksu_symbol" '$3 == symbol { found = 1 } END { exit !found }' \
+    "$OUT_DIR/System.map" || {
+    echo "ERROR: missing SukiSU runtime hook target $ksu_symbol" >&2
+    exit 1
+  }
+done
 
 if [[ -x "$ROOT_DIR/scripts/extract-ikconfig" ]]; then
   EMBEDDED_CONFIG="$OUT_DIR/.config.embedded"
@@ -429,9 +392,7 @@ EOF
   echo "TWRP prebuilt kernel updated: $TWRP_DEVICE_DIR/prebuilt/venus/kernel"
 fi
 
-echo "KSU manager package restriction: disabled"
-echo "ReSukiSU multi-manager support: enabled"
-echo "ReSukiSU + SuSFS: enabled"
+echo "SukiSU Ultra main: enabled (runtime kprobes + syscall tracepoints)"
 echo "KPM: $([[ "$KPM" == 1 ]] && echo enabled || echo disabled)"
 echo "Multi-Gen LRU: compiled, default $([[ "$MGLRU" == 1 ]] && echo enabled || echo disabled) (MGLRU=$MGLRU)"
 echo "F2FS compression: enabled"
@@ -442,6 +403,5 @@ echo "ZRAM explicit Zstd compression levels: enabled (default compressor unchang
 echo "EROFS per-CPU workers: $([[ "$EROFS_PCPU" == 1 ]] && echo enabled || echo disabled) (normal priority)"
 echo "Native ROM compatibility backends: ROM_COMPAT=$ROM_COMPAT"
 echo "MIMD v2 matched-ROM backends: MIMD_V2=$MIMD_V2"
-echo "Recovery/TWRP custom KSU guard: $([[ "$HAS_RECOVERY_GUARD" == 1 ]] && echo enabled || echo absent-in-upstream)"
 echo "Image (for TWRP prebuilt/venus/kernel): $KERNEL_IMAGE"
 echo "Image.gz: $KERNEL_IMAGE_GZ"

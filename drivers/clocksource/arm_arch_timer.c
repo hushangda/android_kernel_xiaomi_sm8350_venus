@@ -576,11 +576,11 @@ void arch_timer_enable_workaround(const struct arch_timer_erratum_workaround *wa
 	 * change both the default value and the vdso itself.
 	 */
 	if (wa->read_cntvct_el0) {
-		clocksource_counter.archdata.clock_mode = VDSO_CLOCKMODE_NONE;
+		clocksource_counter.vdso_clock_mode = VDSO_CLOCKMODE_NONE;
 		vdso_default = VDSO_CLOCKMODE_NONE;
 	} else if (wa->disable_compat_vdso && vdso_default != VDSO_CLOCKMODE_NONE) {
 		vdso_default = VDSO_CLOCKMODE_ARCHTIMER_NOCOMPAT;
-		clocksource_counter.archdata.clock_mode = vdso_default;
+		clocksource_counter.vdso_clock_mode = vdso_default;
 	}
 }
 
@@ -1024,7 +1024,7 @@ static void __init arch_counter_register(unsigned type)
 		}
 
 		arch_timer_read_counter = rd;
-		clocksource_counter.archdata.clock_mode = vdso_default;
+		clocksource_counter.vdso_clock_mode = vdso_default;
 	} else {
 		arch_timer_read_counter = arch_counter_get_cntvct_mem;
 	}

@@ -1,9 +1,10 @@
 Xiaomi memory policy compatibility on Venus
 ==========================================
 
-This is an opt-in implementation on the native SM8350 VM/ZRAM backend. All new
-Kconfig options default to n. Merely compiling a backend does not turn on its
-worker or configure a backing device. It has not been exercised on the phone.
+This implementation uses the native SM8350 VM/ZRAM backend. Its Kconfig
+options default to n, while build_venus.sh enables them through ROM_COMPAT=1
+by default. Merely compiling a backend does not turn on its worker or
+configure a backing device. It has not been exercised on the phone.
 
 Protocol references
 -------------------

@@ -55,13 +55,13 @@ The regular ``build_venus.sh`` enables the ZRAM interfaces. Existing systems
 retain their compressor parameters unless userspace explicitly sets them.
 No automatic recompression daemon or Android init policy is installed.
 
-EROFS per-CPU workers are opt-in, pending device measurements::
+EROFS per-CPU workers are enabled by default at normal priority. Set
+EROFS_PCPU=0 to use the established workqueue path::
 
-    JOBS=4 OUT_DIR=/absolute/path/to/fresh-output EROFS_PCPU=1 ./build_venus.sh
+    JOBS=4 OUT_DIR=/absolute/path/to/fresh-output EROFS_PCPU=0 ./build_venus.sh
 
-The script always leaves ``EROFS_FS_PCPU_KTHREAD_HIPRI`` disabled. Omitting
-``EROFS_PCPU`` uses the established workqueue path. MGLRU's existing default
-and the KernelSU configuration are preserved.
+The script always leaves ``EROFS_FS_PCPU_KTHREAD_HIPRI`` disabled. MGLRU
+remains compiled but disabled by default, and KernelSU remains enabled.
 
 Host regression checks
 ----------------------

@@ -11,6 +11,7 @@
 
 #ifdef CONFIG_SECCOMP
 
+#include <linux/atomic.h>
 #include <linux/thread_info.h>
 #include <asm/seccomp.h>
 
@@ -20,6 +21,7 @@ struct seccomp_filter;
  *
  * @mode:  indicates one of the valid values above for controlled
  *         system calls available to a process.
+ * @filter_count: number of filters in the attached filter tree.
  * @filter: must always point to a valid seccomp-filter or NULL as it is
  *          accessed without locking during system call entry.
  *
@@ -29,6 +31,7 @@ struct seccomp_filter;
 struct seccomp {
 	int mode;
 	struct seccomp_filter *filter;
+	atomic_t filter_count;
 };
 
 #ifdef CONFIG_HAVE_ARCH_SECCOMP_FILTER
@@ -81,10 +84,10 @@ static inline int seccomp_mode(struct seccomp *s)
 #endif /* CONFIG_SECCOMP */
 
 #ifdef CONFIG_SECCOMP_FILTER
-extern void put_seccomp_filter(struct task_struct *tsk);
+extern void seccomp_filter_release(struct task_struct *tsk);
 extern void get_seccomp_filter(struct task_struct *tsk);
 #else  /* CONFIG_SECCOMP_FILTER */
-static inline void put_seccomp_filter(struct task_struct *tsk)
+static inline void seccomp_filter_release(struct task_struct *tsk)
 {
 	return;
 }
