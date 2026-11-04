@@ -361,9 +361,9 @@ static const struct dma_buf_ops dma_buf_ops = {
 	.get_flags = ion_dma_buf_get_flags,
 };
 
-struct dma_buf *ion_dmabuf_alloc(struct ion_device *dev, size_t len,
-				 unsigned int heap_id_mask,
-				 unsigned int flags)
+struct dma_buf *ion_dmabuf_alloc_flags(struct ion_device *dev, size_t len,
+				     unsigned int heap_id_mask,
+				     unsigned int flags, unsigned int fd_flags)
 {
 	struct ion_buffer *buffer;
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
@@ -384,7 +384,7 @@ struct dma_buf *ion_dmabuf_alloc(struct ion_device *dev, size_t len,
 #endif
 	exp_info.ops = &dma_buf_ops;
 	exp_info.size = buffer->size;
-	exp_info.flags = O_RDWR;
+	exp_info.flags = fd_flags;
 	exp_info.priv = buffer;
 #ifdef CONFIG_MACH_XIAOMI
 	exp_info.exp_name = kasprintf(GFP_KERNEL, "%s-%s-%d-%s", KBUILD_MODNAME,
@@ -400,6 +400,13 @@ struct dma_buf *ion_dmabuf_alloc(struct ion_device *dev, size_t len,
 	}
 
 	return dmabuf;
+}
+
+struct dma_buf *ion_dmabuf_alloc(struct ion_device *dev, size_t len,
+				 unsigned int heap_id_mask,
+				 unsigned int flags)
+{
+	return ion_dmabuf_alloc_flags(dev, len, heap_id_mask, flags, O_RDWR);
 }
 
 #ifdef CONFIG_MACH_XIAOMI

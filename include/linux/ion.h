@@ -317,6 +317,10 @@ void ion_buffer_prep_noncached(struct ion_buffer *buffer);
 struct dma_buf *ion_alloc(size_t len, unsigned int heap_id_mask,
 			  unsigned int flags);
 
+/* DMA-heap clients also specify the DMA-BUF file's access mode. */
+struct dma_buf *ion_alloc_fd_flags(size_t len, unsigned int heap_id_mask,
+				   unsigned int flags, unsigned int fd_flags);
+
 /**
  * ion_free - Releases the ion buffer.
  *

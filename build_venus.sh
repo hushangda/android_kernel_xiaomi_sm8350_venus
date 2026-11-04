@@ -143,6 +143,11 @@ mkdir -p "$OUT_DIR"
 
 make "${MAKE_ARGS[@]}" venus_defconfig
 CONFIG_ARGS=(
+  --enable DMABUF_HEAPS \
+  --enable DMABUF_HEAPS_MSM_ION \
+  --enable NET_CLS_MATCHALL \
+  --enable NET_ACT_POLICE \
+  --enable NET_ACT_BPF \
   --enable VSOCKETS \
   --enable VSOCKETS_DIAG \
   --enable VIRTIO_VSOCKETS \
@@ -247,6 +252,12 @@ fi
 # Check the requested config after Kconfig dependencies have been resolved.
 # PAGE_OWNER must stay disabled because it selects DEBUG_FS.
 for required_config in \
+  'CONFIG_DMABUF_HEAPS=y' \
+  'CONFIG_DMABUF_HEAPS_MSM_ION=y' \
+  'CONFIG_ION_MSM_HEAPS=y' \
+  'CONFIG_NET_CLS_MATCHALL=y' \
+  'CONFIG_NET_ACT_POLICE=y' \
+  'CONFIG_NET_ACT_BPF=y' \
   'CONFIG_MODULES=y' \
   'CONFIG_VSOCKETS=y' \
   'CONFIG_VSOCKETS_DIAG=y' \

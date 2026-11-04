@@ -45,6 +45,9 @@ extern void *ion_buffer_kmap_get(struct ion_buffer *buffer);
 extern void ion_buffer_kmap_put(struct ion_buffer *buffer);
 
 /* ion dmabuf allocator */
+struct dma_buf *ion_dmabuf_alloc_flags(struct ion_device *dev, size_t len,
+				     unsigned int heap_id_mask,
+				     unsigned int flags, unsigned int fd_flags);
 extern struct dma_buf *ion_dmabuf_alloc(struct ion_device *dev, size_t len,
 					unsigned int heap_id_mask,
 					unsigned int flags);

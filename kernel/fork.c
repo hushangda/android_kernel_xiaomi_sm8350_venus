@@ -1928,6 +1928,7 @@ static __latent_entropy struct task_struct *copy_process(
 	struct multiprocess_signals delayed;
 	struct file *pidfile = NULL;
 	u64 clone_flags = args->flags;
+	unsigned int cgroup_kill_seq;
 
 	/*
 	 * Don't allow sharing the root directory with processes in a different
@@ -2249,6 +2250,7 @@ static __latent_entropy struct task_struct *copy_process(
 	p->task_works = NULL;
 
 	cgroup_threadgroup_change_begin(current);
+	cgroup_kill_seq = cgroup_fork_kill_seq();
 	/*
 	 * Ensure that the cgroup subsystem policies allow the new process to be
 	 * forked. It should be noted the the new process's css_set can be changed
@@ -2368,6 +2370,7 @@ static __latent_entropy struct task_struct *copy_process(
 
 	proc_fork_connector(p);
 	cgroup_post_fork(p);
+	cgroup_post_fork_kill(p, cgroup_kill_seq);
 	cgroup_threadgroup_change_end(current);
 	perf_event_fork(p);
 

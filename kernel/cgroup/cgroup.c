@@ -49,6 +49,7 @@
 #include <linux/string.h>
 #include <linux/hashtable.h>
 #include <linux/idr.h>
+#include <linux/xarray.h>
 #include <linux/kthread.h>
 #include <linux/atomic.h>
 #include <linux/cpuset.h>
@@ -3896,6 +3897,121 @@ static ssize_t cgroup_freeze_write(struct kernfs_open_file *of,
 	return nbytes;
 }
 
+/*
+ * Keep kill_seq outside struct cgroup to preserve the vendor module layout.
+ * Entries are allocated before a v2 cgroup becomes visible and removed at
+ * final css release, before its ID can be reused. Fork/kill never allocate.
+ */
+struct cgroup_kill_state {
+	unsigned int seq;
+};
+
+static DEFINE_XARRAY(cgroup_kill_states);
+
+static int cgroup_kill_state_alloc(struct cgroup *cgrp)
+{
+	struct cgroup_kill_state *state;
+	int ret;
+
+	lockdep_assert_held(&cgroup_mutex);
+	if (!cgroup_on_dfl(cgrp))
+		return 0;
+
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+
+	ret = xa_insert(&cgroup_kill_states, cgrp->id, state, GFP_KERNEL);
+	if (ret)
+		kfree(state);
+	return ret;
+}
+
+static void cgroup_kill_state_free(struct cgroup *cgrp)
+{
+	lockdep_assert_held(&cgroup_mutex);
+	if (cgroup_on_dfl(cgrp))
+		kfree(xa_erase(&cgroup_kill_states, cgrp->id));
+}
+
+static unsigned int cgroup_read_kill_seq(struct cgroup *cgrp)
+{
+	struct cgroup_kill_state *state;
+
+	lockdep_assert_held(&css_set_lock);
+	/* The root has no cgroup.kill file and needs no sequence storage. */
+	state = xa_load(&cgroup_kill_states, cgrp->id);
+	return state ? state->seq : 0;
+}
+
+static void __cgroup_kill(struct cgroup *cgrp)
+{
+	struct cgroup_kill_state *state;
+	struct css_task_iter it;
+	struct task_struct *task;
+
+	lockdep_assert_held(&cgroup_mutex);
+
+	spin_lock_irq(&css_set_lock);
+	state = xa_load(&cgroup_kill_states, cgrp->id);
+	if (WARN_ON_ONCE(!state)) {
+		spin_unlock_irq(&css_set_lock);
+		return;
+	}
+	state->seq++;
+	spin_unlock_irq(&css_set_lock);
+
+	/* Live threads still exist when their leader has exited or stayed behind. */
+	css_task_iter_start(&cgrp->self, CSS_TASK_ITER_THREADED, &it);
+	while ((task = css_task_iter_next(&it))) {
+		if (task->flags & PF_KTHREAD)
+			continue;
+		if (__fatal_signal_pending(task))
+			continue;
+
+		/* PIDTYPE_PID avoids killing a migrated group via an exiting task. */
+		send_sig(SIGKILL, task, 0);
+	}
+	css_task_iter_end(&it);
+}
+
+static void cgroup_kill(struct cgroup *cgrp)
+{
+	struct cgroup_subsys_state *css;
+	struct cgroup *dsct;
+
+	lockdep_assert_held(&cgroup_mutex);
+	cgroup_for_each_live_descendant_pre(dsct, css, cgrp)
+		__cgroup_kill(dsct);
+}
+
+static ssize_t cgroup_kill_write(struct kernfs_open_file *of, char *buf,
+				 size_t nbytes, loff_t off)
+{
+	struct cgroup *cgrp;
+	int kill;
+	ssize_t ret;
+
+	ret = kstrtoint(strstrip(buf), 0, &kill);
+	if (ret)
+		return ret;
+	if (kill != 1)
+		return -ERANGE;
+
+	cgrp = cgroup_kn_lock_live(of->kn, false);
+	if (!cgrp)
+		return -ENODEV;
+
+	/* Like cgroup.procs, this operates on whole processes, not threads. */
+	if (cgroup_is_threaded(cgrp))
+		ret = -EOPNOTSUPP;
+	else
+		cgroup_kill(cgrp);
+
+	cgroup_kn_unlock(of->kn);
+	return ret ?: nbytes;
+}
+
 static int cgroup_file_open(struct kernfs_open_file *of)
 {
 	struct cftype *cft = of->kn->priv;
@@ -5135,6 +5251,11 @@ static struct cftype cgroup_base_files[] = {
 		.write = cgroup_freeze_write,
 	},
 	{
+		.name = "cgroup.kill",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.write = cgroup_kill_write,
+	},
+	{
 		.name = "cpu.stat",
 		.flags = CFTYPE_NOT_ON_ROOT,
 		.seq_show = cpu_stat_show,
@@ -5277,6 +5398,7 @@ static void css_release_work_fn(struct work_struct *work)
 			tcgrp->nr_dying_descendants--;
 		spin_unlock_irq(&css_set_lock);
 
+		cgroup_kill_state_free(cgrp);
 		cgroup_idr_remove(&cgrp->root->cgroup_idr, cgrp->id);
 		cgrp->id = -1;
 
@@ -5483,9 +5605,13 @@ static struct cgroup *cgroup_create(struct cgroup *parent)
 	cgrp->root = root;
 	cgrp->level = level;
 
-	ret = psi_cgroup_alloc(cgrp);
+	ret = cgroup_kill_state_alloc(cgrp);
 	if (ret)
 		goto out_idr_free;
+
+	ret = psi_cgroup_alloc(cgrp);
+	if (ret)
+		goto out_kill_free;
 
 	ret = cgroup_bpf_inherit(cgrp);
 	if (ret)
@@ -5557,6 +5683,8 @@ static struct cgroup *cgroup_create(struct cgroup *parent)
 
 out_psi_free:
 	psi_cgroup_free(cgrp);
+out_kill_free:
+	cgroup_kill_state_free(cgrp);
 out_idr_free:
 	cgroup_idr_remove(&root->cgroup_idr, cgrp->id);
 out_stat_exit:
@@ -6178,6 +6306,39 @@ void cgroup_fork(struct task_struct *child)
 {
 	RCU_INIT_POINTER(child->cgroups, &init_css_set);
 	INIT_LIST_HEAD(&child->cg_list);
+}
+
+/*
+ * The caller holds cgroup_threadgroup_rwsem for read through post_fork.
+ * Migration of this parent cannot change its v2 cgroup during that window.
+ * This tree rejects CLONE_INTO_CGROUP, so the child always inherits it.
+ */
+unsigned int cgroup_fork_kill_seq(void)
+{
+	unsigned int seq;
+
+	spin_lock_irq(&css_set_lock);
+	seq = cgroup_read_kill_seq(task_css_set(current)->dfl_cgrp);
+	spin_unlock_irq(&css_set_lock);
+	return seq;
+}
+
+void cgroup_post_fork_kill(struct task_struct *child, unsigned int kill_seq)
+{
+	bool kill = false;
+
+	if (child->flags & PF_KTHREAD)
+		return;
+
+	spin_lock_irq(&css_set_lock);
+	if (use_task_css_set_links)
+		kill = kill_seq !=
+			cgroup_read_kill_seq(task_css_set(child)->dfl_cgrp);
+	spin_unlock_irq(&css_set_lock);
+
+	/* Also catches a sweep completed between the signal check and post_fork. */
+	if (unlikely(kill))
+		do_send_sig_info(SIGKILL, SEND_SIG_NOINFO, child, PIDTYPE_TGID);
 }
 
 /**

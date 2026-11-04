@@ -126,6 +126,8 @@ void cgroup_fork(struct task_struct *p);
 extern int cgroup_can_fork(struct task_struct *p);
 extern void cgroup_cancel_fork(struct task_struct *p);
 extern void cgroup_post_fork(struct task_struct *p);
+unsigned int cgroup_fork_kill_seq(void);
+void cgroup_post_fork_kill(struct task_struct *p, unsigned int kill_seq);
 void cgroup_exit(struct task_struct *p);
 void cgroup_release(struct task_struct *p);
 void cgroup_free(struct task_struct *p);
@@ -733,6 +735,9 @@ static inline void cgroup_fork(struct task_struct *p) {}
 static inline int cgroup_can_fork(struct task_struct *p) { return 0; }
 static inline void cgroup_cancel_fork(struct task_struct *p) {}
 static inline void cgroup_post_fork(struct task_struct *p) {}
+static inline unsigned int cgroup_fork_kill_seq(void) { return 0; }
+static inline void cgroup_post_fork_kill(struct task_struct *p,
+					 unsigned int kill_seq) {}
 static inline void cgroup_exit(struct task_struct *p) {}
 static inline void cgroup_release(struct task_struct *p) {}
 static inline void cgroup_free(struct task_struct *p) {}

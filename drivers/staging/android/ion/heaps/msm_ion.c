@@ -619,8 +619,17 @@ static int msm_ion_probe(struct platform_device *pdev)
 					heap_data->name);
 		}
 
-		ion_device_add_heap(heaps[i]);
+		err = ion_device_add_heap(heaps[i]);
+		if (err) {
+			dev_err(&pdev->dev, "Failed to add ION heap %s: %d\n",
+				heap_data->name, err);
+			continue;
+		}
 		msm_ion_debugfs_create_file(to_msm_ion_heap(heaps[i]));
+		err = msm_ion_register_dma_heaps(heaps[i]);
+		if (err)
+			dev_err(&pdev->dev, "Failed to add DMA-BUF heaps: %d\n",
+				err);
 	}
 	free_pdata(pdata);
 

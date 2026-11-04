@@ -7,6 +7,17 @@
 #ifndef _MSM_ION_PRIV_H
 #define _MSM_ION_PRIV_H
 
+struct ion_heap;
+
+#ifdef CONFIG_DMABUF_HEAPS_MSM_ION
+int msm_ion_register_dma_heaps(struct ion_heap *heap);
+#else
+static inline int msm_ion_register_dma_heaps(struct ion_heap *heap)
+{
+	return 0;
+}
+#endif
+
 #include <linux/device.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-direction.h>

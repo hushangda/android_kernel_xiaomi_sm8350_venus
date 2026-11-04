@@ -39,6 +39,17 @@ struct dma_buf *ion_alloc(size_t len, unsigned int heap_id_mask,
 }
 EXPORT_SYMBOL_GPL(ion_alloc);
 
+struct dma_buf *ion_alloc_fd_flags(size_t len, unsigned int heap_id_mask,
+				   unsigned int flags, unsigned int fd_flags)
+{
+	if (fd_flags & ~(O_CLOEXEC | O_ACCMODE))
+		return ERR_PTR(-EINVAL);
+
+	return ion_dmabuf_alloc_flags(internal_dev, len, heap_id_mask, flags,
+				      fd_flags);
+}
+EXPORT_SYMBOL_GPL(ion_alloc_fd_flags);
+
 int ion_free(struct ion_buffer *buffer)
 {
 	return ion_buffer_destroy(internal_dev, buffer);

@@ -70,4 +70,19 @@ config DMABUF_SELFTESTS
 	default n
 	depends on DMA_SHARED_BUFFER
 
+config DMABUF_HEAPS
+	bool "DMA-BUF userspace allocation heaps"
+	depends on DMA_SHARED_BUFFER
+	help
+	  Provide the upstream DMA_HEAP_IOCTL_ALLOC interface under
+	  /dev/dma_heap. A heap backend must also be enabled.
+
+config DMABUF_HEAPS_MSM_ION
+	bool "Qualcomm ION-backed system DMA-BUF heaps"
+	depends on DMABUF_HEAPS && ION_MSM_HEAPS=y
+	help
+	  Export system and system-uncached heaps using the existing Qualcomm
+	  system allocator and DMA-BUF operations. Keep /dev/ion available for
+	  legacy vendor clients. Only the non-secure system heap is exposed.
+
 endmenu
