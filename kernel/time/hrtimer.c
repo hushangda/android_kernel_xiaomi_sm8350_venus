@@ -38,6 +38,7 @@
 #include <linux/sched/deadline.h>
 #include <linux/sched/nohz.h>
 #include <linux/sched/debug.h>
+#include <linux/sched/isolation.h>
 #include <linux/timer.h>
 #include <linux/freezer.h>
 #include <linux/compat.h>
@@ -56,6 +57,13 @@
 #define HRTIMER_ACTIVE_HARD	((1U << MASK_SHIFT) - 1)
 #define HRTIMER_ACTIVE_SOFT	(HRTIMER_ACTIVE_HARD << MASK_SHIFT)
 #define HRTIMER_ACTIVE_ALL	(HRTIMER_ACTIVE_SOFT | HRTIMER_ACTIVE_HARD)
+
+static void retrigger_next_event(void *arg);
+
+/* Keep the remote reprogram request separate from the vendor base layout. */
+static DEFINE_PER_CPU(call_single_data_t, hrtimer_retrigger_csd) = {
+	.func = retrigger_next_event,
+};
 
 /*
  * The timer bases:
@@ -123,6 +131,13 @@ static const int hrtimer_clock_to_base_table[MAX_CLOCKS] = {
 	[CLOCK_TAI]		= HRTIMER_BASE_TAI,
 };
 
+static inline bool hrtimer_base_is_online(struct hrtimer_cpu_base *base)
+{
+	if (!IS_ENABLED(CONFIG_HOTPLUG_CPU))
+		return true;
+	return likely(base->online);
+}
+
 /*
  * Functions and macros which are different for UP/SMP systems are kept in a
  * single place
@@ -176,27 +191,40 @@ struct hrtimer_clock_base *lock_hrtimer_base(const struct hrtimer *timer,
 }
 
 /*
- * We do not migrate the timer when it is expiring before the next
- * event on the target cpu. When high resolution is enabled, we cannot
- * reprogram the target cpu hardware and we would cause it to fire
- * late. To keep it simple, we handle the high resolution enabled and
- * disabled case similar.
+ * Prefer the local CPU if the remote clock event would fire too late,
+ * unless the local timer base has already been shut down. In that case
+ * keep the remote target and request clock event reprogramming by IPI.
  *
  * Called with cpu_base->lock of target cpu held.
  */
-static int
-hrtimer_check_target(struct hrtimer *timer, struct hrtimer_clock_base *new_base)
+static bool hrtimer_suitable_target(struct hrtimer *timer,
+				    struct hrtimer_clock_base *new_base,
+				    struct hrtimer_cpu_base *new_cpu_base,
+				    struct hrtimer_cpu_base *this_cpu_base)
 {
 	ktime_t expires;
 
+	if (new_cpu_base == this_cpu_base)
+		return true;
+
+	if (!hrtimer_base_is_online(this_cpu_base))
+		return true;
+
 	expires = ktime_sub(hrtimer_get_expires(timer), new_base->offset);
-	return expires < new_base->cpu_base->expires_next;
+	return expires >= new_base->cpu_base->expires_next;
 }
 
 static inline
 struct hrtimer_cpu_base *get_target_base(struct hrtimer_cpu_base *base,
 					 int pinned)
 {
+	if (!hrtimer_base_is_online(base)) {
+		int cpu = cpumask_any_and(cpu_online_mask,
+					 housekeeping_cpumask(HK_FLAG_TIMER));
+
+		return &per_cpu(hrtimer_bases, cpu);
+	}
+
 #if defined(CONFIG_SMP) && defined(CONFIG_NO_HZ_COMMON)
 	if (static_branch_likely(&timers_migration_enabled) && !pinned)
 		return &per_cpu(hrtimer_bases, get_nohz_timer_target());
@@ -247,8 +275,8 @@ again:
 		raw_spin_unlock(&base->cpu_base->lock);
 		raw_spin_lock(&new_base->cpu_base->lock);
 
-		if (new_cpu_base != this_cpu_base &&
-		    hrtimer_check_target(timer, new_base)) {
+		if (!hrtimer_suitable_target(timer, new_base, new_cpu_base,
+					     this_cpu_base)) {
 			raw_spin_unlock(&new_base->cpu_base->lock);
 			raw_spin_lock(&base->cpu_base->lock);
 			new_cpu_base = this_cpu_base;
@@ -257,8 +285,8 @@ again:
 		}
 		WRITE_ONCE(timer->base, new_base);
 	} else {
-		if (new_cpu_base != this_cpu_base &&
-		    hrtimer_check_target(timer, new_base)) {
+		if (!hrtimer_suitable_target(timer, new_base, new_cpu_base,
+					     this_cpu_base)) {
 			new_cpu_base = this_cpu_base;
 			goto again;
 		}
@@ -789,7 +817,8 @@ static void hrtimer_reprogram(struct hrtimer *timer, bool reprogram)
 		 * case softirq_expires_next needs to be updated on the
 		 * remote CPU. The soft hrtimer will not expire before the
 		 * first hard hrtimer on the remote CPU -
-		 * hrtimer_check_target() prevents this case.
+		 * hrtimer_suitable_target() prevents this case for online
+		 * callers. Offline callers request remote reprogramming.
 		 */
 		struct hrtimer_cpu_base *timer_cpu_base = base->cpu_base;
 
@@ -1112,6 +1141,7 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 				    u64 delta_ns, const enum hrtimer_mode mode,
 				    struct hrtimer_clock_base *base)
 {
+	struct hrtimer_cpu_base *this_cpu_base = this_cpu_ptr(&hrtimer_bases);
 	struct hrtimer_clock_base *new_base;
 	bool force_local, first;
 
@@ -1123,8 +1153,10 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 	 * and enforce reprogramming after it is queued no matter whether
 	 * it is the new first expiring timer again or not.
 	 */
-	force_local = base->cpu_base == this_cpu_ptr(&hrtimer_bases);
+	force_local = base->cpu_base == this_cpu_base;
 	force_local &= base->cpu_base->next_timer == timer;
+	/* Late wakeups must not arm timers after hrtimers_cpu_dying(). */
+	force_local &= hrtimer_base_is_online(this_cpu_base);
 
 	/*
 	 * Remove an active timer from the queue. In case it is not queued
@@ -1159,8 +1191,28 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
 	timer->state |= (!!(mode & HRTIMER_MODE_PINNED)) << HRTIMER_PINNED_SHIFT;
 
 	first = enqueue_hrtimer(timer, new_base, mode);
-	if (!force_local)
-		return first;
+	if (!force_local) {
+		if (hrtimer_base_is_online(this_cpu_base))
+			return first;
+
+		/* The offline caller cannot program the remote clock event. */
+		if (first) {
+			int cpu = new_base->cpu_base->cpu;
+			call_single_data_t *csd;
+
+			/*
+			 * This tree's async call API waits for a busy CSD.
+			 * The target base lock serializes these requests, and
+			 * a pending callback reevaluates all timers. Coalesce
+			 * requests instead of waiting with the lock held.
+			 */
+			csd = &per_cpu(hrtimer_retrigger_csd, cpu);
+			/* Pairs with the release in csd_unlock(). */
+			if (!smp_load_acquire(&csd->flags))
+				smp_call_function_single_async(cpu, csd);
+		}
+		return 0;
+	}
 
 	/*
 	 * Timer was forced to stay on the current CPU to avoid

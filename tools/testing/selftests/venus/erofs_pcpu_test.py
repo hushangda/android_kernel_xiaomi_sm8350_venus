@@ -23,7 +23,7 @@ workers = region(source, "static struct workqueue_struct *z_erofs_workqueue",
                  "enum z_erofs_collectmode")
 dispatch = region(source,
                   "static void z_erofs_decompressqueue_bg(struct z_erofs_decompressqueue *bgq);",
-                  "static void z_erofs_decompress_kickoff")
+                  "static inline bool z_erofs_in_atomic")
 harness = r'''
 #include <assert.h>
 #include <errno.h>
