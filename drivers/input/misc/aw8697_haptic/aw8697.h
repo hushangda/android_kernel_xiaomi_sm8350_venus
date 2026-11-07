@@ -321,6 +321,15 @@ struct aw8697 {
 	struct work_struct set_gain_work;
 	struct led_classdev vib_dev;
 	struct delayed_work ram_work;
+	unsigned int ram_update_attempts;
+	bool stopping;
+	bool irq_registered;
+	bool input_registered;
+	bool led_registered;
+	bool sysfs_registered;
+	bool led_sysfs_registered;
+	bool misc_registered;
+	bool rb_initialized;
 
 	struct fileops fileops;
 	struct ram ram;
@@ -355,6 +364,7 @@ struct aw8697 {
 	int vmax;
 	int gain;
 	u16 new_gain;
+	bool ff_gain_valid;
 	unsigned char level;
 
 	unsigned char seq[AW8697_SEQUENCER_SIZE];

@@ -65,7 +65,8 @@
 
 /*#define FW_H_FILE*/
 #define FTS_FW_UPDATE
-#define FW_UPDATE_ON_PROBE
+/* Built-in probe runs before Android mounts the firmware partitions. */
+/*#define FW_UPDATE_ON_PROBE*/
 #ifdef FW_H_FILE
 #define FW_SIZE_NAME myArray_size
 #define FW_ARRAY_NAME myArray
@@ -83,8 +84,9 @@
 
 /*#define USE_ONE_FILE_NODE*/
 
-#ifndef FW_UPDATE_ON_PROBE
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
 #define EXP_FN_WORK_DELAY_MS				1000
+#define FTS_FW_READY_MAX_ATTEMPTS			10
 #endif
 
 /**** END ****/
@@ -318,11 +320,6 @@ struct tp_frame {
  * - series_of_switches  to store the enabling status of a particular feature from the host \n
  */
 struct fts_ts_info {
-	bool removing;
-	bool irq_registered;
-	bool power_supply_registered;
-	bool touch_feature_registered;
-	bool sysfs_created;
 	struct device *dev;
 #ifdef I2C_INTERFACE
 	struct i2c_client *client;
@@ -340,11 +337,16 @@ struct fts_ts_info {
 	struct workqueue_struct *irq_wq;
 	struct workqueue_struct *touch_feature_wq;
 
-#ifndef FW_UPDATE_ON_PROBE
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
 	struct delayed_work fwu_work;
 	struct workqueue_struct *fwu_workqueue;
+	const char *fwu_fw_name;
+	unsigned int fwu_attempts;
+	bool fwu_stopping;
 #endif
 	event_dispatch_handler_t *event_dispatch_table;
+	bool irq_installed;
+	bool notifier_registered;
 
 	struct attribute_group attrs;
 
@@ -428,6 +430,7 @@ struct fts_ts_info {
 	short strength_buf[PAGE_SIZE];
 	struct tp_frame thp_frame;
 	int aod_status;
+	bool aod_status_from_display;
 	bool tp_pm_suspend;
 	struct completion pm_resume_completion;
 	bool gamemode_enable;

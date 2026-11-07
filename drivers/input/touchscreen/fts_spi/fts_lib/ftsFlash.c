@@ -100,7 +100,8 @@ int getFWdata(const char *pathToFile, u8 **data, int *size)
 		dev = getDev();
 
 		if (dev != NULL) {
-			res = request_firmware(&fw, path, dev);
+			/* Auto-update retries after probe; never wait for ueventd here. */
+			res = request_firmware_direct(&fw, path, dev);
 			if (res == 0) {
 				*size = fw->size;
 				*data = (u8 *)kmalloc((*size) * sizeof(u8),
@@ -116,8 +117,8 @@ int getFWdata(const char *pathToFile, u8 **data, int *size)
 				release_firmware(fw);
 			} else {
 				logError(1,
-					 "%s getFWdata: No File found! ERROR %08X\n",
-					 tag, ERROR_FILE_NOT_FOUND);
+					 "%s getFWdata: Cannot load %s (%d)! ERROR %08X\n",
+					 tag, path, res, ERROR_FILE_NOT_FOUND);
 				return ERROR_FILE_NOT_FOUND;
 			}
 		} else {

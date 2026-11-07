@@ -138,6 +138,7 @@ static int fts_enable_reg(struct fts_ts_info *info, bool enable);
 static int fts_mode_handler(struct fts_ts_info *info, int force);
 #ifdef FTS_XIAOMI_TOUCHFEATURE
 static int fts_set_cur_value(int mode, int value);
+static void fts_replay_touchfeatures(struct fts_ts_info *info);
 #endif
 extern int power_supply_is_system_supplied(void);
 #ifdef CONFIG_FTS_BOOST
@@ -151,6 +152,7 @@ extern void lpm_disable_for_dev(bool on, char event_dev);
 static int fts_write_charge_status(int status);
 #endif
 
+extern int mi_disp_set_fod_queue_work(u32 fod_btn, bool from_touch);
 
 /**
 * Release all the touches in the linux input subsystem
@@ -176,6 +178,7 @@ void release_all_touches(struct fts_ts_info *info)
 	}
 	input_sync(info->input_dev);
 	input_report_key(info->input_dev, BTN_INFO, 0);
+	mi_disp_set_fod_queue_work(0, true);
 	input_sync(info->input_dev);
 #ifdef FTS_FOD_AREA_REPORT
 	input_report_key(info->input_dev, BTN_INFO, 0);
@@ -2688,7 +2691,12 @@ int fts_enable_touch_raw(int en)
 	};
 	int init_type = NO_INIT;
 	int error = 0;
+#endif
 
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
+
+#ifdef TOUCH_THP_FW
 	fts_disableInterrupt();
 	if (en) {
 		fw_name = fts_info->board->thp_fw_name;
@@ -3812,11 +3820,9 @@ static u8 fts_need_enter_lp_mode(void)
  */
 	u8 tmp_value = 0;
 
-	if (fts_info->nonui_status == 2)
-		return 0;
 	if (fts_info->aod_status && !fts_info->nonui_status)
 		tmp_value |= FOD_SINGLETAP_EVENT;
-	if (fts_info->fod_status == 1 || fts_info->fod_status == 2) {
+	if ((fts_info->fod_status != -1 && fts_info->fod_status != 100)) {
 		tmp_value |= FOD_LONGPRESS_EVENT;
 		if (fts_info->fod_icon_status && !fts_info->nonui_status)
 			tmp_value |= FOD_SINGLETAP_EVENT;
@@ -4823,9 +4829,6 @@ static irqreturn_t fts_event_handler(int irq, void *ts_info)
 	static char pre_id[3];
 	event_dispatch_handler_t event_handler;
 
-	if (READ_ONCE(info->removing))
-		return IRQ_HANDLED;
-
 #ifdef CONFIG_FTS_BOOST
 	touch_irq_boost();
 #endif
@@ -5017,6 +5020,7 @@ int fts_fw_update(struct fts_ts_info *info, const char *fw_name, int force)
 	int crc_status = 0;
 	int error = 0;
 	int init_type = NO_INIT;
+	bool fw_missing;
 #ifdef PRE_SAVED_METHOD
 	int keep_cx = 1;
 #else
@@ -5050,16 +5054,28 @@ int fts_fw_update(struct fts_ts_info *info, const char *fw_name, int force)
 			retval = flashProcedure(fw_name, crc_status, keep_cx);
 
 		if ((retval & 0xFF000000) == ERROR_FLASH_PROCEDURE) {
-			logError(1,
-				 "%s %s: firmware update failed and retry! ERROR %08X\n",
-				 tag, __func__, retval);
-			fts_chip_powercycle(info);
-			retval1 = flashProcedure(info->board->default_fw_name, crc_status, keep_cx);
-			if ((retval1 & 0xFF000000) == ERROR_FLASH_PROCEDURE) {
+			/* A missing host file is not a failed flash transaction. */
+			fw_missing = (retval & 0xFF) ==
+				     (ERROR_FILE_NOT_FOUND & 0xFF);
+			if (fw_missing) {
+				logError(1, "%s %s: firmware %s unavailable; skip power cycle\n",
+					 tag, __func__, fw_name);
+			} else {
 				logError(1,
-					 "%s %s: firmware update failed again!  ERROR %08X\n",
-					 tag, __func__, retval1);
-				logError(1, "%s Fw Auto Update Failed!\n", tag);
+					 "%s %s: firmware update failed and retry! ERROR %08X\n",
+					 tag, __func__, retval);
+				fts_chip_powercycle(info);
+			}
+			if (info->board->default_fw_name &&
+			    (!fw_missing || strcmp(fw_name, info->board->default_fw_name))) {
+				retval1 = flashProcedure(info->board->default_fw_name,
+							 crc_status, keep_cx);
+				if ((retval1 & 0xFF000000) == ERROR_FLASH_PROCEDURE) {
+					logError(1,
+						 "%s %s: firmware update failed again! ERROR %08X\n",
+						 tag, __func__, retval1);
+					logError(1, "%s Fw Auto Update Failed!\n", tag);
+				}
 			}
 		}
 	}
@@ -5148,7 +5164,29 @@ int fts_fw_update(struct fts_ts_info *info, const char *fw_name, int force)
 	return error;
 }
 
-#ifndef FW_UPDATE_ON_PROBE
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
+
+static bool fts_fw_available(struct fts_ts_info *info, const char *fw_name)
+{
+	const struct firmware *fw;
+	int ret;
+
+	if (!fw_name)
+		return false;
+	if (!strncmp(fw_name, "NULL", 4)) {
+#ifdef FW_H_FILE
+		return true;
+#else
+		fw_name = PATH_FILE_FW;
+#endif
+	}
+
+	ret = request_firmware_direct(&fw, fw_name, info->dev);
+	if (ret)
+		return false;
+	release_firmware(fw);
+	return true;
+}
 
 /**
 *	Function called by the delayed workthread executed after the probe in order to perform the fw update flow
@@ -5160,7 +5198,71 @@ static void fts_fw_update_auto(struct work_struct *work)
 	    container_of(work, struct delayed_work, work);
 	struct fts_ts_info *info =
 	    container_of(fwu_work, struct fts_ts_info, fwu_work);
-	fts_fw_update(info, NULL, 0);
+	const char *fw_name;
+	const char *default_fw_name = info->board->default_fw_name;
+	bool available;
+	int error;
+
+	if (READ_ONCE(info->fwu_stopping))
+		return;
+	if (!info->fwu_attempts) {
+		info->fwu_fw_name = fts_get_config(info);
+		if (info->enable_thp_fw && info->enable_touch_raw)
+			info->fwu_fw_name = info->board->thp_fw_name;
+	}
+	fw_name = info->fwu_fw_name;
+	available = fts_fw_available(info, fw_name);
+	if (!available && default_fw_name &&
+	    (!fw_name || strcmp(fw_name, default_fw_name))) {
+		available = fts_fw_available(info, default_fw_name);
+		if (available)
+			fw_name = default_fw_name;
+	}
+
+	/* Retry only file lookup, not the flow that installs the IRQ handler. */
+	info->fwu_attempts++;
+	if (READ_ONCE(info->fwu_stopping))
+		return;
+	if (!available && info->fwu_attempts < FTS_FW_READY_MAX_ATTEMPTS) {
+		dev_info(info->dev, "firmware not ready; retry %u/%u\n",
+			 info->fwu_attempts, FTS_FW_READY_MAX_ATTEMPTS);
+		queue_delayed_work(info->fwu_workqueue, &info->fwu_work,
+				   msecs_to_jiffies(EXP_FN_WORK_DELAY_MS));
+		return;
+	}
+	if (!available)
+		dev_warn(info->dev,
+			 "firmware unavailable after %u attempts (%s, default %s); initializing existing controller firmware\n",
+			 info->fwu_attempts, fw_name ?: "none",
+			 default_fw_name ?: "none");
+
+	error = fts_fw_update(info, fw_name, 0);
+	if (error < OK) {
+		dev_err(info->dev, "deferred firmware/sensing init failed: %08X\n",
+			error);
+	} else if (!READ_ONCE(info->fwu_stopping)) {
+		WRITE_ONCE(info->probe_ok, true);
+#ifdef FTS_XIAOMI_TOUCHFEATURE
+		fts_replay_touchfeatures(info);
+#endif
+#ifdef CONFIG_FTS_POWERSUPPLY_CB
+		/* Recheck notifications ignored while firmware was being updated. */
+		schedule_delayed_work(&info->power_supply_work, 0);
+#endif
+	}
+}
+
+static void fts_fw_update_cancel(struct fts_ts_info *info)
+{
+	WRITE_ONCE(info->fwu_stopping, true);
+	if (!info->fwu_workqueue)
+		return;
+	/* Drain self-requeues before any IRQ, input or hardware resources go away. */
+	cancel_delayed_work_sync(&info->fwu_work);
+	destroy_workqueue(info->fwu_workqueue);
+	info->fwu_workqueue = NULL;
+	/* The worker may have passed its ready check just before stopping. */
+	WRITE_ONCE(info->probe_ok, false);
 }
 #endif
 
@@ -5253,7 +5355,7 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 		info->event_dispatch_table = NULL;
 		error = -EBUSY;
 	} else {
-		info->irq_registered = true;
+		info->irq_installed = true;
 		disable_irq(info->client->irq);
 	}
 
@@ -5266,11 +5368,12 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 */
 static void fts_interrupt_uninstall(struct fts_ts_info *info)
 {
-	if (info->irq_registered) {
-		fts_disableInterrupt();
-		free_irq(info->client->irq, info);
-		info->irq_registered = false;
-	}
+	if (!info->irq_installed)
+		return;
+
+	fts_disableInterrupt();
+	free_irq(info->client->irq, info);
+	info->irq_installed = false;
 	kfree(info->event_dispatch_table);
 	info->event_dispatch_table = NULL;
 }
@@ -5485,7 +5588,10 @@ int fts_chip_powercycle(struct fts_ts_info *info)
 static int fts_init_sensing(struct fts_ts_info *info)
 {
 	int error = 0;
-	error |= mi_disp_register_client(&info->notifier);
+	error = mi_disp_register_client(&info->notifier);
+	if (error < OK)
+		return error;
+	info->notifier_registered = true;
 	error |= fts_interrupt_install(info);
 	error |= fts_mode_handler(info, 0);
 #ifdef FTS_FOD_AREA_REPORT
@@ -6275,6 +6381,8 @@ end:
 
 static void fts_cmd_update_work(struct work_struct *work)
 {
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return;
 	fts_update_touchmode_data();
 
 	return;
@@ -6284,6 +6392,8 @@ static void fts_grip_mode_work(struct work_struct *work)
 {
 	int i = 0;
 
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return;
 	if (xiaomi_touch_interfaces.long_mode_len % GRIP_PARAMETER_NUM) {
 		logError(1, "%s %s len is invalid\n", tag, __func__);
 		return;
@@ -6312,6 +6422,10 @@ static int fts_set_fod_status(int value)
 	int res = 0;
 	u8 gesture_cmd[6] = {0xA2, 0x03, 0x00, 0x00, 0x00, 0x03};
 
+	if (!READ_ONCE(fts_info->probe_ok)) {
+		fts_info->fod_status = value;
+		return -EAGAIN;
+	}
 	pm_stay_awake(fts_info->dev);
 
 	if (fts_info->fod_pressed && fts_info->fod_status == value) {
@@ -6321,8 +6435,7 @@ static int fts_set_fod_status(int value)
 	}
 	fts_info->fod_status = value;
 
-	if ((fts_info->fod_status == 1 || fts_info->fod_status == 2) &&
-	    !fts_info->fod_down) {
+	if (fts_info->fod_status == 1 || fts_info->fod_status == 3) {
 		mutex_lock(&fts_info->fod_mutex);
 		if (fts_info->gesture_enabled == 1)
 			gesture_cmd[2] = 0x20;
@@ -6349,6 +6462,10 @@ static int fts_set_fod_status(int value)
 static int fts_set_aod_status(int value)
 {
 	fts_info->aod_status = value;
+	fts_info->aod_status_from_display = false;
+	if (!READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
+	schedule_work(&fts_info->switch_mode_work);
 	return 0;
 }
 
@@ -6363,6 +6480,8 @@ static int fts_change_enter_doze_time(int value)
 {
 	int ret;
 	u8 set_cmd[4] = {0xc0, 0x00, 0x00, 0x00};
+	if (!READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	if (value <= 0)
 		return -EINVAL;
 	if (!fts_info->gamemode_enable) {
@@ -6390,6 +6509,8 @@ static int fts_change_enter_doze_time(int value)
 
 static int fts_set_cur_value(int mode, int value)
 {
+	if (!fts_info)
+		return -ENODEV;
 	logError(1, "%s %s, mode:%d,value:%d\n", tag, __func__, mode, value);
 	if (mode == Touch_Fod_Enable && fts_info && value >= 0) {
 		xiaomi_touch_interfaces.touch_mode[mode][SET_CUR_VALUE] = value;
@@ -6403,6 +6524,8 @@ static int fts_set_cur_value(int mode, int value)
 	}
 	if (mode == Touch_Doubletap_Mode && fts_info && value >= 0) {
 		fts_info->gesture_enabled = value;
+		if (!READ_ONCE(fts_info->probe_ok))
+			return -EAGAIN;
 		schedule_work(&fts_info->switch_mode_work);
 		return 0;
 	}
@@ -6410,11 +6533,15 @@ static int fts_set_cur_value(int mode, int value)
 		return fts_set_fod_icon_status(value);
 	if (mode == Touch_Nonui_Mode && fts_info && value >= 0) {
 		fts_info->nonui_status = value;
+		if (!READ_ONCE(fts_info->probe_ok))
+			return -EAGAIN;
 		schedule_work(&fts_info->switch_mode_work);
 		return 0;
 	}
 
 	if (mode == Touch_Power_Status && fts_info && value >= 0) {
+		if (!READ_ONCE(fts_info->probe_ok))
+			return -EAGAIN;
 		flush_workqueue(fts_info->event_wq);
 		logError(1, "%s %s: switch sensor state\n", tag, __func__);
 		if (value) {
@@ -6431,6 +6558,8 @@ static int fts_set_cur_value(int mode, int value)
 #endif
 #ifdef TOUCH_THP_SUPPORT
 	if (mode == THP_LOCK_SCAN_MODE && fts_info && value >= 0) {
+		if (!READ_ONCE(fts_info->probe_ok))
+			return -EAGAIN;
 		fts_lock_scan_mode(value);
 		return 0;
 	}
@@ -6457,6 +6586,9 @@ static int fts_set_cur_value(int mode, int value)
 		logError(1, "%s %s, don't support\n", tag, __func__);
 	}
 
+	/* Keep requested settings cached while the initial firmware flow owns SPI. */
+	if (!READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	queue_work(fts_info->touch_feature_wq, &fts_info->cmd_update_work);
 
 	return 0;
@@ -6494,6 +6626,8 @@ static int fts_reset_mode(int mode)
 {
 	int i = 0;
 
+	if (!fts_info)
+		return -ENODEV;
 	if (mode < Touch_Report_Rate && mode > 0) {
 		xiaomi_touch_interfaces.touch_mode[mode][SET_CUR_VALUE] =
 			xiaomi_touch_interfaces.touch_mode[mode][GET_DEF_VALUE];
@@ -6514,6 +6648,8 @@ static int fts_reset_mode(int mode)
 
 	logError(1, "%s %s, mode:%d\n", tag, __func__, mode);
 
+	if (!READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	queue_work(fts_info->event_wq, &fts_info->cmd_update_work);
 
 	return 0;
@@ -6523,6 +6659,8 @@ static int fts_set_mode_long_value(int mode, int len, int *buf)
 {
 	int i = 0;
 
+	if (!fts_info)
+		return -ENODEV;
 	if (len == 0)
 		return -EIO;
 
@@ -6531,6 +6669,8 @@ static int fts_set_mode_long_value(int mode, int len, int *buf)
 	for (i = 0; i < len; i++) {
 		xiaomi_touch_interfaces.long_mode_value[i] = buf[i];
 	}
+	if (!READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	if (mode == Touch_Grip_Mode) {
 		if (fts_info->gamemode_enable) {
 			logError(1, "%s %s in gamemode, don't write parameters to touch ic\n", tag, __func__);
@@ -6549,6 +6689,8 @@ int fts_prox_sensor_cmd(int input)
 	u8 hover_on[] = {0xc0, 0x03, 0x01, 0x00};
 	u8 hover_off[] = {0xc0, 0x03, 0x00, 0x00};
 
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	if (input) {
 		ret = fts_write_dma_safe(cmd_on, sizeof(cmd_on));
 		ret = fts_write_dma_safe(hover_on, sizeof(hover_on));
@@ -6569,7 +6711,13 @@ int fts_prox_sensor_write(int value)
 {
 	int ret = 0;
 
+	if (!fts_info)
+		return -ENODEV;
 	fts_info->prox_sensor_switch = value;
+	if (!READ_ONCE(fts_info->probe_ok)) {
+		fts_info->prox_sensor_changed = false;
+		return -EAGAIN;
+	}
 
 	if (fts_info->sensor_sleep) {
 		fts_info->prox_sensor_changed = false;
@@ -6589,6 +6737,8 @@ int fts_palm_sensor_cmd(int on)
 	u8 cmd_on[3] = {0xc0, 0x14, 0x01};
 	u8 cmd_off[3] = {0xc0, 0x14, 0x00};
 
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	if (on) {
 		ret = fts_write_dma_safe(cmd_on, sizeof(cmd_on));
 	} else {
@@ -6609,10 +6759,16 @@ int fts_palm_sensor_write(int value)
 {
 	int ret = 0;
 #ifdef CONFIG_SECURE_TOUCH
-	struct fts_secure_info *scr_info = fts_info->secure_info;
+	struct fts_secure_info *scr_info;
 #endif
 
+	if (!fts_info)
+		return -ENODEV;
 	fts_info->palm_sensor_switch = value;
+	if (!READ_ONCE(fts_info->probe_ok)) {
+		fts_info->palm_sensor_changed = false;
+		return -EAGAIN;
+	}
 
 	if (fts_info->sensor_sleep) {
 		fts_info->palm_sensor_changed = false;
@@ -6620,6 +6776,7 @@ int fts_palm_sensor_write(int value)
 	}
 
 #ifdef CONFIG_SECURE_TOUCH
+	scr_info = fts_info->secure_info;
 	mutex_lock(&scr_info->palm_lock);
 	if (atomic_read(&scr_info->st_enabled)) {
 		if (!scr_info->scr_delay.palm_pending) {
@@ -6643,6 +6800,24 @@ int fts_palm_sensor_write(int value)
 	return ret;
 }
 
+static void fts_replay_touchfeatures(struct fts_ts_info *info)
+{
+	if (!READ_ONCE(info->probe_ok))
+		return;
+
+	/* HALs need not resend state cached while firmware/sensing was pending. */
+	fts_set_fod_status(info->fod_status);
+	if (info->prox_sensor_switch && !info->prox_sensor_changed)
+		fts_prox_sensor_write(info->prox_sensor_switch);
+	if (info->palm_sensor_switch && !info->palm_sensor_changed)
+		fts_palm_sensor_write(info->palm_sensor_switch);
+	queue_work(info->touch_feature_wq, &info->cmd_update_work);
+	if (xiaomi_touch_interfaces.long_mode_len)
+		schedule_work(&info->grip_mode_work);
+	/* In active mode, gesture state is retained for the next suspend. */
+	schedule_work(&info->switch_mode_work);
+}
+
 static u8 fts_panel_vendor_read(void)
 {
 	if (fts_info)
@@ -6661,11 +6836,15 @@ static u8 fts_panel_color_read(void)
 
 static int fts_get_tx_num(void)
 {
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	return getSenseLen();
 }
 
 static int fts_get_rx_num(void)
 {
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok))
+		return -EAGAIN;
 	return getForceLen();
 }
 
@@ -6744,7 +6923,7 @@ static void fts_resume_work(struct work_struct *work)
 #endif
 	res |= fts_mode_handler(info, 0);
 #ifdef CONFIG_FTS_POWERSUPPLY_CB
-	if (info->probe_ok)
+	if (READ_ONCE(info->probe_ok))
 		fts_write_charge_status(info->charging_status);
 #endif
 	info->sensor_sleep = false;
@@ -6810,8 +6989,6 @@ static void fts_suspend_work(struct work_struct *work)
 	}
 #endif
 	res |= fts_disableInterrupt();
-	if (info->fod_status == 3)
-		info->fod_status = 1;
 	info->resume_bit = 0;
 	res |= fts_mode_handler(info, 0);
 	release_all_touches(info);
@@ -6868,12 +7045,35 @@ static int fts_drm_state_chg_callback(struct notifier_block *nb,
 
 		if (val == MI_DISP_DPMS_EARLY_EVENT && (blank == MI_DISP_DPMS_POWERDOWN ||
 			blank == MI_DISP_DPMS_LP1 || blank == MI_DISP_DPMS_LP2)) {
+			/*
+			 * Some non-MIUI userspaces do not restore Touch_Aod_Enable
+			 * after boot.  An LP1/LP2 transition is an unambiguous signal
+			 * that the display is running an AOD session, so arm single-tap
+			 * as a fallback.  A later explicit touchfeature request always
+			 * takes ownership of aod_status again.
+			 */
+			if (blank != MI_DISP_DPMS_POWERDOWN && !info->aod_status) {
+				info->aod_status = 1;
+				info->aod_status_from_display = true;
+				logError(1, "%s %s: enable AOD single-tap fallback from LP%u\n",
+					 tag, __func__, blank);
+				if (info->sensor_sleep)
+					schedule_work(&info->switch_mode_work);
+			}
+
 			logError(1, "%s %s: FB_BLANK %s\n", tag,
 				 __func__, blank == MI_DISP_DPMS_POWERDOWN ? "POWER DOWN" : "LP");
 
 			flush_workqueue(info->event_wq);
 			queue_work(info->event_wq, &info->suspend_work);
 		} else if (val == MI_DISP_DPMS_EVENT && blank == MI_DISP_DPMS_ON) {
+			if (info->aod_status_from_display) {
+				info->aod_status = 0;
+				info->aod_status_from_display = false;
+				logError(1, "%s %s: clear display-derived AOD single-tap state\n",
+					 tag, __func__);
+			}
+
 			logError(1, "%s %s: FB_BLANK_UNBLANK\n", tag,
 				 __func__);
 
@@ -7028,7 +7228,7 @@ static void fts_power_supply_work(struct work_struct *work)
 {
 	int charging_status;
 
-	if (!fts_info || !fts_info->probe_ok) {
+	if (!fts_info || !READ_ONCE(fts_info->probe_ok)) {
 		logError(1, "%s %s touch is not inited\n", tag, __func__);
 		return;
 	}
@@ -7049,7 +7249,7 @@ static int fts_power_supply_event(struct notifier_block *nb, unsigned long event
 {
 	struct fts_ts_info *info = container_of(nb, struct fts_ts_info, power_supply_notifier);
 
-	if (READ_ONCE(info->removing))
+	if (!info)
 		return 0;
 	schedule_delayed_work(&info->power_supply_work, msecs_to_jiffies(500));
 	return 0;
@@ -7771,28 +7971,26 @@ static void fts_switch_mode_work(struct work_struct *work)
 	struct fts_ts_info *info = container_of(work, struct fts_ts_info, switch_mode_work);
 	u8 gesture_type;
 	u8 gesture_cmd[6] = {0xA2, 0x03, 0x00, 0x00, 0x00, 0x00};
-	bool enable_gesture;
 	int res = 0;
 	int ret;
 
+	if (!READ_ONCE(info->probe_ok))
+		return;
 	if (info->resume_bit) {
 		logError(1, "%s %s touch in resume mode, don't need to set gesture cmds\n", tag, __func__);
 		return;
 	}
 
-	pm_stay_awake(info->dev);
 	gesture_type = fts_need_enter_lp_mode();
-	enable_gesture = (gesture_type || info->gesture_enabled) &&
-			 info->nonui_status != 2;
 	gesture_cmd[5] = gesture_type;
-	if (!enable_gesture)
+	if (!gesture_type && !info->gesture_enabled)
 		fts_disableInterrupt();
 
 	mutex_lock(&info->fod_mutex);
 	if (info->gesture_enabled)
 		gesture_cmd[2] = 0x20;
 
-	if (enable_gesture) {
+	if (gesture_type || info->gesture_enabled) {
 		res = fts_write_dma_safe(gesture_cmd, ARRAY_SIZE(gesture_cmd));
 		if (res < OK)
 			logError(1, "%s %s: send gesture cmd error! ERROR %08X\n",
@@ -7805,9 +8003,8 @@ static void fts_switch_mode_work(struct work_struct *work)
 	}
 	mutex_unlock(&info->fod_mutex);
 
-	if (enable_gesture)
+	if (gesture_type || info->gesture_enabled)
 		fts_enableInterrupt();
-	pm_relax(info->dev);
 
 	logError(1, "%s %s: applied gesture type:%u, doubletap:%d, result:%08X\n",
 		 tag, __func__, gesture_type, info->gesture_enabled, res);
@@ -8338,47 +8535,6 @@ void fts_secure_remove(struct fts_ts_info *info)
  * This function allocate, initialize and define all the most important function and flow that are used by the driver to operate with the IC.
  * It allocates device variables, initialize queues and schedule works, registers the IRQ handler, suspend/resume callbacks, registers the device to the linux input subsystem etc.
  */
-static void fts_stop_async(struct fts_ts_info *info)
-{
-	if (READ_ONCE(info->removing))
-		return;
-	WRITE_ONCE(info->removing, true);
-	WRITE_ONCE(info->probe_ok, false);
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	if (info->touch_feature_registered) {
-		xiaomitouch_unregister_modedata(0, &xiaomi_touch_interfaces);
-		info->touch_feature_registered = false;
-	}
-#endif
-#ifndef FW_UPDATE_ON_PROBE
-	if (info->fwu_workqueue)
-		cancel_delayed_work_sync(&info->fwu_work);
-#endif
-#ifdef CONFIG_FTS_POWERSUPPLY_CB
-	if (info->power_supply_registered) {
-		power_supply_unreg_notifier(&info->power_supply_notifier);
-		info->power_supply_registered = false;
-	}
-	cancel_delayed_work_sync(&info->power_supply_work);
-#endif
-	mi_disp_unregister_client(&info->notifier);
-#ifdef CONFIG_FTS_BL_CB
-	backlight_unregister_notifier(&info->bl_notifier);
-#endif
-	/* An IRQ that observed removing=false must finish queueing first. */
-	if (info->irq_registered)
-		synchronize_irq(info->client->irq);
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	cancel_work_sync(&info->switch_mode_work);
-	cancel_work_sync(&info->grip_mode_work);
-	cancel_work_sync(&info->cmd_update_work);
-#endif
-	cancel_work_sync(&info->resume_work);
-	cancel_work_sync(&info->suspend_work);
-	cancel_work_sync(&info->sleep_work);
-	fts_interrupt_uninstall(info);
-}
-
 #ifdef I2C_INTERFACE
 static int fts_probe(struct i2c_client *client, const struct i2c_device_id *idp)
 {
@@ -8392,9 +8548,6 @@ static int fts_probe(struct spi_device *client)
 	struct device_node *dp = client->dev.of_node;
 	int retval;
 	int skip_5_1 = 0;
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	struct class *touch_class;
-#endif
 	u16 bus_type;
 #ifdef CONFIG_FACTORY_BUILD
 	int res = 0;
@@ -8402,14 +8555,6 @@ static int fts_probe(struct spi_device *client)
 #endif
 	logError(1, "%s %s: driver spi ver: %s\n", tag, __func__,
 		 FTS_TS_DRV_VERSION);
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	/* Built-in probes must also honor the stock module dependency. */
-	touch_class = get_xiaomi_touch_class();
-	if (IS_ERR(touch_class))
-		return PTR_ERR(touch_class);
-	if (!touch_class)
-		return -EPROBE_DEFER;
-#endif
 #ifdef I2C_INTERFACE
 	logError(1, "%s I2C interface... \n", tag);
 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
@@ -8447,24 +8592,7 @@ static int fts_probe(struct spi_device *client)
 		goto ProbeErrorExit_0;
 	}
 
-	INIT_WORK(&info->resume_work, fts_resume_work);
-	INIT_WORK(&info->suspend_work, fts_suspend_work);
-	INIT_WORK(&info->sleep_work, fts_ts_sleep_work);
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	INIT_WORK(&info->cmd_update_work, fts_cmd_update_work);
-	INIT_WORK(&info->switch_mode_work, fts_switch_mode_work);
-	INIT_WORK(&info->grip_mode_work, fts_grip_mode_work);
-	mutex_init(&info->cmd_update_mutex);
-#endif
-#ifdef CONFIG_FTS_POWERSUPPLY_CB
-	INIT_DELAYED_WORK(&info->power_supply_work, fts_power_supply_work);
-#endif
-	mutex_init(&info->charge_lock);
-
 	fts_info = info;
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	info->fts_tp_class = touch_class;
-#endif
 	info->client = client;
 	info->dev = &info->client->dev;
 	dev_set_drvdata(info->dev, info);
@@ -8547,12 +8675,15 @@ static int fts_probe(struct spi_device *client)
 	if (!info->irq_wq) {
 		logError(1, "%s ERROR: Cannot create irq work thread\n", tag);
 		error = -ENOMEM;
-		goto ProbeErrorExit_5;
+		goto ProbeErrorExit_4;
 	}
 
 #ifdef FTS_FOD_AREA_REPORT
 	mutex_init(&(info->fod_mutex));
 #endif
+	INIT_WORK(&info->resume_work, fts_resume_work);
+	INIT_WORK(&info->suspend_work, fts_suspend_work);
+	INIT_WORK(&info->sleep_work, fts_ts_sleep_work);
 	init_completion(&info->tp_reset_completion);
 #ifdef FTS_XIAOMI_TOUCHFEATURE
 	init_waitqueue_head(&info->wait_queue);
@@ -8682,13 +8813,12 @@ static int fts_probe(struct spi_device *client)
 	info->lockdown_is_ok = false;
 	info->notifier = fts_noti_block;
 #ifdef CONFIG_FTS_POWERSUPPLY_CB
+	INIT_DELAYED_WORK(&info->power_supply_work, fts_power_supply_work);
 	info->charging_status = -1;
 	info->power_supply_notifier.notifier_call = fts_power_supply_event;
-	error = power_supply_reg_notifier(&info->power_supply_notifier);
-	if (error)
-		goto ProbeErrorExit_6;
-	info->power_supply_registered = true;
+	power_supply_reg_notifier(&info->power_supply_notifier);
 #endif
+	mutex_init(&info->charge_lock);
 #ifdef CONFIG_FTS_BL_CB
 	info->bl_notifier = fts_bl_noti_block;
 #endif
@@ -8768,6 +8898,7 @@ static int fts_probe(struct spi_device *client)
 			    WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
 	if (!info->fwu_workqueue) {
 		logError(1, "%s ERROR: Cannot create fwu work thread\n", tag);
+		error = -ENOMEM;
 		goto ProbeErrorExit_7;
 	}
 	INIT_DELAYED_WORK(&info->fwu_work, fts_fw_update_auto);
@@ -8792,7 +8923,6 @@ static int fts_probe(struct spi_device *client)
 		goto ProbeErrorExit_7;
 	}
 
-	info->sysfs_created = true;
 	error = fts_proc_init();
 	if (error < OK)
 		logError(1, "%s Error: can not create /proc file! \n", tag);
@@ -8874,6 +9004,10 @@ static int fts_probe(struct spi_device *client)
 		logError(1, "%s Error: Cannot create touch feature work thread\n", tag);
 		goto ProbeErrorExit_8;
 	}
+	INIT_WORK(&info->cmd_update_work, fts_cmd_update_work);
+	INIT_WORK(&info->switch_mode_work, fts_switch_mode_work);
+	INIT_WORK(&info->grip_mode_work, fts_grip_mode_work);
+	mutex_init(&info->cmd_update_mutex);
 	memset(&xiaomi_touch_interfaces, 0x00, sizeof(struct xiaomi_touch_interface));
 	xiaomi_touch_interfaces.getModeValue = fts_get_mode_value;
 	xiaomi_touch_interfaces.setModeValue = fts_set_cur_value;
@@ -8895,27 +9029,22 @@ static int fts_probe(struct spi_device *client)
 	xiaomi_touch_interfaces.get_touch_x_resolution = fts_get_x_resolution;
 	xiaomi_touch_interfaces.get_touch_y_resolution = fts_get_y_resolution;
 	xiaomi_touch_interfaces.enable_clicktouch_raw = fts_enable_click_touch_raw;
-	error = xiaomitouch_register_modedata(0, &xiaomi_touch_interfaces);
-	if (error)
-		goto ProbeErrorExit_8;
-	info->touch_feature_registered = true;
+	xiaomitouch_register_modedata(0, &xiaomi_touch_interfaces);
 	fts_read_touchmode_data();
 	fts_init_touchmode_data();
 	fts_info->enable_touch_delta = 1;
 #endif
 
-#ifndef FW_UPDATE_ON_PROBE
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
 	queue_delayed_work(info->fwu_workqueue, &info->fwu_work,
 			   msecs_to_jiffies(EXP_FN_WORK_DELAY_MS));
+#else
+	WRITE_ONCE(info->probe_ok, true);
 #endif
-	info->probe_ok = true;
 
 	logError(1, "%s Probe Finished! \n", tag);
 	return OK;
 ProbeErrorExit_8:
-#ifdef FTS_DEBUG_FS
-	debugfs_remove_recursive(info->debugfs);
-#endif
 	fts_disableInterrupt();
 	device_destroy(info->fts_tp_class, DCHIP_ID_0);
 	if (info->tp_lockdown_info_proc)
@@ -8932,15 +9061,12 @@ ProbeErrorExit_8:
 	info->fts_tp_class = NULL;
 */
 ProbeErrorExit_7:
-	if (info->sysfs_created) {
-		sysfs_remove_group(&client->dev.kobj, &info->attrs);
-		info->sysfs_created = false;
-		fts_proc_remove();
-	}
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
+	fts_fw_update_cancel(info);
+#endif
 	if (info->tp_selftest_proc)
 		remove_proc_entry("tp_selftest", NULL);
 	info->tp_selftest_proc = NULL;
-	fts_stop_async(info);
 #ifdef CONFIG_SECURE_TOUCH
 	fts_secure_remove(info);
 #endif
@@ -8953,7 +9079,15 @@ ProbeErrorExit_7:
 		kfree(info->dma_buf->wrBuf);
 #endif
 ProbeErrorExit_6:
-	fts_stop_async(info);
+#ifdef CONFIG_FTS_POWERSUPPLY_CB
+	power_supply_unreg_notifier(&info->power_supply_notifier);
+	cancel_delayed_work_sync(&info->power_supply_work);
+#endif
+	if (info->notifier_registered) {
+		mi_disp_unregister_client(&info->notifier);
+		info->notifier_registered = false;
+	}
+	fts_interrupt_uninstall(info);
 	input_unregister_device(info->input_dev);
 
 ProbeErrorExit_5_1:
@@ -8961,16 +9095,6 @@ ProbeErrorExit_5_1:
 		input_free_device(info->input_dev);
 
 ProbeErrorExit_5:
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	if (info->touch_feature_wq)
-		destroy_workqueue(info->touch_feature_wq);
-#endif
-#ifndef FW_UPDATE_ON_PROBE
-	if (info->fwu_workqueue)
-		destroy_workqueue(info->fwu_workqueue);
-#endif
-	if (info->irq_wq)
-		destroy_workqueue(info->irq_wq);
 	destroy_workqueue(info->event_wq);
 
 ProbeErrorExit_4:
@@ -8988,8 +9112,6 @@ ProbeErrorExit_2:
 		devm_pinctrl_put(info->ts_pinctrl);
 
 ProbeErrorExit_1:
-	fts_info = NULL;
-	dev_set_drvdata(&client->dev, NULL);
 	kfree(info);
 
 ProbeErrorExit_0:
@@ -9012,6 +9134,15 @@ static int fts_remove(struct spi_device *client)
 
 	struct fts_ts_info *info = dev_get_drvdata(&(client->dev));
 
+	WRITE_ONCE(info->probe_ok, false);
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
+	fts_fw_update_cancel(info);
+#endif
+#ifdef CONFIG_FTS_POWERSUPPLY_CB
+	power_supply_unreg_notifier(&info->power_supply_notifier);
+	cancel_delayed_work_sync(&info->power_supply_work);
+#endif
+
 	fts_proc_remove();
 	if (info->tp_lockdown_info_proc)
 		remove_proc_entry("tp_lockdown_info", NULL);
@@ -9028,23 +9159,30 @@ static int fts_remove(struct spi_device *client)
 
 	/* sysfs stuff */
 	sysfs_remove_group(&client->dev.kobj, &info->attrs);
-	device_destroy(info->fts_tp_class, DCHIP_ID_0);
-#ifdef FTS_DEBUG_FS
-	debugfs_remove_recursive(info->debugfs);
+#ifdef CONFIG_FTS_BL_CB
+	backlight_unregister_notifier(&info->bl_notifier);
 #endif
-	fts_stop_async(info);
+	if (info->notifier_registered) {
+		mi_disp_unregister_client(&info->notifier);
+		info->notifier_registered = false;
+	}
+#ifdef FTS_XIAOMI_TOUCHFEATURE
+	cancel_work_sync(&info->cmd_update_work);
+	cancel_work_sync(&info->grip_mode_work);
+	cancel_work_sync(&info->switch_mode_work);
+#endif
+	/* Drain power transitions before their input/IRQ resources are released. */
+	destroy_workqueue(info->event_wq);
+	/* remove interrupt and event handlers */
+	fts_interrupt_uninstall(info);
 	/* unregister the device */
 	input_unregister_device(info->input_dev);
 
 	/* Remove the work thread */
-	destroy_workqueue(info->irq_wq);
-	destroy_workqueue(info->event_wq);
-#ifndef FW_UPDATE_ON_PROBE
-	destroy_workqueue(info->fwu_workqueue);
-#endif
 #ifdef FTS_XIAOMI_TOUCHFEATURE
 	destroy_workqueue(info->touch_feature_wq);
 #endif
+	device_destroy(info->fts_tp_class, DCHIP_ID_0);
 /*
 	class_destroy(info->fts_tp_class);
 	info->fts_tp_class = NULL;
@@ -9058,7 +9196,6 @@ static int fts_remove(struct spi_device *client)
 #ifdef CONFIG_SECURE_TOUCH
 	fts_secure_remove(info);
 #endif
-	dev_set_drvdata(&client->dev, NULL);
 	/* free all */
 	kfree(info);
 
